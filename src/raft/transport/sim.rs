@@ -27,12 +27,22 @@
 //! destroy a message already "on the wire".
 //!
 //! The network also acts as an event-level safety observer (phase 10):
-//! every AppendEntries passing through the send path is a leadership claim
-//! `(term, leader_id)`, so two different claimants for one term is Election
-//! Safety (§5.2) violated — recorded in
-//! [`SimNetwork::election_safety_violations`] for tests to assert on at
-//! teardown. Recording, not panicking: sends run in spawned tasks, where a
-//! panic would be silently swallowed with the task.
+//! every AppendEntries passing through the send path is inspected for
+//! - Election Safety (§5.2): the message is a leadership claim
+//!   `(term, leader_id)`; two different claimants for one term violate it;
+//! - Log Matching (§5.3): every shipped entry claims "the entry at
+//!   `(term, index)` is this command"; two different commands ever shipped
+//!   under one `(term, index)` violate it;
+//! - well-formedness: entries must continue contiguously from
+//!   `prev_log_index` with non-decreasing terms never above the leader's.
+//!
+//! Only order-independent properties of message *contents* are checked:
+//! send-observation order is task-scheduling order, not the order the Raft
+//! core created the messages, so sequencing invariants (e.g. leader_commit
+//! monotonicity) cannot be soundly asserted here. Violations are recorded
+//! in [`SimNetwork::safety_violations`] for tests to assert on at teardown
+//! — recorded, not panicked: sends run in spawned tasks, where a panic
+//! would be silently swallowed with the task.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -40,9 +50,9 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::raft::rpc::{RpcRequest, RpcResponse};
+use crate::raft::rpc::{AppendEntriesArgs, RpcRequest, RpcResponse};
 use crate::raft::transport::{Inbound, Transport, TransportError};
-use crate::raft::types::{NodeId, Term};
+use crate::raft::types::{Command, LogIndex, NodeId, Term};
 use crate::rng::SplitMix64;
 
 #[derive(Debug, Clone)]
@@ -81,7 +91,10 @@ struct State {
     blocked: HashSet<(NodeId, NodeId)>,
     /// First node seen claiming leadership of each term (via AppendEntries).
     leaders_per_term: HashMap<Term, NodeId>,
-    /// Election Safety violations observed on the send path.
+    /// First command seen shipped at each (term, index) (Log Matching §5.3:
+    /// there must never be a second, different one).
+    entries_seen: HashMap<(Term, LogIndex), Command>,
+    /// Safety violations observed on the send path.
     violations: Vec<String>,
 }
 
@@ -100,6 +113,7 @@ impl SimNetwork {
                 nodes: HashMap::new(),
                 blocked: HashSet::new(),
                 leaders_per_term: HashMap::new(),
+                entries_seen: HashMap::new(),
                 violations: Vec::new(),
             })),
         }
@@ -142,12 +156,14 @@ impl SimNetwork {
         self.lock().config = config;
     }
 
-    /// Election Safety violations seen so far: two distinct nodes claiming
-    /// leadership of the same term via AppendEntries. Every message crossing
-    /// the network is inspected (even ones later dropped — a send is a claim
-    /// regardless of delivery), so unlike status sampling this cannot miss a
-    /// sub-sample leadership flicker. Empty on a correct Raft.
-    pub fn election_safety_violations(&self) -> Vec<String> {
+    /// Safety violations seen so far: Election Safety (two distinct nodes
+    /// claiming leadership of one term), Log Matching (two different
+    /// commands ever shipped under one (term, index)), or a malformed
+    /// AppendEntries (see module docs). Every message crossing the network
+    /// is inspected (even ones later dropped — a send is a claim regardless
+    /// of delivery), so unlike status sampling this cannot miss a
+    /// sub-sample flicker. Empty on a correct Raft.
+    pub fn safety_violations(&self) -> Vec<String> {
         self.lock().violations.clone()
     }
 
@@ -181,7 +197,7 @@ impl Transport for SimTransport {
         let from = self.id;
         let plan = {
             let mut st = self.state.lock().expect("sim network lock poisoned");
-            record_leadership_claim(&mut st, &req);
+            inspect_append_entries(&mut st, &req);
             let cfg = st.config.clone();
             // Determinism contract: a fixed number of draws per send, all in
             // this critical section — the duplication draws are unconditional
@@ -269,13 +285,14 @@ impl Transport for SimTransport {
     }
 }
 
-/// Every AppendEntries is a claim "I lead term T"; two claimants for one
-/// term is Election Safety broken. TODO(phase 11): ignore PreVote variants
-/// here — a pre-candidate claims nothing.
-fn record_leadership_claim(st: &mut State, req: &RpcRequest) {
+/// The event-level safety observer (see module docs). Only AppendEntries
+/// carries claims; other variants — including phase 11's PreVote — fall
+/// through the match and are ignored by construction.
+fn inspect_append_entries(st: &mut State, req: &RpcRequest) {
     let RpcRequest::AppendEntries(args) = req else {
         return;
     };
+    // Election Safety (§5.2): "I lead term T" must have a unique claimant.
     match st.leaders_per_term.get(&args.term) {
         None => {
             st.leaders_per_term.insert(args.term, args.leader_id);
@@ -288,6 +305,52 @@ fn record_leadership_claim(st: &mut State, req: &RpcRequest) {
             ));
         }
         Some(_) => {}
+    }
+    // Well-formedness: entries continue contiguously from prev_log_index
+    // with non-decreasing terms, none newer than the sender's own term.
+    check_shape(st, args);
+    // Log Matching (§5.3): a (term, index) names one command, forever —
+    // across every leader, retransmission and duplicate.
+    for entry in &args.entries {
+        match st.entries_seen.get(&(entry.term, entry.index)) {
+            None => {
+                st.entries_seen
+                    .insert((entry.term, entry.index), entry.command.clone());
+            }
+            Some(seen) if *seen != entry.command => {
+                st.violations.push(format!(
+                    "log matching violated: two different commands shipped \
+                     for (term {}, index {})",
+                    entry.term, entry.index
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+fn check_shape(st: &mut State, args: &AppendEntriesArgs) {
+    let mut expected = args.prev_log_index + 1;
+    let mut min_term = args.prev_log_term;
+    for entry in &args.entries {
+        if entry.index != expected {
+            st.violations.push(format!(
+                "malformed AppendEntries from node {}: entry index {} where \
+                 {expected} was expected (prev_log_index {})",
+                args.leader_id, entry.index, args.prev_log_index
+            ));
+            return;
+        }
+        if entry.term < min_term || entry.term > args.term {
+            st.violations.push(format!(
+                "malformed AppendEntries from node {}: entry (term {}, index \
+                 {}) outside [{min_term}, {}]",
+                args.leader_id, entry.term, entry.index, args.term
+            ));
+            return;
+        }
+        expected += 1;
+        min_term = entry.term;
     }
 }
 
@@ -663,11 +726,11 @@ mod tests {
         t1.send(3, ae_req(5, 1)).await.unwrap();
         t1.send(3, ae_req(6, 1)).await.unwrap();
         t2.send(3, vote_req(5)).await.unwrap();
-        assert_eq!(net.election_safety_violations(), Vec::<String>::new());
+        assert_eq!(net.safety_violations(), Vec::<String>::new());
 
         // Forged conflict: node 2 also claims to lead term 5.
         t2.send(3, ae_req(5, 2)).await.unwrap();
-        let violations = net.election_safety_violations();
+        let violations = net.safety_violations();
         assert_eq!(violations.len(), 1, "{violations:?}");
         assert!(violations[0].contains("term 5"), "{violations:?}");
 
@@ -676,7 +739,107 @@ mod tests {
         // conflicts.
         net.set_link_blocked(2, 3, true);
         let _ = t2.send(3, ae_req(6, 2)).await;
-        assert_eq!(net.election_safety_violations().len(), 2);
+        assert_eq!(net.safety_violations().len(), 2);
+    }
+
+    fn ae_with(
+        term: Term,
+        leader_id: NodeId,
+        prev_log_index: u64,
+        prev_log_term: Term,
+        entries: Vec<crate::raft::types::LogEntry>,
+    ) -> RpcRequest {
+        RpcRequest::AppendEntries(AppendEntriesArgs {
+            term,
+            leader_id,
+            prev_log_index,
+            prev_log_term,
+            entries,
+            leader_commit: 0,
+        })
+    }
+
+    fn put_entry(term: Term, index: u64, value: u64) -> crate::raft::types::LogEntry {
+        crate::raft::types::LogEntry {
+            term,
+            index,
+            command: Command::Put {
+                key: format!("k{index}"),
+                value: serde_json::json!(value),
+            },
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn log_matching_interceptor_records_conflicting_entries() {
+        let net = SimNetwork::new(0, fixed_delay_config(ms(1)));
+        let (t1, _rx1) = net.register(1);
+        let (t2, _rx2) = net.register(2);
+        let (_t3, rx3) = net.register(3);
+        spawn_echo(rx3);
+
+        // The same entry retransmitted (and duplicated) is not a violation;
+        // neither is a different command at the same index under a NEW term
+        // (that's a legal conflict overwrite).
+        let e = put_entry(2, 1, 10);
+        t1.send(3, ae_with(2, 1, 0, 0, vec![e.clone()]))
+            .await
+            .unwrap();
+        t1.send(3, ae_with(2, 1, 0, 0, vec![e.clone()]))
+            .await
+            .unwrap();
+        t2.send(3, ae_with(3, 2, 0, 0, vec![put_entry(3, 1, 99)]))
+            .await
+            .unwrap();
+        assert_eq!(net.safety_violations(), Vec::<String>::new());
+
+        // Forged: same (term 2, index 1) carrying a different command.
+        t1.send(3, ae_with(2, 1, 0, 0, vec![put_entry(2, 1, 11)]))
+            .await
+            .unwrap();
+        let violations = net.safety_violations();
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].contains("log matching") && violations[0].contains("index 1"),
+            "{violations:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn malformed_append_entries_are_recorded() {
+        let net = SimNetwork::new(0, fixed_delay_config(ms(1)));
+        let (t1, _rx1) = net.register(1);
+        let (_t3, rx3) = net.register(3);
+        spawn_echo(rx3);
+
+        // A well-formed batch: contiguous from prev, terms non-decreasing.
+        t1.send(
+            3,
+            ae_with(3, 1, 1, 1, vec![put_entry(2, 2, 1), put_entry(3, 3, 2)]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(net.safety_violations(), Vec::<String>::new());
+
+        // Gap after prev_log_index (same command as before, so only the
+        // shape check — not log matching — can be what fires).
+        t1.send(3, ae_with(3, 1, 1, 1, vec![put_entry(3, 3, 2)]))
+            .await
+            .unwrap();
+        // Entry from a term newer than the sender claims to lead.
+        t1.send(3, ae_with(3, 1, 3, 3, vec![put_entry(4, 4, 4)]))
+            .await
+            .unwrap();
+        // Terms decreasing along the batch (below prev_log_term).
+        t1.send(3, ae_with(3, 1, 3, 3, vec![put_entry(2, 4, 5)]))
+            .await
+            .unwrap();
+        let violations = net.safety_violations();
+        assert_eq!(violations.len(), 3, "{violations:?}");
+        assert!(
+            violations.iter().all(|v| v.contains("malformed")),
+            "{violations:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

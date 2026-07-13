@@ -390,6 +390,39 @@ async fn same_seed_reproduces_the_same_fault_run() {
     assert_eq!(log_a, log_b, "final logs must be identical");
 }
 
+// ---- the teardown safety assert itself has teeth ----
+
+/// Forges conflicting leadership claims through a bare transport registered
+/// on a live cluster's network: `TestCluster::shutdown` must refuse to pass.
+/// (The recording logic is unit-tested in sim.rs; this pins the teardown
+/// assert wiring end-to-end.)
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "sim-observed safety violations")]
+async fn forged_leadership_conflict_fails_the_run_at_teardown() {
+    use rustkv::raft::rpc::{AppendEntriesArgs, RpcRequest};
+
+    let cluster = spawn_cluster(3, 61, low_loss_faults());
+    cluster.wait_for_leader().await;
+
+    let (forger, _rx) = cluster.net.register(99);
+    for forged_leader in [97, 98] {
+        let _ = rustkv::raft::transport::Transport::send(
+            &forger,
+            1,
+            RpcRequest::AppendEntries(AppendEntriesArgs {
+                term: 999,
+                leader_id: forged_leader,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: Vec::new(),
+                leader_commit: 0,
+            }),
+        )
+        .await;
+    }
+    cluster.shutdown();
+}
+
 // ---- majority loss stalls writes; restart restores liveness ----
 
 #[tokio::test(start_paused = true)]

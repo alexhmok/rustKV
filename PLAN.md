@@ -395,24 +395,38 @@ Done:
   primary exchange's timeout, so it can arrive after the sender gave up;
   it is delivered even if the primary leg is dropped, but never through a
   blocked link.
-- Event-level Election Safety (closes the phase-3/6 sampling gap): the sim's
-  send critical section records `(term, leader_id)` from every AppendEntries
-  crossing the network; a second claimant for a term pushes into a
-  violations list (recorded, not panicked — sends run in spawned tasks).
-  `SimNetwork::election_safety_violations()` is asserted empty by
-  `TestCluster::shutdown()`, so every sim-cluster test checks it at
-  teardown; the sampled `observe_leaders` checks in faults.rs are gone
-  (election.rs keeps its sampling test as a redundant cluster-level check).
-  No Raft-core hook: the core still never knows about the network.
+- Event-level safety observer (closes the phase-3/6 sampling gap): the
+  sim's send critical section inspects every AppendEntries crossing the
+  network for THREE order-independent content invariants — Election Safety
+  (§5.2: one leadership claimant per term), Log Matching (§5.3: one command
+  per (term, index), ever, across all leaders/retransmits/duplicates), and
+  message well-formedness (entries contiguous from prev_log_index, terms
+  non-decreasing and never above the sender's). Violations are recorded,
+  not panicked (sends run in spawned tasks); `SimNetwork::
+  safety_violations()` is asserted empty by `TestCluster::shutdown()`, so
+  every sim-cluster test checks all three at teardown. The sampled
+  `observe_leaders` checks in faults.rs are gone (election.rs keeps its
+  sampling test as a redundant cluster-level check). No Raft-core hook: the
+  core still never knows about the network. Deliberately NOT checked:
+  sequencing invariants like leader_commit monotonicity — send-observation
+  order is task-scheduling order, not core-emission order, so they cannot
+  be asserted soundly here.
 
-Tested (85 total; 5 new):
+Tested (88 total; 8 new):
 - Sim unit: duplicate_probability=1.0 delivers exactly two copies and the
   primary exchange still succeeds; per-seed reproducibility of outcomes AND
   receiver arrival counts under drop+duplication; checker-has-teeth — two
   forged AppendEntries (same term, different leader_id) through bare
   registered senders record exactly one violation, idempotent/other-term/
   RequestVote claims record none, and a claim through a blocked link still
-  records (a send is a claim regardless of delivery).
+  records (a send is a claim regardless of delivery); log-matching teeth —
+  a forged different command at a seen (term, index) records, while exact
+  retransmits and a conflict-overwrite under a NEW term (legal) do not;
+  malformed-AE teeth — gap after prev, entry term above the sender's, and
+  terms decreasing along a batch each record.
+- Teardown wiring has teeth end-to-end: a `#[should_panic]` test forges
+  conflicting leadership claims into a LIVE cluster's network via a bare
+  registered transport and `TestCluster::shutdown()` must refuse to pass.
 - Duplication soaks at 0.1: the randomized fault schedules (8 seeds) and
   the full jepsen linearizable workload (6 seeds, log witness + WGL checker,
   zero violations) both pass with 10% of requests delivered twice.
@@ -422,7 +436,12 @@ Tested (85 total; 5 new):
   determinism on seed 5 now at dup 0.1.
 - Test-the-tests mutation re-run: `majority()=1` trips the NEW event-level
   assert at teardown ("nodes 2 and 3 both sent AppendEntries as leader of
-  term 2") in a suite whose sampled check was removed. Reverted.
+  term 2") in a suite whose sampled check was removed. Reverted. A second
+  hand-run mutation (`entries_from(next + 1)`) was instructive: it produced
+  EMPTY suffixes, i.e. a pure liveness bug shipping no malformed content —
+  tests hang on commit-awaits instead of reaching the teardown assert. The
+  observer checks message contents, not progress; liveness failures still
+  surface as the suite's existing wait/commit timeouts.
 
 Seed churn (expected — two extra draws per send shift every schedule):
 every seeded suite was re-run and passed WITHOUT re-pinning; the stale-mode
@@ -438,8 +457,13 @@ Untested / known gaps:
   once the link allows it (drop applies to the primary only) — documented
   semantics, not a bug, but a different model than two fully independent
   copies.
-- Election-safety interception reads AppendEntries only; when phase 11 adds
-  PreVote RPCs the interceptor must ignore them (TODO marker in sim.rs).
+- The safety observer inspects AppendEntries only; other RPC variants —
+  including phase 11's PreVote — fall through its match and are ignored by
+  construction (no sim change needed when PreVote lands).
+- The observer cannot catch under-sending/liveness bugs (see the
+  `entries_from(next + 1)` mutation note above) or sequencing violations
+  (leader_commit monotonicity) — the former is covered by commit/convergence
+  timeouts, the latter has no sound send-side observation point.
 
 ## Project complete (phases 0-10)
 Remaining ideas beyond the original scope, in planned order: PreVote,

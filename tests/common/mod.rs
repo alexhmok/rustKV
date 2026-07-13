@@ -215,17 +215,17 @@ impl TestCluster {
         self.wait_for_leader_among(&self.all_ids()).await
     }
 
-    /// Stops every node, then asserts the sim's event-level Election Safety
-    /// check: no two nodes ever claimed leadership of the same term, on any
-    /// message that crossed the network during the whole run.
+    /// Stops every node, then asserts the sim's event-level safety checks:
+    /// Election Safety, Log Matching, and AppendEntries well-formedness,
+    /// observed on every message that crossed the network the whole run.
     pub fn shutdown(&self) {
         for (_, handle) in self.lock_nodes().iter() {
             handle.shutdown();
         }
-        let violations = self.net.election_safety_violations();
+        let violations = self.net.safety_violations();
         assert!(
             violations.is_empty(),
-            "election safety violated during the run:\n{}",
+            "sim-observed safety violations during the run:\n{}",
             violations.join("\n")
         );
     }
