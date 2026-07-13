@@ -191,9 +191,44 @@ Untested / known gaps:
   seed-deterministic; the deterministic coverage lives in the sim-transport suites.
 - Location header embeds keys as-is; exotic key encodings unhandled (noted in code).
 
-## Phase 6 — deterministic fault tests ⬜
-Partitions, leader crash/restart mid-write, heal-and-re-partition across seeds.
-Safety invariants asserted: at most one leader per term; no committed write lost.
+## Phase 6 — deterministic fault tests ✅
+
+Done (`tests/faults.rs`; harness: `TestCluster::{crash, restart}` in tests/common/):
+- restart(id) = reopen the node's data dir, fresh empty state machine (rebuilt by
+  re-applying the log once commit is re-learned), new inbox on the sim network, fresh
+  timeout jitter per incarnation.
+- Invariants asserted per run: at most one leader per term (sampled continuously);
+  no confirmed write lost (exact (term, index, command) present in every final log);
+  full convergence (identical logs on disk + identical state-machine snapshots);
+  atomicity of unknown-outcome writes (applied everywhere or nowhere); no key
+  committed twice (each value proposed at most once by construction).
+
+Scenarios (all virtual-time, deterministic per seed):
+- Leader crash mid-write + restart, 5 seeds: confirmed writes survive; the in-flight
+  write's fate is atomic across nodes.
+- 5× heal-and-re-partition cycles rotating the victim (leader included), 3 seeds,
+  2 confirmed writes per cycle; victim reintegrates each time.
+- Randomized fault schedule, 8 seeds: 40 steps mixing writes, node isolation/heal,
+  crash/restart (≤1 down at a time) under 10% message loss; recovery phase then full
+  invariant check. Same-seed run reproduces the identical action/outcome trace and
+  final log (determinism test).
+- Majority loss: writes stall (no commit for 3 virtual seconds, nothing applied);
+  restarting one follower restores the majority and the stalled proposal commits.
+
+Test-the-tests: two hand-run mutations verified the suite has teeth — breaking quorum
+(majority()=1) tripped the leader-per-term invariant, the no-commit-without-majority
+assert, and the in-node SAFETY VIOLATION fail-stop; disabling the AppendEntries
+consistency check was caught by the randomized schedules. Both reverted.
+
+Untested / known gaps:
+- Leader-per-term is sampled between driver steps, not event-intercepted; a
+  sub-sample flicker could theoretically escape (would need transport-level
+  observation hooks — noted for a possible Jepsen phase).
+- Client-level retry duplication is out of scope (each value proposed once).
+- Fault schedules don't yet vary FaultConfig mid-run (drop-rate spikes) — easy to add
+  to the driver if wanted.
+- cluster_http real-time tests hardened against CPU starvation (200–400ms election
+  timeouts + agreement-based waits) after a cross-binary flake surfaced this phase.
 
 ## Phase 7 — real HTTP transport + local/Docker cluster ⬜
 HTTP transport between nodes; 3-node local run (three processes); Dockerfile + Compose

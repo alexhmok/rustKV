@@ -8,8 +8,8 @@
 //! appearing.
 //! NOT covered: node-to-node HTTP transport (phase 7), linearizable reads
 //! (GETs are documented as possibly stale).
-//! These tests run in real time (real sockets don't mix with paused time),
-//! with shortened election timeouts; waits are poll-based, not seed-exact.
+//! These tests run in real time (real sockets don't mix with paused time);
+//! waits are poll-based and agreement-based, not seed-exact.
 
 mod common;
 
@@ -28,11 +28,13 @@ use rustkv::store::KvStore;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-const WRITE_TIMEOUT: Duration = Duration::from_millis(800);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// These tests run in real time with tight election timeouts; running them
-/// concurrently starves the runtime and causes spurious leadership churn.
-/// Each test holds this lock for its duration.
+/// These tests run in real time; concurrent heavyweight tests (including
+/// other test binaries — cargo runs them in parallel processes) can starve
+/// this process long enough to depose a leader. Two mitigations: tests in
+/// this binary serialize on this lock, and election timeouts are generous
+/// (200-400ms) so only a >400ms starvation gap can cause churn.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct HttpNode {
@@ -72,9 +74,9 @@ async fn spawn_http_cluster(n: u64, seed: u64) -> HttpCluster {
         let storage = Storage::open(dir.path()).expect("storage");
         let (transport, inbound) = net.register(id);
         let mut config = node_config(id, n, seed);
-        config.election_timeout_min = Duration::from_millis(50);
-        config.election_timeout_max = Duration::from_millis(100);
-        config.heartbeat_interval = Duration::from_millis(20);
+        config.election_timeout_min = Duration::from_millis(200);
+        config.election_timeout_max = Duration::from_millis(400);
+        config.heartbeat_interval = Duration::from_millis(50);
         let raft = RaftNode::spawn(
             config,
             storage,
@@ -107,20 +109,24 @@ async fn spawn_http_cluster(n: u64, seed: u64) -> HttpCluster {
 }
 
 impl HttpCluster {
+    /// Waits until exactly one node is leader AND every node agrees on it —
+    /// so follower requests reliably redirect to the right place.
     async fn wait_for_leader(&self) -> &HttpNode {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
-            let leaders: Vec<&HttpNode> = self
-                .nodes
+            let statuses: Vec<_> = self.nodes.iter().map(|n| n.kv.status()).collect();
+            let leaders: Vec<_> = statuses
                 .iter()
-                .filter(|n| n.kv.status().role == RoleKind::Leader)
+                .filter(|s| s.role == RoleKind::Leader)
                 .collect();
-            if let [leader] = leaders[..] {
-                return leader;
+            if let [leader] = leaders[..]
+                && statuses.iter().all(|s| s.leader_id == Some(leader.id))
+            {
+                return self.nodes.iter().find(|n| n.id == leader.id).unwrap();
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "no leader within 10s"
+                "no agreed leader within 15s"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -182,7 +188,6 @@ async fn follower_redirects_writes_to_the_leader() {
     let _serial = SERIAL.lock().await;
     let cluster = spawn_http_cluster(3, 32).await;
     let leader = cluster.wait_for_leader().await;
-    tokio::time::sleep(Duration::from_millis(100)).await; // followers learn the leader
     let follower = cluster.followers(leader.id)[0];
     let value = json!({"via": "follower"});
 
@@ -221,7 +226,6 @@ async fn delete_through_a_follower_redirect() {
     let _serial = SERIAL.lock().await;
     let cluster = spawn_http_cluster(3, 33).await;
     let leader = cluster.wait_for_leader().await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
     let follower = cluster.followers(leader.id)[0];
     let client = reqwest::Client::new();
     let value = json!(1);

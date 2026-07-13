@@ -5,12 +5,15 @@ cluster kept consistent by a hand-implemented Raft consensus core (no consensus 
 crates). The system is CP: under a network partition, the minority side refuses writes
 rather than diverging.
 
-**Current status: phase 5** — client writes go through the replicated log: a PUT/DELETE
+**Current status: phase 6** — client writes go through the replicated log: a PUT/DELETE
 is only acknowledged after the entry is committed by a majority and applied. Non-leaders
 redirect writes to the leader. The binary runs a single-node cluster (fully persistent —
 state is rebuilt from the log on restart); multi-node clusters currently exist on the
-in-process simulated transport (tested end-to-end over real HTTP client APIs), and the
-node-to-node HTTP transport arrives in phase 7. See [PLAN.md](PLAN.md).
+in-process simulated transport, where deterministic seeded fault tests (partitions,
+leader crash/restart mid-write, randomized fault schedules under message loss) assert
+the safety invariants: at most one leader per term, no confirmed write lost, identical
+logs and state machines after recovery. The node-to-node HTTP transport arrives in
+phase 7. See [PLAN.md](PLAN.md).
 
 ## Prerequisites
 

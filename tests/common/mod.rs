@@ -70,6 +70,9 @@ pub struct TestCluster {
     pub nodes: Vec<(NodeId, RaftHandle)>,
     pub stores: Vec<(NodeId, Arc<KvStore>)>,
     dirs: Vec<(NodeId, TempDir)>,
+    seed: u64,
+    /// Bumped on every restart so a reborn node gets fresh timeout jitter.
+    incarnation: u64,
 }
 
 /// Spawns nodes 1..=n; `prepare` can pre-populate each node's storage
@@ -108,6 +111,8 @@ pub fn spawn_cluster_with(
         nodes,
         stores,
         dirs,
+        seed,
+        incarnation: 0,
     }
 }
 
@@ -174,6 +179,51 @@ impl TestCluster {
         for (_, handle) in &self.nodes {
             handle.shutdown();
         }
+    }
+
+    /// Hard-kills node `id`: its task is aborted and its transport inbox
+    /// becomes a black hole. Its status watch freezes at the last value, so
+    /// exclude crashed nodes from invariant sampling.
+    pub fn crash(&self, id: NodeId) {
+        self.handle(id).crash();
+    }
+
+    /// Restarts a crashed node from its data directory with a fresh (empty)
+    /// state machine — the KV state is rebuilt by re-applying the log once
+    /// the commit index is re-learned. Sleeps briefly first so the aborted
+    /// task has definitely been dropped and released its file handles.
+    pub async fn restart(&mut self, id: NodeId) {
+        tokio::time::sleep(ms(20)).await;
+        self.incarnation += 1;
+        let n = self.nodes.len() as u64;
+        let dir = &self
+            .dirs
+            .iter()
+            .find(|(nid, _)| *nid == id)
+            .expect("no such node")
+            .1;
+        let storage = Storage::open(dir.path()).expect("reopen storage");
+        let (transport, inbound) = self.net.register(id);
+        let store = Arc::new(KvStore::new());
+        let mut config = node_config(id, n, self.seed);
+        config.timeout_seed ^= self.incarnation << 32;
+        let handle = RaftNode::spawn(
+            config,
+            storage,
+            transport,
+            inbound,
+            store.clone() as Arc<dyn StateMachine>,
+        );
+        self.nodes
+            .iter_mut()
+            .find(|(nid, _)| *nid == id)
+            .expect("no such node")
+            .1 = handle;
+        self.stores
+            .iter_mut()
+            .find(|(nid, _)| *nid == id)
+            .expect("no such node")
+            .1 = store;
     }
 
     /// Reads a node's log back from disk. Only call after the node has been
