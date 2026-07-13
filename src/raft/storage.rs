@@ -187,6 +187,12 @@ impl Storage {
         &self.log
     }
 
+    /// All entries with `index >= from` (1-based); empty if past the end.
+    pub fn entries_from(&self, from: LogIndex) -> &[LogEntry] {
+        let start = usize::try_from(from.saturating_sub(1)).expect("log index fits in usize");
+        self.log.get(start..).unwrap_or(&[])
+    }
+
     /// The entry at 1-based `index`, if present. `index` 0 is the sentinel
     /// "before the log" and never has an entry.
     pub fn entry(&self, index: LogIndex) -> Option<&LogEntry> {
@@ -324,6 +330,21 @@ mod tests {
         assert_eq!(storage.entries(), &[]);
         assert_eq!(storage.term(0), Some(0));
         assert_eq!(storage.term(1), None);
+    }
+
+    #[test]
+    fn entries_from_slices_the_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(dir.path()).unwrap();
+        storage
+            .append(&[entry(1, 1), entry(1, 2), entry(2, 3)])
+            .unwrap();
+
+        assert_eq!(storage.entries_from(1), storage.entries());
+        assert_eq!(storage.entries_from(3).len(), 1);
+        assert_eq!(storage.entries_from(3)[0].index, 3);
+        assert_eq!(storage.entries_from(4), &[]);
+        assert_eq!(storage.entries_from(100), &[]);
     }
 
     #[test]

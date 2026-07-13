@@ -115,9 +115,43 @@ Untested / known gaps:
   one round of re-election churn (tested as expected behavior).
 - AppendEntries carries no entries yet; commit_index never advances (phase 4).
 
-## Phase 4 — log replication ⬜
-AppendEntries, log-matching/backtracking, commit on majority, current-term commit rule
-(§5.4.2). Tested on the simulated transport.
+## Phase 4 — log replication ✅
+
+Done (`src/raft/node.rs`, `src/raft/storage.rs::entries_from`):
+- Follower §5.3: prev_log consistency check; duplicate-tolerant entry walk (skip
+  already-held, truncate suffix at first conflict — fail-stop assert that committed
+  entries are never truncated — append the rest); commit advance capped at
+  min(leader_commit, prefix verified by this RPC).
+- Leader: `Role::Leader { next_index, match_index }` (re-initialized per election);
+  every AppendEntries reply is tagged with (term, prev, len) sent, so reordered/stale
+  replies fold in safely (match via max, backtracking via min); rejection ⇒ next_index
+  steps below the failing prev and resends immediately; success with a still-lagging
+  peer resends immediately (catch-up isn't heartbeat-paced).
+- Commit: majority match (leader's own log counted), §5.4.2 current-term rule —
+  prior-term entries commit only transitively.
+- `RaftHandle::propose(command) -> (term, index)` = durably appended on the leader,
+  NOT yet committed; commitment observable via Status (commit_index/last_log_index
+  added). Non-leaders reject with a leader hint. Phase 5 wires clients through this.
+- Deliberate basic-Raft gaps (documented in node.rs): no no-op entry on election win,
+  no conflict-hint fast backtracking (linear next_index decrement), no AE batching cap.
+- Test helpers extracted to tests/common/ (shared by election/replication/phase-6).
+
+Tested (8 integration + 1 unit, seeded virtual time): propose→commit→identical disk
+logs on all nodes; NotLeader + hint; lagging-follower catch-up through partition/heal;
+Figure-7-style divergence — minority leader's uncommitted entries truncated and
+replaced after heal (exercises full backtracking chain); minority leader accepts but
+never commits across 3 virtual seconds, doomed entry absent everywhere after heal (CP);
+same seed ⇒ identical (leader, term, byte-identical logs); 10 confirmed writes survive
+sustained 15% loss across 3 seeds with unknown-outcome retry semantics; RPC-level AE
+conformance (idempotent duplicates, commit capped at verified prefix, gap rejection,
+stale term, conflict overwrite verified on disk).
+
+Untested / known gaps:
+- Message duplication by the transport itself (AE handler is duplicate-tolerant and
+  that code path is tested, but the simulator never duplicates in flight).
+- Crash/restart mid-replication and event-level invariant checks — phase 6.
+- Client-visible semantics of "accepted but never committed" — phase 5 (writes will
+  block on commit, so minority-side clients time out instead of seeing success).
 
 ## Phase 5 — KV on top of Raft ⬜
 Apply committed entries to the KV map; client writes go through the log and commit to

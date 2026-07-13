@@ -1,14 +1,16 @@
-//! The Raft node: roles, terms, and leader election (§5.1–5.2, §5.4.1).
+//! The Raft node: leader election and log replication (§5.1–5.4).
 //!
 //! One node = one event-loop task that owns all consensus state — storage,
-//! role, timers — with no shared-state locking. It communicates only via
-//! channels and the [`Transport`] trait:
+//! role, timers, replication bookkeeping — with no shared-state locking. It
+//! communicates only via channels and the [`Transport`] trait:
 //! - inbound RPCs arrive as [`Inbound`] values on the transport's channel;
 //! - outbound RPCs are sent from short-lived spawned tasks that report
 //!   replies back through an internal event channel (tagged with the term
-//!   they were sent in, so stale replies are discarded);
-//! - observers (tests now, the KV layer in phase 5) read a `watch` channel
-//!   of [`Status`] snapshots.
+//!   and log position they were sent with, so stale replies are harmless);
+//! - client proposals come in through the control channel
+//!   ([`RaftHandle::propose`]);
+//! - observers (tests, the KV layer in phase 5) read a `watch` channel of
+//!   [`Status`] snapshots.
 //!
 //! Determinism: the event loop uses `select! { biased; .. }` — tokio's
 //! default randomized branch polling would make runs irreproducible. With a
@@ -19,13 +21,18 @@
 //! Storage errors are fail-stop: a node that cannot persist its state
 //! panics (crashes) rather than continuing and risking a safety violation.
 //!
-//! Phase 3 scope: elections and empty-heartbeat AppendEntries only.
-//! TODO(phase 4): replication state (next_index/match_index), entry
-//! handling, commit advancement. TODO(phase 5): client command proposals.
+//! Phase 4 scope: full replication — log-matching consistency check with
+//! conflict truncation on followers, per-peer next_index/match_index with
+//! backtracking on the leader, majority commit with the §5.4.2 current-term
+//! rule. Deliberately basic Raft: no no-op entry on election win, so entries
+//! from prior terms commit only once a current-term entry is proposed; no
+//! PreVote/CheckQuorum; no batching cap on AppendEntries payloads.
+//! TODO(phase 5): apply committed entries to the KV state machine and
+//! notify proposal waiters of commitment.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, sleep_until};
 
@@ -35,7 +42,7 @@ use super::rpc::{
 };
 use super::storage::Storage;
 use super::transport::{Inbound, Transport, TransportError};
-use super::types::{HardState, LogIndex, NodeId, Term};
+use super::types::{Command, HardState, LogEntry, LogIndex, NodeId, Term};
 use crate::rng::SplitMix64;
 
 #[derive(Debug, Clone)]
@@ -79,7 +86,37 @@ pub struct Status {
     pub role: RoleKind,
     /// Who this node believes leads its current term (itself, if leader).
     pub leader_id: Option<NodeId>,
+    /// Highest log index known committed (volatile; re-learned after restart).
+    pub commit_index: LogIndex,
+    pub last_log_index: LogIndex,
 }
+
+/// Why a proposal was not accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposeError {
+    /// This node is not the leader; retry against `leader_hint` if present.
+    NotLeader { leader_hint: Option<NodeId> },
+    /// The node has shut down.
+    Shutdown,
+}
+
+impl std::fmt::Display for ProposeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProposeError::NotLeader {
+                leader_hint: Some(id),
+            } => {
+                write!(f, "not the leader; try node {id}")
+            }
+            ProposeError::NotLeader { leader_hint: None } => {
+                write!(f, "not the leader, and no leader is known")
+            }
+            ProposeError::Shutdown => write!(f, "raft node has shut down"),
+        }
+    }
+}
+
+impl std::error::Error for ProposeError {}
 
 /// Handle to a running node.
 pub struct RaftHandle {
@@ -97,6 +134,22 @@ impl RaftHandle {
         self.status.clone()
     }
 
+    /// Submits a command to the replicated log. `Ok((term, index))` means the
+    /// entry was durably *appended* on the leader — NOT yet committed.
+    /// Commitment is observable as `Status::commit_index >= index` while the
+    /// term still matches. TODO(phase 5): notify on commit/apply instead of
+    /// making callers watch.
+    pub async fn propose(&self, command: Command) -> Result<(Term, LogIndex), ProposeError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.control
+            .send(Control::Propose {
+                command,
+                reply: reply_tx,
+            })
+            .map_err(|_| ProposeError::Shutdown)?;
+        reply_rx.await.map_err(|_| ProposeError::Shutdown)?
+    }
+
     /// Asks the node to stop cleanly (it finishes the current event first).
     pub fn shutdown(&self) {
         let _ = self.control.send(Control::Shutdown);
@@ -112,10 +165,14 @@ impl RaftHandle {
 
 enum Control {
     Shutdown,
-    // TODO(phase 5): Propose(Command, reply channel) for client writes.
+    Propose {
+        command: Command,
+        reply: oneshot::Sender<Result<(Term, LogIndex), ProposeError>>,
+    },
 }
 
-/// Replies from outbound-RPC tasks, tagged with the term when sent.
+/// Replies from outbound-RPC tasks, tagged with what was sent so stale or
+/// reordered replies can be interpreted safely.
 enum Event {
     VoteReply {
         sent_term: Term,
@@ -125,15 +182,25 @@ enum Event {
     AppendReply {
         sent_term: Term,
         from: NodeId,
+        /// prev_log_index of the AppendEntries this reply answers.
+        sent_prev_index: LogIndex,
+        /// How many entries that AppendEntries carried.
+        sent_entries: u64,
         result: Result<RpcResponse, TransportError>,
     },
 }
 
 enum Role {
     Follower,
-    Candidate { votes: HashSet<NodeId> },
-    // TODO(phase 4): Leader carries next_index/match_index per peer.
-    Leader,
+    Candidate {
+        votes: HashSet<NodeId>,
+    },
+    Leader {
+        /// Next log index to send to each peer (§5.3).
+        next_index: HashMap<NodeId, LogIndex>,
+        /// Highest log index known replicated on each peer.
+        match_index: HashMap<NodeId, LogIndex>,
+    },
 }
 
 pub struct RaftNode<T: Transport + Clone> {
@@ -143,7 +210,7 @@ pub struct RaftNode<T: Transport + Clone> {
     inbound: mpsc::UnboundedReceiver<Inbound>,
     role: Role,
     leader_id: Option<NodeId>,
-    /// Volatile; rebuilt after restart. Advances in phase 4.
+    /// Volatile; re-learned from the leader (or majority) after restart.
     commit_index: LogIndex,
     election_deadline: Instant,
     next_heartbeat: Instant,
@@ -171,6 +238,8 @@ impl<T: Transport + Clone> RaftNode<T> {
             term: hard_state.current_term,
             role: RoleKind::Follower,
             leader_id: None,
+            commit_index: 0,
+            last_log_index: storage.last_index(),
         });
         tracing::info!(
             node = config.id,
@@ -214,6 +283,9 @@ impl<T: Transport + Clone> RaftNode<T> {
 
                 ctl = self.control_rx.recv() => match ctl {
                     Some(Control::Shutdown) | None => break,
+                    Some(Control::Propose { command, reply }) => {
+                        self.handle_propose(command, reply);
+                    }
                 },
                 _ = sleep_until(self.election_deadline), if !self.is_leader() => {
                     self.on_election_timeout();
@@ -240,6 +312,37 @@ impl<T: Transport + Clone> RaftNode<T> {
             term = self.current_term(),
             "raft node stopped"
         );
+    }
+
+    // ---- client proposals ----
+
+    fn handle_propose(
+        &mut self,
+        command: Command,
+        reply: oneshot::Sender<Result<(Term, LogIndex), ProposeError>>,
+    ) {
+        if !self.is_leader() {
+            let _ = reply.send(Err(ProposeError::NotLeader {
+                leader_hint: self.leader_id,
+            }));
+            return;
+        }
+        let term = self.current_term();
+        let index = self.storage.last_index() + 1;
+        self.storage
+            .append(&[LogEntry {
+                term,
+                index,
+                command,
+            }])
+            .expect("cannot persist proposal; fail-stop");
+        tracing::info!(node = self.config.id, term, index, "proposal appended");
+        let _ = reply.send(Ok((term, index)));
+        // A single-node cluster commits immediately; otherwise replicate now.
+        self.maybe_advance_commit();
+        for &peer in &self.config.peers {
+            self.send_append(peer);
+        }
     }
 
     // ---- inbound RPCs ----
@@ -315,8 +418,8 @@ impl<T: Transport + Clone> RaftNode<T> {
         }
     }
 
-    /// Phase 3: term handling + heartbeat recognition. The log consistency
-    /// check is real but trivial while logs are empty.
+    /// Full §5.3 AppendEntries: consistency check, duplicate-tolerant entry
+    /// processing with conflict truncation, and commit advancement.
     fn handle_append_entries(&mut self, args: AppendEntriesArgs) -> AppendEntriesReply {
         let current = self.current_term();
         if args.term < current {
@@ -339,11 +442,87 @@ impl<T: Transport + Clone> RaftNode<T> {
         self.become_follower(args.term, Some(args.leader_id));
         let term = self.current_term();
 
-        let log_ok = self.storage.term(args.prev_log_index) == Some(args.prev_log_term);
-        // TODO(phase 4): append/truncate entries, advance commit_index.
+        // Log-matching consistency check: we must hold the leader's prev
+        // entry. If not, the leader backtracks and retries.
+        if self.storage.term(args.prev_log_index) != Some(args.prev_log_term) {
+            tracing::debug!(
+                node = self.config.id,
+                term,
+                prev_log_index = args.prev_log_index,
+                prev_log_term = args.prev_log_term,
+                last_log_index = self.storage.last_index(),
+                "append rejected: log mismatch"
+            );
+            return AppendEntriesReply {
+                term,
+                success: false,
+            };
+        }
+
+        // Walk the entries: skip what we already hold (duplicate/reordered
+        // delivery), truncate our suffix at the first conflict, then append
+        // the rest. Committed entries can never conflict (§5.3 + §5.4) —
+        // enforced fail-stop below.
+        let mut append_from = None;
+        for entry in &args.entries {
+            match self.storage.term(entry.index) {
+                Some(existing) if existing == entry.term => continue,
+                Some(_) => {
+                    assert!(
+                        entry.index > self.commit_index,
+                        "SAFETY VIOLATION: asked to truncate committed entry {}",
+                        entry.index
+                    );
+                    self.storage
+                        .truncate_from(entry.index)
+                        .expect("cannot truncate conflicting entries; fail-stop");
+                    tracing::info!(
+                        node = self.config.id,
+                        term,
+                        from_index = entry.index,
+                        "truncated conflicting log suffix"
+                    );
+                    append_from = Some(entry.index);
+                    break;
+                }
+                None => {
+                    append_from = Some(entry.index);
+                    break;
+                }
+            }
+        }
+        if let Some(first) = append_from {
+            let offset = usize::try_from(first - args.prev_log_index - 1)
+                .expect("entry offset fits in usize");
+            self.storage
+                .append(&args.entries[offset..])
+                .expect("cannot append entries; fail-stop");
+            tracing::debug!(
+                node = self.config.id,
+                term,
+                from_index = first,
+                count = args.entries.len() - offset,
+                "appended entries from leader"
+            );
+        }
+
+        // Commit only up to what this RPC verified matches the leader.
+        let last_verified = args.prev_log_index + args.entries.len() as u64;
+        let new_commit = args.leader_commit.min(last_verified);
+        if new_commit > self.commit_index {
+            self.commit_index = new_commit;
+            tracing::debug!(
+                node = self.config.id,
+                term,
+                commit_index = new_commit,
+                "commit advanced"
+            );
+            // TODO(phase 5): apply newly committed entries to the KV map.
+        }
+
         AppendEntriesReply {
             term,
-            success: log_ok,
+            success: true,
         }
     }
 
@@ -394,6 +573,8 @@ impl<T: Transport + Clone> RaftNode<T> {
             Event::AppendReply {
                 sent_term,
                 from,
+                sent_prev_index,
+                sent_entries,
                 result,
             } => {
                 let reply = match result {
@@ -414,10 +595,52 @@ impl<T: Transport + Clone> RaftNode<T> {
                 };
                 if reply.term > self.current_term() {
                     self.become_follower(reply.term, None);
+                    return;
                 }
-                // TODO(phase 4): use sent_term/from/success to drive
-                // next_index backtracking and commit advancement.
-                let _ = sent_term;
+                if sent_term != self.current_term() {
+                    return; // reply to an RPC from an earlier term of ours
+                }
+                let last_index = self.storage.last_index();
+                let Role::Leader {
+                    next_index,
+                    match_index,
+                } = &mut self.role
+                else {
+                    return;
+                };
+                let mut resend = false;
+                if reply.success {
+                    // The peer confirmed it matches us up to prev + sent.
+                    // max() because replies can arrive reordered.
+                    let confirmed = sent_prev_index + sent_entries;
+                    let matched = match_index.entry(from).or_insert(0);
+                    if confirmed > *matched {
+                        *matched = confirmed;
+                        next_index.insert(from, confirmed + 1);
+                        // Keep pushing if the peer is still behind.
+                        resend = confirmed < last_index;
+                    }
+                } else {
+                    // §5.3 backtracking: the peer diverges at or before
+                    // sent_prev_index; step below it and retry immediately.
+                    // min() so stale rejections never undo progress.
+                    let next = next_index.entry(from).or_insert(1);
+                    *next = (*next).min(sent_prev_index.max(1));
+                    tracing::debug!(
+                        node = self.config.id,
+                        term = sent_term,
+                        peer = from,
+                        next_index = *next,
+                        "append rejected by peer; backtracking"
+                    );
+                    resend = true;
+                }
+                if reply.success {
+                    self.maybe_advance_commit();
+                }
+                if resend {
+                    self.send_append(from);
+                }
             }
         }
     }
@@ -498,37 +721,97 @@ impl<T: Transport + Clone> RaftNode<T> {
         }
         let term = self.current_term();
         tracing::info!(node = self.config.id, term, votes, "became leader");
-        self.role = Role::Leader;
+        let next = self.storage.last_index() + 1;
+        self.role = Role::Leader {
+            next_index: self.config.peers.iter().map(|&p| (p, next)).collect(),
+            match_index: self.config.peers.iter().map(|&p| (p, 0)).collect(),
+        };
         self.leader_id = Some(self.config.id);
-        // TODO(phase 4): initialize next_index/match_index here.
+        // Basic Raft: no no-op entry on election win, so prior-term entries
+        // commit only once a current-term proposal lands (§5.4.2).
         // Assert authority immediately; also schedules the next heartbeat.
         self.on_heartbeat_tick();
     }
 
+    // ---- leader replication ----
+
     fn on_heartbeat_tick(&mut self) {
+        for &peer in &self.config.peers {
+            self.send_append(peer);
+        }
+        self.next_heartbeat = Instant::now() + self.config.heartbeat_interval;
+    }
+
+    /// Sends `peer` everything from its next_index (an empty batch doubles
+    /// as the heartbeat). TODO(batching): sends the whole tail in one RPC;
+    /// fine while compaction is out of scope and logs stay small.
+    fn send_append(&self, peer: NodeId) {
+        let Role::Leader { next_index, .. } = &self.role else {
+            return;
+        };
+        let next = next_index
+            .get(&peer)
+            .copied()
+            .unwrap_or_else(|| self.storage.last_index() + 1);
+        let prev_log_index = next - 1;
+        let prev_log_term = self
+            .storage
+            .term(prev_log_index)
+            .expect("next_index stays within log bounds");
         let term = self.current_term();
         let args = AppendEntriesArgs {
             term,
             leader_id: self.config.id,
-            prev_log_index: self.storage.last_index(),
-            prev_log_term: self.storage.last_term(),
-            entries: Vec::new(),
+            prev_log_index,
+            prev_log_term,
+            entries: self.storage.entries_from(next).to_vec(),
             leader_commit: self.commit_index,
         };
-        for &peer in &self.config.peers {
-            let transport = self.transport.clone();
-            let events = self.events_tx.clone();
-            let args = args.clone();
-            tokio::spawn(async move {
-                let result = transport.send(peer, RpcRequest::AppendEntries(args)).await;
-                let _ = events.send(Event::AppendReply {
-                    sent_term: term,
-                    from: peer,
-                    result,
-                });
+        let sent_entries = args.entries.len() as u64;
+        let transport = self.transport.clone();
+        let events = self.events_tx.clone();
+        tokio::spawn(async move {
+            let result = transport.send(peer, RpcRequest::AppendEntries(args)).await;
+            let _ = events.send(Event::AppendReply {
+                sent_term: term,
+                from: peer,
+                sent_prev_index: prev_log_index,
+                sent_entries,
+                result,
             });
+        });
+    }
+
+    /// Advances commit_index to the highest index replicated on a majority,
+    /// but only for entries of the current term (§5.4.2) — prior-term
+    /// entries commit transitively.
+    fn maybe_advance_commit(&mut self) {
+        let Role::Leader { match_index, .. } = &self.role else {
+            return;
+        };
+        let mut replicated: Vec<LogIndex> = self
+            .config
+            .peers
+            .iter()
+            .map(|p| match_index.get(p).copied().unwrap_or(0))
+            .collect();
+        // The leader trivially holds its own whole log.
+        replicated.push(self.storage.last_index());
+        replicated.sort_unstable();
+        let candidate = replicated[replicated.len() - self.majority()];
+
+        if candidate > self.commit_index
+            && self.storage.term(candidate) == Some(self.current_term())
+        {
+            self.commit_index = candidate;
+            tracing::info!(
+                node = self.config.id,
+                term = self.current_term(),
+                commit_index = candidate,
+                "commit advanced"
+            );
+            // TODO(phase 5): apply committed entries + notify proposers.
         }
-        self.next_heartbeat = Instant::now() + self.config.heartbeat_interval;
     }
 
     // ---- helpers ----
@@ -538,14 +821,14 @@ impl<T: Transport + Clone> RaftNode<T> {
     }
 
     fn is_leader(&self) -> bool {
-        matches!(self.role, Role::Leader)
+        matches!(self.role, Role::Leader { .. })
     }
 
     fn role_kind(&self) -> RoleKind {
         match self.role {
             Role::Follower => RoleKind::Follower,
             Role::Candidate { .. } => RoleKind::Candidate,
-            Role::Leader => RoleKind::Leader,
+            Role::Leader { .. } => RoleKind::Leader,
         }
     }
 
@@ -571,6 +854,8 @@ impl<T: Transport + Clone> RaftNode<T> {
             term: self.current_term(),
             role: self.role_kind(),
             leader_id: self.leader_id,
+            commit_index: self.commit_index,
+            last_log_index: self.storage.last_index(),
         };
         self.status_tx.send_if_modified(|current| {
             if *current == status {

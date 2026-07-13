@@ -6,134 +6,24 @@
 //! §5.4.1 election restriction (cluster-level and RPC-level), vote rules and
 //! vote persistence across restart, and at-most-one-leader-per-term under
 //! message loss.
-//! NOT covered here: log replication (phase 4) and durable-write invariants
-//! under crashes mid-replication (phase 6). The one-leader-per-term check
-//! samples every 10ms of virtual time, so sub-sample leaderships could
-//! theoretically escape it; phase 6 tightens this.
+//! NOT covered here: log replication (tests/replication.rs) and durable-write
+//! invariants under crashes mid-replication (phase 6). The
+//! one-leader-per-term check samples every 10ms of virtual time, so
+//! sub-sample leaderships could theoretically escape it; phase 6 tightens
+//! this.
+
+mod common;
 
 use std::collections::HashMap;
 use std::time::Duration;
 
+use common::*;
 use rustkv::raft::Storage;
-use rustkv::raft::node::{RaftConfig, RaftHandle, RaftNode, RoleKind, Status};
+use rustkv::raft::node::{RaftNode, RoleKind, Status};
 use rustkv::raft::rpc::{RequestVoteArgs, RequestVoteReply, RpcRequest, RpcResponse};
 use rustkv::raft::transport::Transport;
 use rustkv::raft::transport::sim::{FaultConfig, SimNetwork, SimTransport};
-use rustkv::raft::types::{Command, HardState, LogEntry, NodeId, Term};
-use serde_json::json;
-use tempfile::TempDir;
-
-fn ms(n: u64) -> Duration {
-    Duration::from_millis(n)
-}
-
-fn low_loss_faults() -> FaultConfig {
-    FaultConfig {
-        min_delay: ms(1),
-        max_delay: ms(10),
-        drop_probability: 0.0,
-        rpc_timeout: ms(50),
-    }
-}
-
-struct TestCluster {
-    net: SimNetwork,
-    nodes: Vec<(NodeId, RaftHandle)>,
-    _dirs: Vec<TempDir>,
-}
-
-fn node_config(id: NodeId, n: u64, seed: u64) -> RaftConfig {
-    let peers = (1..=n).filter(|&p| p != id).collect();
-    let mut config = RaftConfig::new(id, peers);
-    // Distinct, seed-derived jitter per node.
-    config.timeout_seed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(id);
-    config
-}
-
-/// Spawns nodes 1..=n; `prepare` can pre-populate each node's storage
-/// (pre-existing log/term) before the node starts.
-fn spawn_cluster_with(
-    n: u64,
-    seed: u64,
-    faults: FaultConfig,
-    prepare: impl Fn(NodeId, &mut Storage),
-) -> TestCluster {
-    let net = SimNetwork::new(seed, faults);
-    let mut nodes = Vec::new();
-    let mut dirs = Vec::new();
-    for id in 1..=n {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut storage = Storage::open(dir.path()).expect("storage");
-        prepare(id, &mut storage);
-        let (transport, inbound) = net.register(id);
-        nodes.push((
-            id,
-            RaftNode::spawn(node_config(id, n, seed), storage, transport, inbound),
-        ));
-        dirs.push(dir);
-    }
-    TestCluster {
-        net,
-        nodes,
-        _dirs: dirs,
-    }
-}
-
-fn spawn_cluster(n: u64, seed: u64, faults: FaultConfig) -> TestCluster {
-    spawn_cluster_with(n, seed, faults, |_, _| {})
-}
-
-impl TestCluster {
-    fn handle(&self, id: NodeId) -> &RaftHandle {
-        &self
-            .nodes
-            .iter()
-            .find(|(nid, _)| *nid == id)
-            .expect("no such node")
-            .1
-    }
-
-    fn statuses_among(&self, ids: &[NodeId]) -> Vec<Status> {
-        self.nodes
-            .iter()
-            .filter(|(id, _)| ids.contains(id))
-            .map(|(_, h)| h.status())
-            .collect()
-    }
-
-    fn all_ids(&self) -> Vec<NodeId> {
-        self.nodes.iter().map(|(id, _)| *id).collect()
-    }
-
-    /// Waits (virtual time) until exactly one of `ids` reports Leader.
-    async fn wait_for_leader_among(&self, ids: &[NodeId]) -> Status {
-        tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                let leaders: Vec<Status> = self
-                    .statuses_among(ids)
-                    .into_iter()
-                    .filter(|s| s.role == RoleKind::Leader)
-                    .collect();
-                if leaders.len() == 1 {
-                    return leaders[0];
-                }
-                tokio::time::sleep(ms(5)).await;
-            }
-        })
-        .await
-        .expect("no leader elected within 30s of virtual time")
-    }
-
-    async fn wait_for_leader(&self) -> Status {
-        self.wait_for_leader_among(&self.all_ids()).await
-    }
-
-    fn shutdown(&self) {
-        for (_, handle) in &self.nodes {
-            handle.shutdown();
-        }
-    }
-}
+use rustkv::raft::types::{HardState, NodeId, Term};
 
 // ---- convergence and stability ----
 
@@ -358,17 +248,6 @@ async fn at_most_one_leader_per_term_under_message_loss() {
 
 // ---- election restriction (§5.4.1) ----
 
-fn entry(term: Term, index: u64) -> LogEntry {
-    LogEntry {
-        term,
-        index,
-        command: Command::Put {
-            key: format!("k{index}"),
-            value: json!(index),
-        },
-    }
-}
-
 #[tokio::test(start_paused = true)]
 async fn node_with_stale_log_never_becomes_leader() {
     for seed in 0..5 {
@@ -395,15 +274,6 @@ async fn node_with_stale_log_never_becomes_leader() {
 }
 
 // ---- RPC-level vote rules, driven by the test acting as a fake candidate ----
-
-/// Config with effectively-infinite election timeouts, so the node under
-/// test never starts its own elections.
-fn passive_config(id: NodeId, peers: Vec<NodeId>) -> RaftConfig {
-    let mut config = RaftConfig::new(id, peers);
-    config.election_timeout_min = Duration::from_secs(3600);
-    config.election_timeout_max = Duration::from_secs(7200);
-    config
-}
 
 async fn request_vote(
     transport: &SimTransport,
