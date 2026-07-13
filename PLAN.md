@@ -370,13 +370,83 @@ Untested / known gaps:
   CPU-starvation flake class (one occurrence seen during a full parallel run
   this phase; passes in isolation and on re-run).
 
-## Project complete (phases 0-9)
-Remaining ideas beyond the original scope, in planned order: harness
-hardening (crash nemesis in jepsen, sim message duplication, event-level
-leader-per-term), PreVote, client dedup tokens for 504 retries,
-snapshotting/compaction + InstallSnapshot, dynamic membership, connection
-pooling, scripted Docker partition test. (TLS on the raft port: dropped —
-blocked on the dependency whitelist.)
+## Phase 10 — harness hardening ✅
+
+Done:
+- `TestCluster` interior mutability (tests/common/mod.rs): nodes/stores
+  behind `Mutex` holding `Arc` clones, `incarnation: AtomicU64`,
+  `restart(&self, id)` — so concurrent workload/nemesis tasks can share the
+  cluster via `Arc` and crash/restart nodes mid-run. New `crashed` tracker +
+  `alive_ids()`: a crashed node's status watch freezes at its last value, so
+  workloads must exclude it from leader sampling. Mechanical call-site
+  updates across election/replication/faults/jepsen/read_index tests.
+- Jepsen nemesis (tests/jepsen.rs) now rolls each round between
+  partition/heal and crash-then-restart (at most one node down, restarted
+  before the round ends, so the final heal always finds everyone running).
+  `run_workload` reports the crash-round count and the linearizable-mode
+  tests assert it's nonzero across their seed set — crash coverage can't
+  silently vanish in a future seed re-pin.
+- Sim message duplication (src/raft/transport/sim.rs):
+  `FaultConfig.duplicate_probability` (default 0.0). Exactly two extra
+  unconditional RNG draws per send (duplicated? + duplicate delay) inside
+  the existing critical section, preserving the fixed-draw-count determinism
+  contract. The duplicate is a fire-and-forget second `Inbound` with a
+  throwaway reply oneshot on its own delay — it shares nothing with the
+  primary exchange's timeout, so it can arrive after the sender gave up;
+  it is delivered even if the primary leg is dropped, but never through a
+  blocked link.
+- Event-level Election Safety (closes the phase-3/6 sampling gap): the sim's
+  send critical section records `(term, leader_id)` from every AppendEntries
+  crossing the network; a second claimant for a term pushes into a
+  violations list (recorded, not panicked — sends run in spawned tasks).
+  `SimNetwork::election_safety_violations()` is asserted empty by
+  `TestCluster::shutdown()`, so every sim-cluster test checks it at
+  teardown; the sampled `observe_leaders` checks in faults.rs are gone
+  (election.rs keeps its sampling test as a redundant cluster-level check).
+  No Raft-core hook: the core still never knows about the network.
+
+Tested (85 total; 5 new):
+- Sim unit: duplicate_probability=1.0 delivers exactly two copies and the
+  primary exchange still succeeds; per-seed reproducibility of outcomes AND
+  receiver arrival counts under drop+duplication; checker-has-teeth — two
+  forged AppendEntries (same term, different leader_id) through bare
+  registered senders record exactly one violation, idempotent/other-term/
+  RequestVote claims record none, and a claim through a blocked link still
+  records (a send is a claim regardless of delivery).
+- Duplication soaks at 0.1: the randomized fault schedules (8 seeds) and
+  the full jepsen linearizable workload (6 seeds, log witness + WGL checker,
+  zero violations) both pass with 10% of requests delivered twice.
+- Crash/restart nemesis: `linearizable_reads_pass_the_checker` (and the
+  soak) now run partitions+crashes; 5 of 6 seeds roll ≥1 crash round.
+  Jepsen determinism re-pinned on seed 3 (1 crash round, dup 0.1); faults
+  determinism on seed 5 now at dup 0.1.
+- Test-the-tests mutation re-run: `majority()=1` trips the NEW event-level
+  assert at teardown ("nodes 2 and 3 both sent AppendEntries as leader of
+  term 2") in a suite whose sampled check was removed. Reverted.
+
+Seed churn (expected — two extra draws per send shift every schedule):
+every seeded suite was re-run and passed WITHOUT re-pinning; the stale-mode
+jepsen check now finds violations on all 6 seeds (previously a subset), and
+all other seed-pinned expectations (faults.rs counts, election/replication
+outcomes) held as written.
+
+Untested / known gaps:
+- Reply legs are never duplicated (requests only); the Raft core tolerates
+  duplicate replies by design (stale-reply folding) but the sim doesn't
+  exercise that path.
+- The duplicate copy skips the drop draw: a duplicated request always lands
+  once the link allows it (drop applies to the primary only) — documented
+  semantics, not a bug, but a different model than two fully independent
+  copies.
+- Election-safety interception reads AppendEntries only; when phase 11 adds
+  PreVote RPCs the interceptor must ignore them (TODO marker in sim.rs).
+
+## Project complete (phases 0-10)
+Remaining ideas beyond the original scope, in planned order: PreVote,
+client dedup tokens for 504 retries, snapshotting/compaction +
+InstallSnapshot, dynamic membership, connection pooling, scripted Docker
+partition test. (TLS on the raft port: dropped — blocked on the dependency
+whitelist.)
 
 ## Out of scope (deliberate)
 Snapshotting/log compaction, dynamic membership changes — leave clean TODOs.

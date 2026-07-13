@@ -20,8 +20,10 @@
 //!     workload through ReadIndex ([`RaftHandle::read`]) and the checker
 //!     must find NO violation on any seed — the phase-9 headline claim.
 //!
-//! Crash/restart faults are exercised in tests/faults.rs; the nemesis here
-//! uses partitions only, which is where stale reads live.
+//! The nemesis (phase 10) mixes partition/heal rounds with crash/restart
+//! rounds (at most one node down at a time, always restarted before the
+//! round ends), and a soak variant additionally duplicates 10% of all
+//! requests in flight.
 
 mod common;
 
@@ -163,8 +165,10 @@ const CLIENTS: u64 = 4;
 const OPS_PER_CLIENT: u64 = 12;
 
 fn unique_leader(cluster: &TestCluster) -> Option<NodeId> {
+    // Sample only live nodes: a crashed node's status watch is frozen and
+    // may still claim a leadership it no longer holds.
     let leaders: Vec<NodeId> = cluster
-        .statuses_among(&cluster.all_ids())
+        .statuses_among(&cluster.alive_ids())
         .into_iter()
         .filter(|s| s.role == RoleKind::Leader)
         .map(|s| s.id)
@@ -187,39 +191,58 @@ enum ReadMode {
     Linearizable,
 }
 
-/// Runs one seeded workload; returns the merged history and each node's
-/// final on-disk log (nodes are shut down afterwards).
-async fn run_workload(seed: u64, reads: ReadMode) -> (Vec<Recorded>, Vec<Vec<LogEntry>>) {
+/// Runs one seeded workload; returns the merged history, each node's final
+/// on-disk log (nodes are shut down afterwards), and how many crash rounds
+/// the nemesis rolled — callers assert on the sum so crash coverage can't
+/// silently vanish in a future seed re-pin.
+async fn run_workload(
+    seed: u64,
+    reads: ReadMode,
+    duplicate_probability: f64,
+) -> (Vec<Recorded>, Vec<Vec<LogEntry>>, u64) {
     let faults = rustkv::raft::transport::sim::FaultConfig {
         min_delay: ms(1),
         max_delay: ms(15),
         drop_probability: 0.05,
+        duplicate_probability,
         rpc_timeout: ms(40),
     };
     let cluster = Arc::new(spawn_cluster(3, seed, faults));
     let start = Instant::now();
     cluster.wait_for_leader().await;
 
-    // Nemesis: repeatedly isolate a random node, then heal it.
+    // Nemesis: each round picks a random victim and either isolates it for
+    // a while and heals it, or crashes it and restarts it (at most one node
+    // down at a time — the restart happens before the round ends, so the
+    // final heal below always finds every node running).
     let nemesis = {
         let cluster = Arc::clone(&cluster);
         tokio::spawn(async move {
             let mut rng = SplitMix64::new(seed ^ 0xDEAD_BEEF);
+            let mut crashes = 0u64;
             for _ in 0..6 {
                 tokio::time::sleep(ms(rng.next_range(80..=300))).await;
                 let victim = rng.next_range(1..=3);
-                for other in cluster.all_ids() {
-                    if other != victim {
-                        cluster.net.set_pair_blocked(victim, other, true);
+                if rng.next_range(0..=9) < 3 {
+                    crashes += 1;
+                    cluster.crash(victim);
+                    tokio::time::sleep(ms(rng.next_range(150..=400))).await;
+                    cluster.restart(victim).await;
+                } else {
+                    for other in cluster.all_ids() {
+                        if other != victim {
+                            cluster.net.set_pair_blocked(victim, other, true);
+                        }
                     }
-                }
-                tokio::time::sleep(ms(rng.next_range(150..=400))).await;
-                for other in cluster.all_ids() {
-                    if other != victim {
-                        cluster.net.set_pair_blocked(victim, other, false);
+                    tokio::time::sleep(ms(rng.next_range(150..=400))).await;
+                    for other in cluster.all_ids() {
+                        if other != victim {
+                            cluster.net.set_pair_blocked(victim, other, false);
+                        }
                     }
                 }
             }
+            crashes
         })
     };
 
@@ -328,7 +351,7 @@ async fn run_workload(seed: u64, reads: ReadMode) -> (Vec<Recorded>, Vec<Vec<Log
     for client in clients {
         history.extend(client.await.expect("client task"));
     }
-    nemesis.await.expect("nemesis task");
+    let crashes = nemesis.await.expect("nemesis task");
 
     // Heal everything, converge, and take Jepsen-style final reads (they
     // pin down which unknown writes actually landed).
@@ -382,7 +405,7 @@ async fn run_workload(seed: u64, reads: ReadMode) -> (Vec<Recorded>, Vec<Vec<Log
         .into_iter()
         .map(|id| cluster.disk_log(id))
         .collect();
-    (history, logs)
+    (history, logs, crashes)
 }
 
 // ---- checked claims ----
@@ -435,7 +458,7 @@ fn check_write_witness(history: &[Recorded], log: &[LogEntry]) -> Result<(), Str
 #[tokio::test(start_paused = true)]
 async fn confirmed_writes_are_linearizable_via_the_log_witness() {
     for seed in 0..6 {
-        let (history, logs) = run_workload(seed, ReadMode::Stale).await;
+        let (history, logs, _) = run_workload(seed, ReadMode::Stale, 0.0).await;
         for log in &logs[1..] {
             assert_eq!(*log, logs[0], "seed {seed}: logs diverge");
         }
@@ -447,8 +470,11 @@ async fn confirmed_writes_are_linearizable_via_the_log_witness() {
 
 #[tokio::test(start_paused = true)]
 async fn same_seed_reproduces_the_same_history() {
-    let (history_a, logs_a) = run_workload(3, ReadMode::Linearizable).await;
-    let (history_b, logs_b) = run_workload(3, ReadMode::Linearizable).await;
+    // With duplication on, so the determinism claim covers the full phase-10
+    // fault mix: partitions, crashes/restarts, and duplicated messages.
+    let (history_a, logs_a, crashes) = run_workload(3, ReadMode::Linearizable, 0.10).await;
+    let (history_b, logs_b, _) = run_workload(3, ReadMode::Linearizable, 0.10).await;
+    assert!(crashes > 0, "seed 3 must exercise a crash round");
     let refs_a: Vec<&Recorded> = history_a.iter().collect();
     let refs_b: Vec<&Recorded> = history_b.iter().collect();
     assert_eq!(
@@ -469,7 +495,7 @@ async fn same_seed_reproduces_the_same_history() {
 async fn local_reads_expose_documented_staleness_under_partitions() {
     let mut violations = Vec::new();
     for seed in 0..6 {
-        let (history, _) = run_workload(seed, ReadMode::Stale).await;
+        let (history, _, _) = run_workload(seed, ReadMode::Stale, 0.0).await;
         if let Err(reason) = check_linearizable(&history) {
             violations.push((seed, reason));
         }
@@ -490,8 +516,10 @@ async fn local_reads_expose_documented_staleness_under_partitions() {
 /// on any seed. This is the phase's headline claim: reads are linearizable.
 #[tokio::test(start_paused = true)]
 async fn linearizable_reads_pass_the_checker() {
+    let mut total_crashes = 0;
     for seed in 0..6 {
-        let (history, _) = run_workload(seed, ReadMode::Linearizable).await;
+        let (history, _, crashes) = run_workload(seed, ReadMode::Linearizable, 0.0).await;
+        total_crashes += crashes;
         let reads = history
             .iter()
             .filter(|r| matches!(r.op, OpKind::Read { .. }))
@@ -506,4 +534,30 @@ async fn linearizable_reads_pass_the_checker() {
             panic!("seed {seed}: linearizable reads produced a violation:\n{reason}");
         }
     }
+    // The other vacuity guard: the seed set must exercise crash rounds, or
+    // "linearizable under crashes" was never actually tested.
+    assert!(total_crashes > 0, "no seed rolled a crash round");
+}
+
+/// The duplication soak: the linearizable workload with 10% of requests
+/// delivered twice on top of loss, partitions and crash/restarts. Both the
+/// lin checker and the log witness must still hold — duplicate
+/// AppendEntries/votes must never double-apply or split a term.
+#[tokio::test(start_paused = true)]
+async fn linearizable_reads_survive_message_duplication() {
+    let mut total_crashes = 0;
+    for seed in 0..6 {
+        let (history, logs, crashes) = run_workload(seed, ReadMode::Linearizable, 0.10).await;
+        total_crashes += crashes;
+        for log in &logs[1..] {
+            assert_eq!(*log, logs[0], "seed {seed}: logs diverge");
+        }
+        check_write_witness(&history, &logs[0]).unwrap_or_else(|reason| {
+            panic!("seed {seed}: {reason}");
+        });
+        if let Err(reason) = check_linearizable(&history) {
+            panic!("seed {seed}: violation under duplication:\n{reason}");
+        }
+    }
+    assert!(total_crashes > 0, "no seed rolled a crash round");
 }

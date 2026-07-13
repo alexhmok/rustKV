@@ -8,9 +8,10 @@
 //! message loss.
 //! NOT covered here: log replication (tests/replication.rs) and durable-write
 //! invariants under crashes mid-replication (phase 6). The
-//! one-leader-per-term check samples every 10ms of virtual time, so
-//! sub-sample leaderships could theoretically escape it; phase 6 tightens
-//! this.
+//! one-leader-per-term check here samples every 10ms of virtual time (kept
+//! as a redundant cluster-level check); the airtight event-level version
+//! lives in the sim transport since phase 10 and is asserted by
+//! `TestCluster::shutdown` in every test below.
 
 mod common;
 
@@ -90,7 +91,7 @@ async fn leader_crash_triggers_reelection_at_higher_term() {
     let cluster = spawn_cluster(3, 11, low_loss_faults());
     let old = cluster.wait_for_leader().await;
 
-    cluster.handle(old.id).crash();
+    cluster.crash(old.id);
     let survivors: Vec<NodeId> = cluster
         .all_ids()
         .into_iter()
@@ -219,6 +220,7 @@ async fn at_most_one_leader_per_term_under_message_loss() {
             min_delay: ms(1),
             max_delay: ms(15),
             drop_probability: 0.25,
+            duplicate_probability: 0.0,
             rpc_timeout: ms(40),
         };
         let cluster = spawn_cluster(3, seed, faults);

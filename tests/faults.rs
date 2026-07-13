@@ -2,7 +2,11 @@
 //! virtual time — every scenario is a pure function of its seed.
 //!
 //! Safety invariants asserted:
-//! - at most one leader per term (sampled continuously through each run);
+//! - at most one leader per term — event-level since phase 10: the sim
+//!   transport inspects every AppendEntries crossing the network and
+//!   records conflicting leadership claims; `TestCluster::shutdown`
+//!   (called by `assert_final_consistency`) asserts none were seen, so no
+//!   sub-sample flicker can escape;
 //! - no confirmed write lost: once a proposal's commit is positively
 //!   observed, its (term, index, command) must be in every node's log at
 //!   the end;
@@ -14,16 +18,17 @@
 //! Scenarios: leader crash/restart mid-write, repeated partition/heal
 //! cycles (including partitioning the leader), a seeded randomized schedule
 //! mixing writes, partitions, heals, crashes and restarts under 10% message
-//! loss, write stall without a majority + resumption after restart, and a
-//! same-seed determinism check over the randomized schedule.
+//! loss (run both with and without message duplication), write stall
+//! without a majority + resumption after restart, and a same-seed
+//! determinism check over the randomized schedule.
 //!
-//! Honest limits: leader-per-term is checked by sampling (between driver
-//! steps), not event-level interception; each value is proposed at most
-//! once, so client-level retry duplication is out of scope (see PLAN.md).
+//! Honest limits: each value is proposed at most once, so client-level
+//! retry duplication is out of scope (see PLAN.md) — transport-level
+//! duplication is covered by the `duplicate_probability` soak.
 
 mod common;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::Duration;
 
 use common::*;
@@ -33,24 +38,6 @@ use rustkv::rng::SplitMix64;
 
 /// A write whose commit was positively observed.
 type Confirmed = (Term, LogIndex, u64);
-
-fn observe_leaders(
-    cluster: &TestCluster,
-    alive: &[NodeId],
-    seen: &mut HashMap<Term, NodeId>,
-    context: &str,
-) {
-    for status in cluster.statuses_among(alive) {
-        if status.role == RoleKind::Leader {
-            let prev = seen.entry(status.term).or_insert(status.id);
-            assert_eq!(
-                *prev, status.id,
-                "{context}: two leaders observed in term {}",
-                status.term
-            );
-        }
-    }
-}
 
 /// The single visible leader among `ids`, if there is exactly one.
 fn unique_leader(cluster: &TestCluster, ids: &[NodeId]) -> Option<Status> {
@@ -172,7 +159,7 @@ async fn assert_final_consistency(cluster: &TestCluster, confirmed: &[Confirmed]
 async fn leader_crash_mid_write_preserves_confirmed_writes() {
     for seed in [41, 42, 43, 44, 45] {
         let context = format!("seed {seed}");
-        let mut cluster = spawn_cluster(3, seed, low_loss_faults());
+        let cluster = spawn_cluster(3, seed, low_loss_faults());
         let mut confirmed = Vec::new();
 
         let leader = cluster.wait_for_leader().await;
@@ -236,7 +223,6 @@ async fn partition_heal_cycles_preserve_confirmed_writes() {
         let context = format!("seed {seed}");
         let cluster = spawn_cluster(3, seed, low_loss_faults());
         let all = cluster.all_ids();
-        let mut leaders_by_term = HashMap::new();
         let mut confirmed = Vec::new();
         let mut next_value = 0u64;
 
@@ -253,13 +239,11 @@ async fn partition_heal_cycles_preserve_confirmed_writes() {
             for _ in 0..2 {
                 write_until_confirmed(&cluster, &majority, &mut next_value, &mut confirmed).await;
             }
-            observe_leaders(&cluster, &all, &mut leaders_by_term, &context);
 
             for &id in &majority {
                 cluster.net.set_pair_blocked(victim, id, false);
             }
             tokio::time::sleep(ms(500)).await; // let the victim reintegrate
-            observe_leaders(&cluster, &all, &mut leaders_by_term, &context);
         }
 
         converge(&cluster).await;
@@ -271,22 +255,26 @@ async fn partition_heal_cycles_preserve_confirmed_writes() {
 // ---- randomized fault schedules ----
 
 /// Runs a seeded random schedule of writes, partitions, heals, crashes and
-/// restarts under 10% message loss, asserting invariants throughout.
+/// restarts under 10% message loss (plus `duplicate_probability` message
+/// duplication), asserting invariants throughout.
 /// Returns the action trace and the final log for determinism checks.
-async fn randomized_fault_schedule(seed: u64) -> (Vec<String>, Vec<LogEntry>) {
+async fn randomized_fault_schedule(
+    seed: u64,
+    duplicate_probability: f64,
+) -> (Vec<String>, Vec<LogEntry>) {
     let context = format!("seed {seed}");
     let faults = rustkv::raft::transport::sim::FaultConfig {
         min_delay: ms(1),
         max_delay: ms(15),
         drop_probability: 0.10,
+        duplicate_probability,
         rpc_timeout: ms(40),
     };
-    let mut cluster = spawn_cluster(3, seed, faults);
+    let cluster = spawn_cluster(3, seed, faults);
     let all = cluster.all_ids();
     let mut rng = SplitMix64::new(seed.wrapping_mul(0x5851_F42D_4C95_7F2D).wrapping_add(99));
     let mut trace = Vec::new();
     let mut confirmed: Vec<Confirmed> = Vec::new();
-    let mut leaders_by_term = HashMap::new();
     let mut next_value = 0u64;
     let mut crashed: Option<NodeId> = None; // at most one down at a time
     let mut isolated: Vec<NodeId> = Vec::new(); // kept sorted for determinism
@@ -297,7 +285,6 @@ async fn randomized_fault_schedule(seed: u64) -> (Vec<String>, Vec<LogEntry>) {
             .copied()
             .filter(|id| Some(*id) != crashed)
             .collect();
-        observe_leaders(&cluster, &alive, &mut leaders_by_term, &context);
 
         match rng.next_range(0..=9) {
             // Writes are the most common action.
@@ -371,7 +358,6 @@ async fn randomized_fault_schedule(seed: u64) -> (Vec<String>, Vec<LogEntry>) {
     for _ in 0..2 {
         write_until_confirmed(&cluster, &all, &mut next_value, &mut confirmed).await;
     }
-    observe_leaders(&cluster, &all, &mut leaders_by_term, &context);
     converge(&cluster).await;
     trace.push(format!("done: {} confirmed writes", confirmed.len()));
     assert_final_consistency(&cluster, &confirmed, &context).await;
@@ -381,14 +367,25 @@ async fn randomized_fault_schedule(seed: u64) -> (Vec<String>, Vec<LogEntry>) {
 #[tokio::test(start_paused = true)]
 async fn randomized_fault_schedules_preserve_safety_across_seeds() {
     for seed in 0..8 {
-        randomized_fault_schedule(seed).await;
+        randomized_fault_schedule(seed, 0.0).await;
+    }
+}
+
+/// The duplication soak: the same randomized schedules with 10% of all
+/// requests delivered twice, exercising the duplicate-tolerant
+/// AppendEntries walk (and vote idempotence) end-to-end under partitions,
+/// crashes and loss at once.
+#[tokio::test(start_paused = true)]
+async fn randomized_fault_schedules_survive_message_duplication() {
+    for seed in 0..8 {
+        randomized_fault_schedule(seed, 0.10).await;
     }
 }
 
 #[tokio::test(start_paused = true)]
 async fn same_seed_reproduces_the_same_fault_run() {
-    let (trace_a, log_a) = randomized_fault_schedule(5).await;
-    let (trace_b, log_b) = randomized_fault_schedule(5).await;
+    let (trace_a, log_a) = randomized_fault_schedule(5, 0.10).await;
+    let (trace_b, log_b) = randomized_fault_schedule(5, 0.10).await;
     assert_eq!(trace_a, trace_b, "action/outcome traces must be identical");
     assert_eq!(log_a, log_b, "final logs must be identical");
 }
@@ -397,7 +394,7 @@ async fn same_seed_reproduces_the_same_fault_run() {
 
 #[tokio::test(start_paused = true)]
 async fn writes_stall_without_majority_and_resume_after_restart() {
-    let mut cluster = spawn_cluster(3, 51, low_loss_faults());
+    let cluster = spawn_cluster(3, 51, low_loss_faults());
     let leader = cluster.wait_for_leader().await;
     let p1 = cluster
         .handle(leader.id)

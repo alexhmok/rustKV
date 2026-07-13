@@ -106,6 +106,7 @@ async fn reads_wait_for_the_term_start_noop() {
         min_delay: ms(20),
         max_delay: ms(40),
         drop_probability: 0.0,
+        duplicate_probability: 0.0,
         rpc_timeout: ms(200),
     };
     let cluster = spawn_cluster(3, 74, faults);

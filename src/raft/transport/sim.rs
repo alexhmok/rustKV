@@ -14,8 +14,9 @@
 //! later interleave.
 //!
 //! Fault control:
-//! - [`FaultConfig`]: delay range, per-leg drop probability, RPC timeout;
-//!   swappable at runtime via [`SimNetwork::set_fault_config`].
+//! - [`FaultConfig`]: delay range, per-leg drop probability, request
+//!   duplication probability, RPC timeout; swappable at runtime via
+//!   [`SimNetwork::set_fault_config`].
 //! - Directed link blocking ([`SimNetwork::set_link_blocked`] /
 //!   `set_pair_blocked`) — the building block for phase 6 partitions.
 //! - Crashes: dropping a node's `Inbound` receiver makes it a black hole
@@ -24,6 +25,14 @@
 //! Link state is sampled once per leg (request: at send; reply: when the
 //! handler answers), so a block landing mid-flight does not retroactively
 //! destroy a message already "on the wire".
+//!
+//! The network also acts as an event-level safety observer (phase 10):
+//! every AppendEntries passing through the send path is a leadership claim
+//! `(term, leader_id)`, so two different claimants for one term is Election
+//! Safety (§5.2) violated — recorded in
+//! [`SimNetwork::election_safety_violations`] for tests to assert on at
+//! teardown. Recording, not panicking: sends run in spawned tasks, where a
+//! panic would be silently swallowed with the task.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -33,7 +42,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::raft::rpc::{RpcRequest, RpcResponse};
 use crate::raft::transport::{Inbound, Transport, TransportError};
-use crate::raft::types::NodeId;
+use crate::raft::types::{NodeId, Term};
 use crate::rng::SplitMix64;
 
 #[derive(Debug, Clone)]
@@ -43,6 +52,11 @@ pub struct FaultConfig {
     pub max_delay: Duration,
     /// Probability that a given leg is silently lost.
     pub drop_probability: f64,
+    /// Probability that a request is delivered twice. The duplicate is an
+    /// independent copy with its own delay whose reply goes nowhere; it is
+    /// delivered even if the primary copy is dropped (one copy lost, the
+    /// other not), but never through a blocked link.
+    pub duplicate_probability: f64,
     /// How long a sender waits for the reply before giving up.
     pub rpc_timeout: Duration,
 }
@@ -53,6 +67,7 @@ impl Default for FaultConfig {
             min_delay: Duration::from_millis(1),
             max_delay: Duration::from_millis(10),
             drop_probability: 0.0,
+            duplicate_probability: 0.0,
             rpc_timeout: Duration::from_millis(100),
         }
     }
@@ -64,6 +79,10 @@ struct State {
     nodes: HashMap<NodeId, mpsc::UnboundedSender<Inbound>>,
     /// Directed `(from, to)` pairs whose messages are dropped.
     blocked: HashSet<(NodeId, NodeId)>,
+    /// First node seen claiming leadership of each term (via AppendEntries).
+    leaders_per_term: HashMap<Term, NodeId>,
+    /// Election Safety violations observed on the send path.
+    violations: Vec<String>,
 }
 
 /// The shared fabric. Cheap to clone; all clones drive the same network.
@@ -80,6 +99,8 @@ impl SimNetwork {
                 config,
                 nodes: HashMap::new(),
                 blocked: HashSet::new(),
+                leaders_per_term: HashMap::new(),
+                violations: Vec::new(),
             })),
         }
     }
@@ -121,6 +142,15 @@ impl SimNetwork {
         self.lock().config = config;
     }
 
+    /// Election Safety violations seen so far: two distinct nodes claiming
+    /// leadership of the same term via AppendEntries. Every message crossing
+    /// the network is inspected (even ones later dropped — a send is a claim
+    /// regardless of delivery), so unlike status sampling this cannot miss a
+    /// sub-sample leadership flicker. Empty on a correct Raft.
+    pub fn election_safety_violations(&self) -> Vec<String> {
+        self.lock().violations.clone()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().expect("sim network lock poisoned")
     }
@@ -141,6 +171,8 @@ struct SendPlan {
     req_delay: Duration,
     resp_dropped: bool,
     resp_delay: Duration,
+    req_duplicated: bool,
+    dup_delay: Duration,
     rpc_timeout: Duration,
 }
 
@@ -149,7 +181,11 @@ impl Transport for SimTransport {
         let from = self.id;
         let plan = {
             let mut st = self.state.lock().expect("sim network lock poisoned");
+            record_leadership_claim(&mut st, &req);
             let cfg = st.config.clone();
+            // Determinism contract: a fixed number of draws per send, all in
+            // this critical section — the duplication draws are unconditional
+            // even when duplicate_probability is 0.
             SendPlan {
                 target: st.nodes.get(&to).cloned(),
                 req_blocked: st.blocked.contains(&(from, to)),
@@ -157,12 +193,38 @@ impl Transport for SimTransport {
                 req_delay: draw_delay(&mut st.rng, &cfg),
                 resp_dropped: st.rng.next_bool(cfg.drop_probability),
                 resp_delay: draw_delay(&mut st.rng, &cfg),
+                req_duplicated: st.rng.next_bool(cfg.duplicate_probability),
+                dup_delay: draw_delay(&mut st.rng, &cfg),
                 rpc_timeout: cfg.rpc_timeout,
             }
         };
         let Some(target) = plan.target else {
             return Err(TransportError::Unreachable(to));
         };
+
+        if plan.req_duplicated && !plan.req_blocked {
+            // Fire-and-forget second copy on its own clock. Its reply
+            // receiver is dropped immediately (handlers tolerate that), and
+            // it shares nothing with the primary exchange's timeout — a
+            // duplicate can arrive long after the sender gave up.
+            let dup_target = target.clone();
+            let dup_req = req.clone();
+            let dup_delay = plan.dup_delay;
+            tokio::spawn(async move {
+                tokio::time::sleep(dup_delay).await;
+                let (reply_tx, _discarded) = oneshot::channel();
+                if dup_target
+                    .send(Inbound {
+                        from,
+                        request: dup_req,
+                        reply: reply_tx,
+                    })
+                    .is_ok()
+                {
+                    tracing::trace!(from, to, "sim: duplicate request delivered");
+                }
+            });
+        }
 
         let state = Arc::clone(&self.state);
         let exchange = async move {
@@ -207,6 +269,28 @@ impl Transport for SimTransport {
     }
 }
 
+/// Every AppendEntries is a claim "I lead term T"; two claimants for one
+/// term is Election Safety broken. TODO(phase 11): ignore PreVote variants
+/// here — a pre-candidate claims nothing.
+fn record_leadership_claim(st: &mut State, req: &RpcRequest) {
+    let RpcRequest::AppendEntries(args) = req else {
+        return;
+    };
+    match st.leaders_per_term.get(&args.term) {
+        None => {
+            st.leaders_per_term.insert(args.term, args.leader_id);
+        }
+        Some(&known) if known != args.leader_id => {
+            st.violations.push(format!(
+                "election safety violated: nodes {known} and {} both sent \
+                 AppendEntries as leader of term {}",
+                args.leader_id, args.term
+            ));
+        }
+        Some(_) => {}
+    }
+}
+
 fn draw_delay(rng: &mut SplitMix64, cfg: &FaultConfig) -> Duration {
     let lo = u64::try_from(cfg.min_delay.as_micros()).expect("min_delay fits in u64 µs");
     let hi = u64::try_from(cfg.max_delay.as_micros()).expect("max_delay fits in u64 µs");
@@ -217,8 +301,11 @@ fn draw_delay(rng: &mut SplitMix64, cfg: &FaultConfig) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::rpc::{AppendEntriesReply, RequestVoteArgs, RequestVoteReply};
+    use crate::raft::rpc::{
+        AppendEntriesArgs, AppendEntriesReply, RequestVoteArgs, RequestVoteReply,
+    };
     use crate::raft::types::Term;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::time::Instant;
 
     fn ms(n: u64) -> Duration {
@@ -231,6 +318,17 @@ mod tests {
             candidate_id: 1,
             last_log_index: 0,
             last_log_term: 0,
+        })
+    }
+
+    fn ae_req(term: Term, leader_id: NodeId) -> RpcRequest {
+        RpcRequest::AppendEntries(AppendEntriesArgs {
+            term,
+            leader_id,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: Vec::new(),
+            leader_commit: 0,
         })
     }
 
@@ -260,6 +358,7 @@ mod tests {
             min_delay: delay,
             max_delay: delay,
             drop_probability: 0.0,
+            duplicate_probability: 0.0,
             rpc_timeout: ms(100),
         }
     }
@@ -362,6 +461,7 @@ mod tests {
             min_delay: ms(1),
             max_delay: ms(20),
             drop_probability: 0.3,
+            duplicate_probability: 0.0,
             rpc_timeout: ms(50),
         };
         let net = SimNetwork::new(seed, cfg);
@@ -412,6 +512,7 @@ mod tests {
             min_delay: ms(1),
             max_delay: ms(20),
             drop_probability: 0.0,
+            duplicate_probability: 0.0,
             rpc_timeout: ms(100),
         };
         let net = SimNetwork::new(seed, cfg);
@@ -439,6 +540,143 @@ mod tests {
         h1.await.unwrap().unwrap();
         h2.await.unwrap().unwrap();
         order
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_duplication_delivers_every_request_twice() {
+        let cfg = FaultConfig {
+            duplicate_probability: 1.0,
+            ..fixed_delay_config(ms(2))
+        };
+        let net = SimNetwork::new(11, cfg);
+        let (t1, _rx1) = net.register(1);
+        let (_t2, mut rx2) = net.register(2);
+
+        let sender = tokio::spawn(async move { t1.send(2, vote_req(7)).await });
+        for copy in 0..2 {
+            let inbound = rx2.recv().await.unwrap_or_else(|| panic!("copy {copy}"));
+            let RpcRequest::RequestVote(args) = &inbound.request else {
+                panic!("unexpected rpc");
+            };
+            assert_eq!(args.term, 7, "copy {copy} is byte-for-byte the request");
+            // Answer both copies; the duplicate's reply sinks harmlessly
+            // into its dropped receiver.
+            let _ = inbound
+                .reply
+                .send(RpcResponse::RequestVote(RequestVoteReply {
+                    term: args.term,
+                    vote_granted: true,
+                }));
+        }
+        assert!(
+            sender.await.unwrap().is_ok(),
+            "the primary exchange still completes normally"
+        );
+        // And no third copy ever shows up.
+        tokio::time::timeout(ms(500), rx2.recv())
+            .await
+            .expect_err("exactly two copies");
+    }
+
+    /// 20 concurrent sends under drop + duplication; the per-send outcomes
+    /// AND the receiver-side arrival count must be pure functions of the
+    /// seed.
+    async fn duplicated_lossy_trace(seed: u64) -> (Vec<String>, u64) {
+        let cfg = FaultConfig {
+            min_delay: ms(1),
+            max_delay: ms(20),
+            drop_probability: 0.2,
+            duplicate_probability: 0.5,
+            rpc_timeout: ms(50),
+        };
+        let net = SimNetwork::new(seed, cfg);
+        let (t1, _rx1) = net.register(1);
+        let (_t2, mut rx2) = net.register(2);
+        let arrivals = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&arrivals);
+        tokio::spawn(async move {
+            while let Some(inbound) = rx2.recv().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let RpcRequest::RequestVote(args) = &inbound.request else {
+                    continue;
+                };
+                let _ = inbound
+                    .reply
+                    .send(RpcResponse::RequestVote(RequestVoteReply {
+                        term: args.term,
+                        vote_granted: true,
+                    }));
+            }
+        });
+
+        let start = Instant::now();
+        let handles: Vec<_> = (0..20u64)
+            .map(|i| {
+                let t1 = t1.clone();
+                tokio::spawn(async move {
+                    let result = t1.send(2, vote_req(i)).await;
+                    format!(
+                        "msg {i}: ok={} at {}µs",
+                        result.is_ok(),
+                        start.elapsed().as_micros()
+                    )
+                })
+            })
+            .collect();
+        let mut trace = Vec::new();
+        for h in handles {
+            trace.push(h.await.unwrap());
+        }
+        // Duplicates are fire-and-forget on their own clocks — let any
+        // stragglers land before reading the arrival counter.
+        tokio::time::sleep(ms(200)).await;
+        (trace, arrivals.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn duplication_schedule_is_reproducible_per_seed() {
+        let (trace_a, arrivals_a) = duplicated_lossy_trace(77).await;
+        let (trace_b, arrivals_b) = duplicated_lossy_trace(77).await;
+        assert_eq!(trace_a, trace_b);
+        assert_eq!(arrivals_a, arrivals_b);
+        // Sanity: more arrivals than the 20 primary sends means duplicates
+        // really landed (drops only push the count down).
+        assert!(
+            arrivals_a > 20,
+            "expected duplicate deliveries, got {arrivals_a} arrivals"
+        );
+    }
+
+    /// The event-level Election Safety observer must record forged
+    /// conflicting leadership claims — and nothing else.
+    #[tokio::test(start_paused = true)]
+    async fn election_safety_interceptor_records_conflicting_claims() {
+        let net = SimNetwork::new(0, fixed_delay_config(ms(1)));
+        let (t1, _rx1) = net.register(1);
+        let (t2, _rx2) = net.register(2);
+        let (_t3, rx3) = net.register(3);
+        spawn_echo(rx3);
+
+        // Repeated claims by the same node, and claims for other terms, are
+        // not violations. Neither are RequestVotes (candidates, not leaders).
+        t1.send(3, ae_req(5, 1)).await.unwrap();
+        t1.send(3, ae_req(5, 1)).await.unwrap();
+        t1.send(3, ae_req(6, 1)).await.unwrap();
+        t2.send(3, vote_req(5)).await.unwrap();
+        assert_eq!(net.election_safety_violations(), Vec::<String>::new());
+
+        // Forged conflict: node 2 also claims to lead term 5.
+        t2.send(3, ae_req(5, 2)).await.unwrap();
+        let violations = net.election_safety_violations();
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].contains("term 5"), "{violations:?}");
+
+        // A claim records at send time even if the message is then lost:
+        // node 2 claiming node 1's term 6 from behind a blocked link still
+        // conflicts.
+        net.set_link_blocked(2, 3, true);
+        let _ = t2.send(3, ae_req(6, 2)).await;
+        assert_eq!(net.election_safety_violations().len(), 2);
     }
 
     #[tokio::test(start_paused = true)]

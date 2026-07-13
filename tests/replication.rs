@@ -428,6 +428,7 @@ async fn confirmed_writes_survive_sustained_message_loss() {
             min_delay: ms(1),
             max_delay: ms(15),
             drop_probability: 0.15,
+            duplicate_probability: 0.0,
             rpc_timeout: ms(40),
         };
         let cluster = spawn_cluster(3, seed, faults);
