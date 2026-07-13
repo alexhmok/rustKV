@@ -6,10 +6,9 @@
 //! binary (`src/main.rs`) is a thin shell that wires up config, tracing, and
 //! the network.
 //!
-//! Current status: phase 2 — single-node server, Raft log persistence, and
-//! the node-to-node transport abstraction with a deterministic fault-
-//! injecting simulator (nothing wired to the server yet; that is phase 5).
-//! See PLAN.md for the roadmap.
+//! Current status: phase 3 — single-node server; Raft log persistence,
+//! deterministic simulated transport, and leader election (nothing wired to
+//! the server yet; that is phase 5). See PLAN.md for the roadmap.
 
 pub mod api;
 pub mod raft;

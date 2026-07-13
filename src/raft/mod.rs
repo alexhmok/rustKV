@@ -6,11 +6,13 @@
 //! and the state-machine wiring (5). The core never talks to the network
 //! directly — only through the transport trait.
 
+pub mod node;
 pub mod rpc;
 pub mod storage;
 pub mod transport;
 pub mod types;
 
+pub use node::{RaftConfig, RaftHandle, RaftNode, RoleKind, Status};
 pub use storage::{Storage, StorageError};
 pub use transport::{Inbound, Transport, TransportError};
 pub use types::{Command, HardState, LogEntry, LogIndex, NodeId, Term};

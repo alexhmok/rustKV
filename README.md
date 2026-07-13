@@ -5,8 +5,11 @@ cluster kept consistent by a hand-implemented Raft consensus core (no consensus 
 crates). The system is CP: under a network partition, the minority side refuses writes
 rather than diverging.
 
-**Current status: phase 0** — a single-node, in-memory store behind the HTTP API. No
-consensus or persistence yet. See [PLAN.md](PLAN.md) for the roadmap and progress.
+**Current status: phase 3** — the client-facing HTTP API is still single-node and
+in-memory, but the Raft core underneath now has crash-safe log persistence, a
+deterministic fault-injecting simulated transport, and working leader election.
+Replication and the log→KV wiring land in phases 4–5. See [PLAN.md](PLAN.md) for the
+roadmap and progress.
 
 ## Prerequisites
 

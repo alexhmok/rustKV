@@ -81,9 +81,39 @@ Untested / known gaps:
   phase 4's idempotent AppendEntries handling covers it).
 - Trait shape may grow (e.g. broadcast helpers) when election lands.
 
-## Phase 3 — leader election ⬜
-Terms, randomized timeouts, RequestVote, majority, election restriction (§5.4.1).
-Tested on the simulated transport.
+## Phase 3 — leader election ✅
+
+Done (`src/raft/node.rs`):
+- `RaftNode`: one event-loop task owning all consensus state (storage, role,
+  timers) — no locks. Inbound RPCs via the transport channel; outbound RPCs from
+  short-lived tasks reporting term-tagged replies back on an internal channel
+  (stale replies discarded); observers read a `watch` channel of `Status`.
+- Elections per §5.2: randomized timeouts (seeded jitter RNG), RequestVote with
+  majority counting, §5.4.1 election restriction (last-term/last-index compare),
+  idempotent vote grants, term adoption + step-down on any higher term.
+- Heartbeats: empty AppendEntries with real (trivial while logs are empty)
+  prev_log consistency check; candidates step down on AE from a legit leader.
+- Persistence before replying: term/vote fsynced via phase 1 Storage; storage
+  failures are fail-stop (panic). Determinism: `select! { biased; .. }` because
+  tokio's randomized branch polling would break seed-reproducibility.
+- `RaftHandle`: status/watch, graceful shutdown, `crash()` (abort + inbox drop).
+
+Tested (10 integration tests, virtual time, all seeded): exactly-one-leader +
+full convergence across 10 seeds; same seed ⇒ same (leader, term); 10 virtual
+seconds heartbeat stability; leader crash ⇒ re-election at higher term; leader
+partition ⇒ deposed, heals as follower, one leader after reconvergence; isolated
+follower churns terms but never wins, majority undisturbed, cluster reconverges
+after heal (known basic-Raft rejoin churn — no PreVote, by scope); at most one
+leader per term across 5 seeds under 25% message loss (10ms sampling); RPC-level
+vote rules (idempotent re-grant, competing candidate refused, stale term told
+current term) + votedFor/term survive restart; RPC-level §5.4.1 matrix.
+
+Untested / known gaps:
+- One-leader-per-term is asserted by 10ms status sampling, not event-level
+  observation — phase 6 tightens this.
+- No PreVote/CheckQuorum (out of scope): a rejoining node's inflated term causes
+  one round of re-election churn (tested as expected behavior).
+- AppendEntries carries no entries yet; commit_index never advances (phase 4).
 
 ## Phase 4 — log replication ⬜
 AppendEntries, log-matching/backtracking, commit on majority, current-term commit rule
