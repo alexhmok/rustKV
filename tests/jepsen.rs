@@ -12,11 +12,13 @@
 //!   * confirmed writes respect real-time order in the committed log
 //!     (white-box witness — writes ARE linearizable, log order is the
 //!     linearization);
-//!   * full histories including reads are checked for linearizability.
-//!     Reads are served locally by design (documented since phase 5), so
-//!     under partitions the checker MUST find stale-read violations — this
-//!     both demonstrates the checker's power and characterizes the system
-//!     honestly. Quiet histories (no partition active near the read) pass.
+//!   * full histories including reads are checked for linearizability, in
+//!     both read modes (phase 9). Stale mode reads local state from random
+//!     nodes — the pre-phase-9 behavior — and under partitions the checker
+//!     MUST find stale-read violations, demonstrating its power and
+//!     characterizing that path honestly. Linearizable mode issues the same
+//!     workload through ReadIndex ([`RaftHandle::read`]) and the checker
+//!     must find NO violation on any seed — the phase-9 headline claim.
 //!
 //! Crash/restart faults are exercised in tests/faults.rs; the nemesis here
 //! uses partitions only, which is where stale reads live.
@@ -173,9 +175,21 @@ fn unique_leader(cluster: &TestCluster) -> Option<NodeId> {
     }
 }
 
+/// How the workload's clients read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadMode {
+    /// Local state of a random node (the pre-phase-9 path, `?stale=true`
+    /// at the HTTP layer): may be stale under partitions.
+    Stale,
+    /// ReadIndex through the chosen node ([`RaftHandle::read`]): non-leaders
+    /// refuse, unconfirmable reads time out — a read either linearizes or
+    /// never happened, so it appears in the history only when granted.
+    Linearizable,
+}
+
 /// Runs one seeded workload; returns the merged history and each node's
 /// final on-disk log (nodes are shut down afterwards).
-async fn run_workload(seed: u64) -> (Vec<Recorded>, Vec<Vec<LogEntry>>) {
+async fn run_workload(seed: u64, reads: ReadMode) -> (Vec<Recorded>, Vec<Vec<LogEntry>>) {
     let faults = rustkv::raft::transport::sim::FaultConfig {
         min_delay: ms(1),
         max_delay: ms(15),
@@ -221,18 +235,42 @@ async fn run_workload(seed: u64) -> (Vec<Recorded>, Vec<Vec<LogEntry>>) {
                 let key = KEYS[rng.next_range(0..=2) as usize];
                 let dice = rng.next_range(0..=9);
                 if dice < 5 {
-                    // Read from a random node — the documented local-read
-                    // path, deliberately including partitioned nodes.
+                    // Read from a random node — deliberately including
+                    // partitioned nodes and non-leaders.
                     let node = rng.next_range(1..=3);
                     let invoked_us = start.elapsed().as_micros() as u64;
-                    let result = cluster.store(node).get(key).and_then(|v| v.as_u64());
-                    history.push(Recorded {
-                        process,
-                        key: key.to_string(),
-                        op: OpKind::Read { result },
-                        invoked_us,
-                        returned_us: start.elapsed().as_micros() as u64 + 1,
-                    });
+                    match reads {
+                        ReadMode::Stale => {
+                            let result = cluster.store(node).get(key).and_then(|v| v.as_u64());
+                            history.push(Recorded {
+                                process,
+                                key: key.to_string(),
+                                op: OpKind::Read { result },
+                                invoked_us,
+                                returned_us: start.elapsed().as_micros() as u64 + 1,
+                            });
+                        }
+                        ReadMode::Linearizable => {
+                            // A refused (NotLeader), timed-out, or
+                            // step-down-dropped read never observed anything
+                            // and constrains nothing — record only grants.
+                            let Ok(ticket) = cluster.handle(node).read().await else {
+                                continue;
+                            };
+                            let Ok(Ok(())) = tokio::time::timeout(ms(1500), ticket.granted).await
+                            else {
+                                continue;
+                            };
+                            let result = cluster.store(node).get(key).and_then(|v| v.as_u64());
+                            history.push(Recorded {
+                                process,
+                                key: key.to_string(),
+                                op: OpKind::Read { result },
+                                invoked_us,
+                                returned_us: start.elapsed().as_micros() as u64 + 1,
+                            });
+                        }
+                    }
                 } else {
                     // Write through whoever currently looks like the leader;
                     // skip the turn if leadership is unclear.
@@ -311,13 +349,29 @@ async fn run_workload(seed: u64) -> (Vec<Recorded>, Vec<Vec<LogEntry>>) {
     .await;
     for key in KEYS {
         let invoked_us = start.elapsed().as_micros() as u64;
-        let result = cluster.store(1).get(key).and_then(|v| v.as_u64());
+        let result = match reads {
+            ReadMode::Stale => cluster.store(1).get(key).and_then(|v| v.as_u64()),
+            // Everything is healed and converged: the first granted read
+            // through the leader is the authoritative final value.
+            ReadMode::Linearizable => loop {
+                let Some(leader) = unique_leader(&cluster) else {
+                    tokio::time::sleep(ms(10)).await;
+                    continue;
+                };
+                let Ok(ticket) = cluster.handle(leader).read().await else {
+                    continue;
+                };
+                if let Ok(Ok(())) = tokio::time::timeout(ms(1500), ticket.granted).await {
+                    break cluster.store(leader).get(key).and_then(|v| v.as_u64());
+                }
+            },
+        };
         history.push(Recorded {
             process: 99,
             key: key.to_string(),
             op: OpKind::Read { result },
             invoked_us,
-            returned_us: invoked_us + 1,
+            returned_us: start.elapsed().as_micros() as u64 + 1,
         });
     }
 
@@ -381,7 +435,7 @@ fn check_write_witness(history: &[Recorded], log: &[LogEntry]) -> Result<(), Str
 #[tokio::test(start_paused = true)]
 async fn confirmed_writes_are_linearizable_via_the_log_witness() {
     for seed in 0..6 {
-        let (history, logs) = run_workload(seed).await;
+        let (history, logs) = run_workload(seed, ReadMode::Stale).await;
         for log in &logs[1..] {
             assert_eq!(*log, logs[0], "seed {seed}: logs diverge");
         }
@@ -393,8 +447,8 @@ async fn confirmed_writes_are_linearizable_via_the_log_witness() {
 
 #[tokio::test(start_paused = true)]
 async fn same_seed_reproduces_the_same_history() {
-    let (history_a, logs_a) = run_workload(3).await;
-    let (history_b, logs_b) = run_workload(3).await;
+    let (history_a, logs_a) = run_workload(3, ReadMode::Linearizable).await;
+    let (history_b, logs_b) = run_workload(3, ReadMode::Linearizable).await;
     let refs_a: Vec<&Recorded> = history_a.iter().collect();
     let refs_b: Vec<&Recorded> = history_b.iter().collect();
     assert_eq!(
@@ -415,7 +469,7 @@ async fn same_seed_reproduces_the_same_history() {
 async fn local_reads_expose_documented_staleness_under_partitions() {
     let mut violations = Vec::new();
     for seed in 0..6 {
-        let (history, _) = run_workload(seed).await;
+        let (history, _) = run_workload(seed, ReadMode::Stale).await;
         if let Err(reason) = check_linearizable(&history) {
             violations.push((seed, reason));
         }
@@ -427,5 +481,29 @@ async fn local_reads_expose_documented_staleness_under_partitions() {
     );
     for (seed, reason) in &violations {
         eprintln!("seed {seed}: documented stale-read violation:\n{reason}");
+    }
+}
+
+/// The phase-9 inversion of the test above: the same seeds, keys, nemesis
+/// pattern, and client mix, but reads go through ReadIndex. The checker
+/// that provably catches stale local reads must find NO violation here —
+/// on any seed. This is the phase's headline claim: reads are linearizable.
+#[tokio::test(start_paused = true)]
+async fn linearizable_reads_pass_the_checker() {
+    for seed in 0..6 {
+        let (history, _) = run_workload(seed, ReadMode::Linearizable).await;
+        let reads = history
+            .iter()
+            .filter(|r| matches!(r.op, OpKind::Read { .. }))
+            .count();
+        // Guard against vacuous success: the workload must actually have
+        // granted reads (final reads alone are 3).
+        assert!(
+            reads > 3,
+            "seed {seed}: too few granted reads ({reads}) to mean anything"
+        );
+        if let Err(reason) = check_linearizable(&history) {
+            panic!("seed {seed}: linearizable reads produced a violation:\n{reason}");
+        }
     }
 }

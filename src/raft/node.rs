@@ -27,8 +27,18 @@
 //! resolves `false` if a leadership change truncated it). A new leader
 //! appends a no-op entry (§8) so prior-term entries — and therefore the
 //! applied state after restarts — commit promptly without client traffic.
-//! Deliberately basic Raft: no PreVote/CheckQuorum, no linearizable reads
-//! (ReadIndex/leases), no batching cap on AppendEntries payloads.
+//!
+//! Phase 9: linearizable reads via ReadIndex (§6.4), with nothing new on the
+//! wire. Each outbound AppendEntries is tagged with a local monotonic
+//! sequence number; a read registered at seq `s` is leadership-confirmed
+//! once a majority has answered an AppendEntries sent at seq >= `s` (any
+//! reply at our term counts — even a log-mismatch rejection acknowledges our
+//! authority). The read's index is `max(commit_index, term_start_index)` so
+//! a fresh leader never serves before its no-op commits, and the ticket
+//! resolves only once `last_applied` reaches it. Losing leadership drops all
+//! pending read tickets (waiters get a retryable error, never a stale value).
+//! Deliberately basic Raft: no PreVote/CheckQuorum, no batching cap on
+//! AppendEntries payloads.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -137,6 +147,19 @@ pub struct Proposal {
     pub committed: oneshot::Receiver<bool>,
 }
 
+/// A linearizable read in progress (§6.4 ReadIndex).
+#[derive(Debug)]
+pub struct ReadTicket {
+    /// Resolves once this node has (a) confirmed it is still leader by
+    /// hearing from a majority after the read was registered and (b) applied
+    /// everything the read must reflect; the local state machine is then
+    /// safe to read. If the node loses leadership first the sender is
+    /// dropped and awaiting returns an error — retry against the new leader.
+    /// May never resolve while the node is cut off from a majority — callers
+    /// own the timeout (the same CP behavior as writes).
+    pub granted: oneshot::Receiver<()>,
+}
+
 /// Handle to a running node.
 pub struct RaftHandle {
     status: watch::Receiver<Status>,
@@ -167,6 +190,17 @@ impl RaftHandle {
         reply_rx.await.map_err(|_| ProposeError::Shutdown)?
     }
 
+    /// Registers a linearizable read (§6.4 ReadIndex). Leader-only, like
+    /// [`Self::propose`]. On success, await [`ReadTicket::granted`] before
+    /// reading the local state machine.
+    pub async fn read(&self) -> Result<ReadTicket, ProposeError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.control
+            .send(Control::Read { reply: reply_tx })
+            .map_err(|_| ProposeError::Shutdown)?;
+        reply_rx.await.map_err(|_| ProposeError::Shutdown)?
+    }
+
     /// Asks the node to stop cleanly (it finishes the current event first).
     pub fn shutdown(&self) {
         let _ = self.control.send(Control::Shutdown);
@@ -186,6 +220,9 @@ enum Control {
         command: Command,
         reply: oneshot::Sender<Result<Proposal, ProposeError>>,
     },
+    Read {
+        reply: oneshot::Sender<Result<ReadTicket, ProposeError>>,
+    },
 }
 
 /// A proposal whose commit outcome is still unknown.
@@ -193,6 +230,17 @@ struct PendingProposal {
     term: Term,
     index: LogIndex,
     committed: oneshot::Sender<bool>,
+}
+
+/// A registered read awaiting leadership confirmation + apply (§6.4).
+struct PendingRead {
+    /// Confirmed once a majority has answered an AppendEntries sent at
+    /// seq >= this.
+    needed_seq: u64,
+    /// The state the read must reflect; grant only once last_applied
+    /// reaches it. Captured once at registration.
+    read_index: LogIndex,
+    granted: oneshot::Sender<()>,
 }
 
 /// Replies from outbound-RPC tasks, tagged with what was sent so stale or
@@ -210,6 +258,9 @@ enum Event {
         sent_prev_index: LogIndex,
         /// How many entries that AppendEntries carried.
         sent_entries: u64,
+        /// The leader's heartbeat_seq when this AppendEntries was sent
+        /// (ReadIndex leadership confirmation, §6.4).
+        sent_seq: u64,
         result: Result<RpcResponse, TransportError>,
     },
 }
@@ -224,6 +275,19 @@ enum Role {
         next_index: HashMap<NodeId, LogIndex>,
         /// Highest log index known replicated on each peer.
         match_index: HashMap<NodeId, LogIndex>,
+        /// Index of this term's leadership no-op (§8). Reads never serve
+        /// below it (§6.4): a fresh leader doesn't yet know how far its
+        /// predecessor committed.
+        term_start_index: LogIndex,
+        /// Monotonic tag on outbound AppendEntries within this leadership;
+        /// bumped when a read registers so later acks prove later authority.
+        heartbeat_seq: u64,
+        /// Highest sent_seq each peer has answered (at our term).
+        acked_seq: HashMap<NodeId, u64>,
+        /// Reads awaiting confirmation. Deliberately inside the role: losing
+        /// leadership drops them, resolving every ticket with an error —
+        /// unlike `pending` proposals, which survive step-down.
+        pending_reads: Vec<PendingRead>,
     },
 }
 
@@ -320,6 +384,9 @@ impl<T: Transport + Clone> RaftNode<T> {
                     Some(Control::Propose { command, reply }) => {
                         self.handle_propose(command, reply);
                     }
+                    Some(Control::Read { reply }) => {
+                        self.handle_read(reply);
+                    }
                 },
                 _ = sleep_until(self.election_deadline), if !self.is_leader() => {
                     self.on_election_timeout();
@@ -387,6 +454,50 @@ impl<T: Transport + Clone> RaftNode<T> {
         for &peer in &self.config.peers {
             self.send_append(peer);
         }
+    }
+
+    /// Registers a linearizable read (§6.4 ReadIndex).
+    fn handle_read(&mut self, reply: oneshot::Sender<Result<ReadTicket, ProposeError>>) {
+        let commit_index = self.commit_index;
+        let Role::Leader {
+            term_start_index,
+            heartbeat_seq,
+            pending_reads,
+            ..
+        } = &mut self.role
+        else {
+            let _ = reply.send(Err(ProposeError::NotLeader {
+                leader_hint: self.leader_id,
+            }));
+            return;
+        };
+        // §6.4: never serve below this term's no-op.
+        let read_index = commit_index.max(*term_start_index);
+        // Bump before broadcasting: an ack only proves authority as of the
+        // seq its RPC was sent with, so this read needs post-bump acks.
+        *heartbeat_seq += 1;
+        let needed_seq = *heartbeat_seq;
+        let (granted_tx, granted_rx) = oneshot::channel();
+        pending_reads.push(PendingRead {
+            needed_seq,
+            read_index,
+            granted: granted_tx,
+        });
+        let _ = reply.send(Ok(ReadTicket {
+            granted: granted_rx,
+        }));
+        tracing::debug!(
+            node = self.config.id,
+            term = self.current_term(),
+            read_index,
+            needed_seq,
+            "linearizable read registered"
+        );
+        for &peer in &self.config.peers {
+            self.send_append(peer);
+        }
+        // A single-node cluster is its own majority; grant immediately.
+        self.resolve_reads();
     }
 
     // ---- inbound RPCs ----
@@ -594,6 +705,8 @@ impl<T: Transport + Clone> RaftNode<T> {
             );
         }
         self.resolve_pending();
+        // last_applied advanced — pending reads may now be servable.
+        self.resolve_reads();
     }
 
     /// Settles proposal waiters: `true` once committed (and, via
@@ -611,6 +724,38 @@ impl<T: Transport + Clone> RaftNode<T> {
                 let _ = p.committed.send(true);
             } else {
                 self.pending.push(p);
+            }
+        }
+    }
+
+    /// Grants every pending read that is both leadership-confirmed (a
+    /// majority answered an AppendEntries sent at seq >= needed_seq) and
+    /// applied (last_applied >= read_index). No-op on non-leaders.
+    fn resolve_reads(&mut self) {
+        let majority = self.majority();
+        let last_applied = self.last_applied;
+        let Role::Leader {
+            acked_seq,
+            pending_reads,
+            ..
+        } = &mut self.role
+        else {
+            return;
+        };
+        if pending_reads.is_empty() {
+            return;
+        }
+        let reads = std::mem::take(pending_reads);
+        for read in reads {
+            // Count ourselves: the leader trivially acknowledges itself.
+            let acks = 1 + acked_seq
+                .values()
+                .filter(|&&seq| seq >= read.needed_seq)
+                .count();
+            if acks >= majority && last_applied >= read.read_index {
+                let _ = read.granted.send(());
+            } else {
+                pending_reads.push(read);
             }
         }
     }
@@ -664,6 +809,7 @@ impl<T: Transport + Clone> RaftNode<T> {
                 from,
                 sent_prev_index,
                 sent_entries,
+                sent_seq,
                 result,
             } => {
                 let reply = match result {
@@ -693,10 +839,16 @@ impl<T: Transport + Clone> RaftNode<T> {
                 let Role::Leader {
                     next_index,
                     match_index,
+                    acked_seq,
+                    ..
                 } = &mut self.role
                 else {
                     return;
                 };
+                // Any reply at our term — success or log-mismatch rejection —
+                // acknowledges our authority as of this RPC's send (§6.4).
+                let acked = acked_seq.entry(from).or_insert(0);
+                *acked = (*acked).max(sent_seq);
                 let mut resend = false;
                 if reply.success {
                     // The peer confirmed it matches us up to prev + sent.
@@ -730,6 +882,8 @@ impl<T: Transport + Clone> RaftNode<T> {
                 if resend {
                     self.send_append(from);
                 }
+                // Acks advanced even if commit didn't — reads may confirm.
+                self.resolve_reads();
             }
         }
     }
@@ -748,6 +902,18 @@ impl<T: Transport + Clone> RaftNode<T> {
                 .expect("cannot persist term; fail-stop");
         }
         let was = self.role_kind();
+        if let Role::Leader { pending_reads, .. } = &self.role
+            && !pending_reads.is_empty()
+        {
+            tracing::debug!(
+                node = self.config.id,
+                term,
+                failed_reads = pending_reads.len(),
+                "stepping down; pending linearizable reads resolve as retryable errors"
+            );
+        }
+        // Replacing the role drops any pending reads' senders — their
+        // waiters get an error, never a hang or a stale value.
         self.role = Role::Follower;
         self.leader_id = leader_id;
         // Also resets when stepping down, so a deposed leader/candidate
@@ -816,6 +982,10 @@ impl<T: Transport + Clone> RaftNode<T> {
         self.role = Role::Leader {
             next_index: self.config.peers.iter().map(|&p| (p, next)).collect(),
             match_index: self.config.peers.iter().map(|&p| (p, 0)).collect(),
+            term_start_index: next,
+            heartbeat_seq: 0,
+            acked_seq: HashMap::new(),
+            pending_reads: Vec::new(),
         };
         self.leader_id = Some(self.config.id);
         // §8: commit a no-op at the start of the term. Under the §5.4.2 rule
@@ -847,9 +1017,15 @@ impl<T: Transport + Clone> RaftNode<T> {
     /// as the heartbeat). TODO(batching): sends the whole tail in one RPC;
     /// fine while compaction is out of scope and logs stay small.
     fn send_append(&self, peer: NodeId) {
-        let Role::Leader { next_index, .. } = &self.role else {
+        let Role::Leader {
+            next_index,
+            heartbeat_seq,
+            ..
+        } = &self.role
+        else {
             return;
         };
+        let sent_seq = *heartbeat_seq;
         let next = next_index
             .get(&peer)
             .copied()
@@ -878,6 +1054,7 @@ impl<T: Transport + Clone> RaftNode<T> {
                 from: peer,
                 sent_prev_index: prev_log_index,
                 sent_entries,
+                sent_seq,
                 result,
             });
         });

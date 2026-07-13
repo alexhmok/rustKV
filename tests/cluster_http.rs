@@ -1,13 +1,14 @@
 //! End-to-end tests of a 3-node cluster: real axum HTTP servers for the
 //! client API, simulated transport between the Raft nodes.
 //!
-//! Covered: leader writes visible on every node; follower redirect (raw
-//! 307 with Location, and reqwest auto-following it); delete through a
-//! redirect; a minority-partitioned leader answering 504 without
-//! acknowledging the write (CP at the HTTP level), the doomed key never
-//! appearing.
-//! NOT covered: node-to-node HTTP transport (phase 7), linearizable reads
-//! (GETs are documented as possibly stale).
+//! Covered: leader writes visible on every node (via `?stale=true` local
+//! reads — the point is per-node replication, not read semantics); follower
+//! redirect for writes AND linearizable GETs (raw 307 with Location, and
+//! reqwest auto-following it); delete through a redirect; a
+//! minority-partitioned leader answering 504 for writes and linearizable
+//! reads without acknowledging either (CP at the HTTP level), the doomed
+//! key never appearing; `/cluster/status`.
+//! NOT covered: node-to-node HTTP transport (phase 7).
 //! These tests run in real time (real sockets don't mix with paused time);
 //! waits are poll-based and agreement-based, not seed-exact.
 
@@ -137,12 +138,23 @@ impl HttpCluster {
     }
 }
 
-/// Polls GET on `url/key` until the expected outcome (Some(value) or None
-/// for 404) holds; panics after 5 real seconds.
-async fn wait_for_get(client: &reqwest::Client, url: &str, key: &str, expect: Option<&Value>) {
+/// Polls a LOCAL (`?stale=true`) GET on `url/key` until the expected outcome
+/// (Some(value) or None for 404) holds; panics after 5 real seconds. Local
+/// on purpose: these waits verify per-node replication, and a linearizable
+/// GET would redirect to the leader and prove nothing about this node.
+async fn wait_for_local_get(
+    client: &reqwest::Client,
+    url: &str,
+    key: &str,
+    expect: Option<&Value>,
+) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let resp = client.get(format!("{url}/{key}")).send().await.unwrap();
+        let resp = client
+            .get(format!("{url}/{key}?stale=true"))
+            .send()
+            .await
+            .unwrap();
         match expect {
             Some(value) if resp.status() == 200 => {
                 if &resp.json::<Value>().await.unwrap() == value {
@@ -179,7 +191,7 @@ async fn leader_write_becomes_visible_on_every_node() {
     // Applied on the leader synchronously with the 201; followers apply as
     // heartbeats deliver the commit index.
     for node in &cluster.nodes {
-        wait_for_get(&client, &node.url, "loc", Some(&value)).await;
+        wait_for_local_get(&client, &node.url, "loc", Some(&value)).await;
     }
 }
 
@@ -217,8 +229,68 @@ async fn follower_redirects_writes_to_the_leader() {
         .unwrap();
     assert_eq!(put.status(), 201);
     for node in &cluster.nodes {
-        wait_for_get(&client, &node.url, "redirected", Some(&value)).await;
+        wait_for_local_get(&client, &node.url, "redirected", Some(&value)).await;
     }
+}
+
+#[tokio::test]
+async fn follower_redirects_linearizable_reads_and_serves_status() {
+    let _serial = SERIAL.lock().await;
+    let cluster = spawn_http_cluster(3, 35).await;
+    let leader = cluster.wait_for_leader().await;
+    let follower = cluster.followers(leader.id)[0];
+    let client = reqwest::Client::new();
+    let value = json!("fresh");
+
+    let put = client
+        .put(format!("{}/lin", leader.url))
+        .json(&value)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 201);
+
+    // Raw linearizable GET on a follower: 307 to the leader.
+    let raw = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let resp = raw
+        .get(format!("{}/lin", follower.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 307);
+    let location = resp.headers()["location"].to_str().unwrap();
+    assert_eq!(location, format!("{}/lin", leader.url));
+
+    // A standard client follows it and gets the committed value; a miss
+    // through the same path is a 404 from the leader.
+    let got = client
+        .get(format!("{}/lin", follower.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.status(), 200);
+    assert_eq!(got.json::<Value>().await.unwrap(), value);
+    let miss = client
+        .get(format!("{}/absent", follower.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(miss.status(), 404);
+
+    // /cluster/status reports the raft view without shadowing any key.
+    let status = client
+        .get(format!("{}/cluster/status", leader.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(status.status(), 200);
+    let body = status.json::<Value>().await.unwrap();
+    assert_eq!(body["id"], json!(leader.id));
+    assert_eq!(body["role"], json!("Leader"));
+    assert_eq!(body["leader_id"], json!(leader.id));
 }
 
 #[tokio::test]
@@ -237,7 +309,7 @@ async fn delete_through_a_follower_redirect() {
         .await
         .unwrap();
     assert_eq!(put.status(), 201);
-    wait_for_get(&client, &follower.url, "gone", Some(&value)).await;
+    wait_for_local_get(&client, &follower.url, "gone", Some(&value)).await;
 
     let del = client
         .delete(format!("{}/gone", follower.url))
@@ -246,7 +318,7 @@ async fn delete_through_a_follower_redirect() {
         .unwrap();
     assert_eq!(del.status(), 204);
     for node in &cluster.nodes {
-        wait_for_get(&client, &node.url, "gone", None).await;
+        wait_for_local_get(&client, &node.url, "gone", None).await;
     }
 }
 
@@ -276,7 +348,7 @@ async fn minority_partitioned_leader_times_out_writes_and_never_applies_them() {
     }
 
     // CP: the write must NOT be acknowledged — 504 after the write timeout,
-    // and the key must not be readable anywhere.
+    // and the key must not be locally applied anywhere.
     let resp = client
         .put(format!("{}/doomed", leader.url))
         .json(&json!(9))
@@ -286,7 +358,7 @@ async fn minority_partitioned_leader_times_out_writes_and_never_applies_them() {
     assert_eq!(resp.status(), 504);
     for node in &cluster.nodes {
         let get = client
-            .get(format!("{}/doomed", node.url))
+            .get(format!("{}/doomed?stale=true", node.url))
             .send()
             .await
             .unwrap();
@@ -297,6 +369,26 @@ async fn minority_partitioned_leader_times_out_writes_and_never_applies_them() {
             node.id
         );
     }
+
+    // Reads are CP too (phase 9): the partitioned leader cannot confirm its
+    // leadership, so a linearizable GET times out (504) instead of serving —
+    // even for a key it holds — while a stale read still answers locally.
+    let get = client
+        .get(format!("{}/alive", leader.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        get.status(),
+        504,
+        "partitioned leader must not confirm a linearizable read"
+    );
+    let stale = client
+        .get(format!("{}/alive?stale=true", leader.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), 200);
 
     // The majority side elects a new leader and keeps serving writes.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -327,8 +419,8 @@ async fn minority_partitioned_leader_times_out_writes_and_never_applies_them() {
         cluster.net.set_pair_blocked(leader.id, id, false);
     }
     for node in &cluster.nodes {
-        wait_for_get(&client, &node.url, "after-partition", Some(&json!("ok"))).await;
-        wait_for_get(&client, &node.url, "doomed", None).await;
-        wait_for_get(&client, &node.url, "alive", Some(&json!(true))).await;
+        wait_for_local_get(&client, &node.url, "after-partition", Some(&json!("ok"))).await;
+        wait_for_local_get(&client, &node.url, "doomed", None).await;
+        wait_for_local_get(&client, &node.url, "alive", Some(&json!(true))).await;
     }
 }

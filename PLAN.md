@@ -313,10 +313,70 @@ Untested / known gaps:
   combining both under the linearizability checker would be a natural extension).
 - The checker caps at 63 ops per key (u64 mask) — sized to the workload.
 
-## Project complete
-All phases 0-8 done. Remaining ideas beyond the original scope: linearizable
-reads (ReadIndex/leases), snapshotting/compaction, dynamic membership, PreVote,
-client dedup tokens for 504 retries, connection pooling, TLS on the raft port.
+## Phase 9 — linearizable reads via ReadIndex ✅
+
+Done (`src/raft/node.rs`, `src/kv.rs`, `src/api.rs`):
+- ReadIndex (§6.4) with zero wire changes: every outbound AppendEntries is
+  tagged with a local monotonic `heartbeat_seq`; a read registered at seq `s`
+  (which bumps the seq and broadcasts an AE round immediately) is
+  leadership-confirmed once a majority — self included — has answered an AE
+  sent at seq >= `s`. Any reply at the leader's term counts, including a
+  log-mismatch rejection (it still acknowledges authority).
+- §6.4 no-op gate: `Role::Leader` records `term_start_index` (the election
+  no-op's index); a read's index is `max(commit_index, term_start_index)`,
+  captured once at registration, and the ticket resolves only when
+  `last_applied` reaches it — a fresh leader can't serve state it doesn't yet
+  know is committed.
+- Step-down safety: pending reads live INSIDE `Role::Leader` (unlike `pending`
+  proposals, which deliberately survive step-down), so `become_follower`
+  drops their oneshot senders — waiters get a retryable error promptly,
+  never a hang or a stale value. `RaftHandle::read() -> ReadTicket`.
+- `KvNode::get_linearizable` (`ReadError::{NotLeader, Timeout, Retry,
+  Shutdown}`); reuses the write timeout. `KvNode::get` stays as the local path.
+- HTTP: `GET /{key}` is now linearizable by default — non-leaders 307 to the
+  leader (shared redirect helper with writes), unconfirmable reads 504,
+  step-down 503; `GET /{key}?stale=true` keeps the old local read as an
+  explicit opt-in. New `GET /cluster/status` (id/term/role/leader/commit) —
+  under `/cluster/` so no single-segment key is shadowed.
+
+Tested (80 total; 7 new):
+- tests/read_index.rs (sim, seeded, virtual time): single-node immediate
+  grant; grants reflect committed writes; follower NotLeader + hint; the
+  §6.4 gate observable under slow links (read registered while the no-op is
+  uncommitted stays pending, grants after commit); the money test — a
+  minority-partitioned leader holding a provably stale value accepts a read
+  but never confirms it (3 virtual seconds), and healing resolves the hung
+  ticket as an error via step-down, with a retry on the new leader seeing
+  the new value.
+- tests/jepsen.rs: `run_workload` parametrized by ReadMode. Stale mode keeps
+  the pre-phase-9 behavior byte-identical (the stale-violation test still
+  proves the checker catches real staleness). NEW
+  `linearizable_reads_pass_the_checker`: same seeds/nemesis/client mix with
+  reads through ReadIndex — the WGL checker finds ZERO violations across all
+  seeds (with a guard against vacuous success). This is the phase's headline:
+  the fix is validated by the exact harness that demonstrated the bug.
+- tests/cluster_http.rs: follower GET 307 + follow-redirect, `?stale=true`
+  local reads (the per-node replication waits now use it on purpose),
+  partitioned leader answers 504 to linearizable GET while stale GET still
+  serves, `/cluster/status` smoke. Manual binary smoke (status/put/both
+  GET modes/404).
+
+Untested / known gaps:
+- The `term_start_index` gate's exotic branch — a read confirmed purely by
+  log-mismatch rejection acks before the no-op commits — is not specifically
+  exercised (needs a diverged-follower + timing setup); the common path is.
+- Reads carry no dedup/session tokens (irrelevant: reads are side-effect-free).
+- Real-time cluster_http tests remain subject to the documented cross-binary
+  CPU-starvation flake class (one occurrence seen during a full parallel run
+  this phase; passes in isolation and on re-run).
+
+## Project complete (phases 0-9)
+Remaining ideas beyond the original scope, in planned order: harness
+hardening (crash nemesis in jepsen, sim message duplication, event-level
+leader-per-term), PreVote, client dedup tokens for 504 retries,
+snapshotting/compaction + InstallSnapshot, dynamic membership, connection
+pooling, scripted Docker partition test. (TLS on the raft port: dropped —
+blocked on the dependency whitelist.)
 
 ## Out of scope (deliberate)
 Snapshotting/log compaction, dynamic membership changes — leave clean TODOs.

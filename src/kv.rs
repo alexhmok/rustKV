@@ -2,10 +2,12 @@
 //!
 //! Writes go through [`RaftHandle::propose`] and only succeed once the entry
 //! is committed by a majority and applied locally — a node cut off from the
-//! majority times out instead of acknowledging (the CP guarantee). Reads are
-//! served from the local state machine and may be stale on followers or a
-//! just-deposed leader. TODO: linearizable reads (ReadIndex or leader
-//! leases) are deliberately out of scope.
+//! majority times out instead of acknowledging (the CP guarantee). Reads
+//! come in two flavors: [`KvNode::get_linearizable`] (the default) confirms
+//! leadership via ReadIndex before reading, so it is never stale and, like
+//! writes, times out rather than answering from a minority; [`KvNode::get`]
+//! reads the local state machine directly and may be stale on followers or
+//! a just-deposed leader (the documented fast path).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,6 +50,38 @@ impl std::fmt::Display for WriteError {
 
 impl std::error::Error for WriteError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadError {
+    /// This node is not the leader; retry against `leader_hint` if present.
+    NotLeader { leader_hint: Option<NodeId> },
+    /// Leadership not confirmed within the timeout (typical cause: this
+    /// leader lost its majority). Unlike a write timeout there is nothing
+    /// ambiguous in flight — safe to retry elsewhere.
+    Timeout,
+    /// Leadership was lost while the read was pending. Safe to retry.
+    Retry,
+    /// The node has shut down.
+    Shutdown,
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadError::NotLeader {
+                leader_hint: Some(id),
+            } => write!(f, "not the leader; try node {id}"),
+            ReadError::NotLeader { leader_hint: None } => {
+                write!(f, "not the leader, and no leader is known")
+            }
+            ReadError::Timeout => write!(f, "read not confirmed in time; retry"),
+            ReadError::Retry => write!(f, "leadership changed during the read; retry"),
+            ReadError::Shutdown => write!(f, "node has shut down"),
+        }
+    }
+}
+
+impl std::error::Error for ReadError {}
+
 /// One node's KV service: the local state machine plus the Raft handle.
 pub struct KvNode {
     store: Arc<KvStore>,
@@ -67,6 +101,25 @@ impl KvNode {
     /// Local read. May be stale on followers (see module docs).
     pub fn get(&self, key: &str) -> Option<Value> {
         self.store.get(key)
+    }
+
+    /// Linearizable read (§6.4 ReadIndex): confirms this node is still the
+    /// leader against a majority, waits until the state machine reflects
+    /// everything committed before the read began, then reads locally.
+    /// Leader-only — non-leaders return [`ReadError::NotLeader`].
+    pub async fn get_linearizable(&self, key: &str) -> Result<Option<Value>, ReadError> {
+        let ticket = match self.raft.read().await {
+            Ok(ticket) => ticket,
+            Err(ProposeError::NotLeader { leader_hint }) => {
+                return Err(ReadError::NotLeader { leader_hint });
+            }
+            Err(ProposeError::Shutdown) => return Err(ReadError::Shutdown),
+        };
+        match tokio::time::timeout(self.write_timeout, ticket.granted).await {
+            Err(_elapsed) => Err(ReadError::Timeout),
+            Ok(Err(_step_down)) => Err(ReadError::Retry),
+            Ok(Ok(())) => Ok(self.store.get(key)),
+        }
     }
 
     pub fn status(&self) -> Status {
