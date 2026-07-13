@@ -1,7 +1,9 @@
-//! Shared helpers for the seeded cluster tests (election, replication, and
-//! later fault tests). This module is compiled separately into each test
-//! binary, so not every binary uses every item.
+//! Shared helpers for the seeded cluster tests (election, replication,
+//! fault, and jepsen-style tests). This module is compiled separately into
+//! each test binary, so not every binary uses every item.
 #![allow(dead_code)]
+
+pub mod lin;
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -273,8 +273,50 @@ Untested / known gaps:
 - No TLS/auth on the raft port and no connection pooling (out of scope; TODOs).
 - Follower reads remain eventually consistent (documented since phase 5).
 
-## Phase 8 — Jepsen harness (optional) ⬜
-Do NOT start without explicit user approval.
+## Phase 8 — Jepsen-style consistency harness ✅ (approved by user)
+
+Built natively in Rust on the deterministic simulator instead of the Clojure
+framework: real Jepsen would add a JVM/SSH/VM stack, and our simulator gives
+something Jepsen cannot — every history is a pure function of its seed, so any
+violation replays exactly. Trade-off noted below.
+
+Done (`tests/common/lin.rs`, `tests/jepsen.rs`):
+- Wing & Gong linearizability checker for a per-key last-write-wins register
+  (Put/Delete/Get), compositional per key, memoized DFS over (mask, state).
+  Jepsen-equivalent outcome semantics: ok = must linearize; fail = definitely
+  didn't happen (excluded); unknown (client timeout) = takes effect any time
+  after invocation or never (return = ∞, optional to linearize).
+- Workload driver: 4 concurrent client processes × 12 randomized ops over 3 keys
+  (reads from random nodes, writes via the visible leader with ok/fail/unknown
+  recording + (term,index) tags) while a nemesis partitions/heals random nodes;
+  Jepsen-style final reads after heal+convergence pin down unknown writes.
+- Checked claims across seeds:
+  * checker validation: hand-crafted valid histories accepted, invalid ones
+    (stale read, read-through-delete, phantom value, failed-write visible,
+    non-monotonic reads) rejected — the checker has teeth;
+  * write linearizability via the log witness: every confirmed write present at
+    its assigned (term, index) with the right command, identical logs, and log
+    order consistent with real-time order (the log IS the linearization);
+  * same seed ⇒ byte-identical history and logs;
+  * full histories with local reads: the checker finds real, replayable
+    stale-read violations under partitions (e.g. seed 0: a client's committed
+    Delete at t=517ms followed 5ms later by its own read returning the deleted
+    value from a lagging node). This is the documented non-linearizable-read
+    design made precise — and the fix (ReadIndex/leases) is now specified by a
+    failing-check-away if ever wanted.
+
+Untested / known gaps:
+- This is not the Clojure Jepsen: no Elle transactional anomalies checker, no
+  real-VM/SSH nemeses (real-network partitions are covered manually via Docker,
+  phase 7), no wall-clock-skew faults (the sim has one clock by construction).
+- Nemesis here is partition-only (crash/restart schedules live in tests/faults.rs;
+  combining both under the linearizability checker would be a natural extension).
+- The checker caps at 63 ops per key (u64 mask) — sized to the workload.
+
+## Project complete
+All phases 0-8 done. Remaining ideas beyond the original scope: linearizable
+reads (ReadIndex/leases), snapshotting/compaction, dynamic membership, PreVote,
+client dedup tokens for 504 retries, connection pooling, TLS on the raft port.
 
 ## Out of scope (deliberate)
 Snapshotting/log compaction, dynamic membership changes — leave clean TODOs.

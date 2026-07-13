@@ -5,15 +5,19 @@ cluster kept consistent by a hand-implemented Raft consensus core (no consensus 
 crates). The system is CP: under a network partition, the minority side refuses writes
 rather than diverging.
 
-**Current status: phase 7 (feature-complete)** — a full CP cluster: writes go through
-the replicated log and are acknowledged only after majority commit; non-leaders
-redirect writes to the leader; nodes rebuild their KV state from the persisted log on
-restart. Consensus is verified two ways: deterministic seeded fault tests on the
-simulated transport (partitions, leader crash/restart mid-write, randomized fault
-schedules — asserting at most one leader per term, no confirmed write lost, identical
-logs and state machines after recovery), and end-to-end over the real HTTP transport
-(in-process, three OS processes, and Docker Compose with real network partitions).
-See [PLAN.md](PLAN.md).
+**Current status: complete (phases 0–8)** — a full CP cluster: writes go through the
+replicated log and are acknowledged only after majority commit; non-leaders redirect
+writes to the leader; nodes rebuild their KV state from the persisted log on restart.
+Consensus is verified three ways: deterministic seeded fault tests on the simulated
+transport (partitions, leader crash/restart mid-write, randomized fault schedules —
+asserting at most one leader per term, no confirmed write lost, identical logs and
+state machines after recovery); end-to-end over the real HTTP transport (in-process,
+three OS processes, and Docker Compose with real network partitions); and a
+Jepsen-style harness (`tests/jepsen.rs`) — concurrent clients + a partition nemesis
+recording timed histories, checked by a Wing&Gong linearizability checker. Confirmed
+writes are linearizable (the committed log is the linearization witness); local reads
+are deliberately not, and the checker pinpoints replayable stale-read counterexamples
+under partitions, making that documented trade-off precise. See [PLAN.md](PLAN.md).
 
 ## Prerequisites
 
