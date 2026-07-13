@@ -1,8 +1,11 @@
-//! The two Raft RPCs (Figure 2 of the paper), as plain serializable data.
+//! The Raft RPCs (Figure 2 of the paper, plus PreVote from §9.6 / thesis
+//! §4.2.3), as plain serializable data.
 //!
 //! Phase 2 defines only the message shapes so the transport layer has a
 //! payload; the RPC *semantics* (vote rules, consistency checks) arrive with
-//! leader election (phase 3) and log replication (phase 4).
+//! leader election (phase 3) and log replication (phase 4). PreVote
+//! (phase 11) reuses the RequestVote payloads under distinct variants, so a
+//! pre-vote probe can never be conflated with a real, binding vote.
 
 use serde::{Deserialize, Serialize};
 
@@ -44,10 +47,16 @@ pub struct AppendEntriesReply {
 pub enum RpcRequest {
     RequestVote(RequestVoteArgs),
     AppendEntries(AppendEntriesArgs),
+    /// A pre-vote probe (§9.6): "would you vote for me for `term`?". Same
+    /// payload as RequestVote — `term` is the *prospective* term, one above
+    /// the asker's current term — but granting one records nothing and
+    /// binds nobody.
+    PreVote(RequestVoteArgs),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RpcResponse {
     RequestVote(RequestVoteReply),
     AppendEntries(AppendEntriesReply),
+    PreVote(RequestVoteReply),
 }

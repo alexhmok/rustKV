@@ -37,7 +37,18 @@
 //! a fresh leader never serves before its no-op commits, and the ticket
 //! resolves only once `last_applied` reaches it. Losing leadership drops all
 //! pending read tickets (waiters get a retryable error, never a stale value).
-//! Deliberately basic Raft: no PreVote/CheckQuorum, no batching cap on
+//!
+//! Phase 11: PreVote (§9.6 / thesis §4.2.3). An election timeout no longer
+//! bumps the term; it starts a *pre-campaign* ([`Role::PreCandidate`]) that
+//! probes peers with the prospective term `current_term + 1` — persisting
+//! nothing, and leaving the node's own term untouched. Only a pre-vote
+//! majority triggers the real election (term bump + durable self-vote).
+//! Grantors apply the same §5.4.1 log check as a real vote plus *leader
+//! stickiness*: a node that is the leader, or heard from a valid one within
+//! `election_timeout_min`, denies the probe. Together these stop a healed
+//! or partitioned node from ever disrupting a healthy leader — the term
+//! churn phase 3 documented as expected is gone.
+//! Deliberately basic Raft: no CheckQuorum, no batching cap on
 //! AppendEntries payloads.
 
 use std::collections::{HashMap, HashSet};
@@ -85,6 +96,8 @@ impl RaftConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoleKind {
     Follower,
+    /// Probing for a pre-vote majority (§9.6); still at its old term.
+    PreCandidate,
     Candidate,
     Leader,
 }
@@ -245,7 +258,16 @@ struct PendingRead {
 
 /// Replies from outbound-RPC tasks, tagged with what was sent so stale or
 /// reordered replies can be interpreted safely.
+// The shared `Reply` postfix is the point: every event IS a reply.
+#[allow(clippy::enum_variant_names)]
 enum Event {
+    PreVoteReply {
+        /// The *prospective* term the probe asked for (`current_term + 1`
+        /// at send time) — a term this node has not adopted.
+        sent_term: Term,
+        from: NodeId,
+        result: Result<RpcResponse, TransportError>,
+    },
     VoteReply {
         sent_term: Term,
         from: NodeId,
@@ -267,6 +289,12 @@ enum Event {
 
 enum Role {
     Follower,
+    /// Pre-campaigning (§9.6): counting non-binding pre-votes for the
+    /// prospective term `current_term + 1`. Nothing is persisted and the
+    /// node's own term does not move until the pre-vote majority arrives.
+    PreCandidate {
+        votes: HashSet<NodeId>,
+    },
     Candidate {
         votes: HashSet<NodeId>,
     },
@@ -306,6 +334,10 @@ pub struct RaftNode<T: Transport + Clone> {
     /// Local proposals awaiting their commit outcome. Survives step-down
     /// (a deposed leader's entry may still commit under its successor).
     pending: Vec<PendingProposal>,
+    /// When the last valid AppendEntries (current-or-higher term) arrived.
+    /// Leader stickiness: pre-votes are denied while this is fresher than
+    /// `election_timeout_min`. Volatile — a restarted node grants again.
+    last_leader_contact: Option<Instant>,
     election_deadline: Instant,
     next_heartbeat: Instant,
     rng: SplitMix64,
@@ -355,6 +387,7 @@ impl<T: Transport + Clone> RaftNode<T> {
             commit_index: 0,
             last_applied: 0,
             pending: Vec::new(),
+            last_leader_contact: None,
             election_deadline: Instant::now(),
             next_heartbeat: Instant::now(),
             rng,
@@ -510,17 +543,21 @@ impl<T: Transport + Clone> RaftNode<T> {
             RpcRequest::AppendEntries(args) => {
                 RpcResponse::AppendEntries(self.handle_append_entries(args))
             }
+            RpcRequest::PreVote(args) => RpcResponse::PreVote(self.handle_pre_vote(args)),
         };
         // The peer may have timed out and dropped the reply channel.
         let _ = inbound.reply.send(response);
     }
 
-    /// §5.2 + the §5.4.1 election restriction.
+    /// §5.2 + the §5.4.1 election restriction. Deliberately unchanged by
+    /// PreVote: real votes are not sticky and still adopt higher terms.
     fn handle_request_vote(&mut self, args: RequestVoteArgs) -> RequestVoteReply {
         if args.term > self.current_term() {
             // Note: this resets our election timer even if the vote is then
-            // refused — a slight liveness concession (a disruptive candidate
-            // can delay us); PreVote would fix it and is out of scope.
+            // refused — a liveness concession that PreVote (phase 11) makes
+            // mostly moot: a candidate only reaches here after winning a
+            // pre-vote round, which stickiness denies while a live leader
+            // exists.
             self.become_follower(args.term, None);
         }
         let term = self.current_term();
@@ -573,6 +610,41 @@ impl<T: Transport + Clone> RaftNode<T> {
         }
     }
 
+    /// PreVote (§9.6): "would you vote for me for `args.term`?". Grant only
+    /// if the prospective term is beyond ours, the candidate's log passes
+    /// the same §5.4.1 check as a real vote, and we have no reason to
+    /// believe a valid leader exists (leader stickiness). Unlike a real
+    /// vote this persists nothing, adopts no term, resets no election
+    /// timer, and may be granted to any number of askers.
+    fn handle_pre_vote(&mut self, args: RequestVoteArgs) -> RequestVoteReply {
+        let term = self.current_term();
+        let log_up_to_date = (args.last_log_term, args.last_log_index)
+            >= (self.storage.last_term(), self.storage.last_index());
+        // Stickiness is what stops an up-to-date healed node from
+        // disrupting: the leader itself always denies (it IS the valid
+        // leader), and everyone it reaches within election_timeout_min
+        // denies too, so the disruptor can never assemble a majority.
+        let leader_is_live = self.is_leader()
+            || self
+                .last_leader_contact
+                .is_some_and(|at| at.elapsed() < self.config.election_timeout_min);
+        let grant = args.term > term && log_up_to_date && !leader_is_live;
+        tracing::debug!(
+            node = self.config.id,
+            term,
+            candidate = args.candidate_id,
+            prospective_term = args.term,
+            grant,
+            log_up_to_date,
+            leader_is_live,
+            "pre-vote"
+        );
+        RequestVoteReply {
+            term,
+            vote_granted: grant,
+        }
+    }
+
     /// Full §5.3 AppendEntries: consistency check, duplicate-tolerant entry
     /// processing with conflict truncation, and commit advancement.
     fn handle_append_entries(&mut self, args: AppendEntriesArgs) -> AppendEntriesReply {
@@ -595,6 +667,9 @@ impl<T: Transport + Clone> RaftNode<T> {
         // AppendEntries at our term (or above) comes from the legitimate
         // leader of that term: adopt it and (re)become follower.
         self.become_follower(args.term, Some(args.leader_id));
+        // Leader stickiness (§9.6): even a log-mismatch rejection below is
+        // contact with a valid leader — pre-votes are denied while fresh.
+        self.last_leader_contact = Some(Instant::now());
         let term = self.current_term();
 
         // Log-matching consistency check: we must hold the leader's prev
@@ -764,6 +839,51 @@ impl<T: Transport + Clone> RaftNode<T> {
 
     fn handle_event(&mut self, event: Event) {
         match event {
+            Event::PreVoteReply {
+                sent_term,
+                from,
+                result,
+            } => {
+                let reply = match result {
+                    Ok(RpcResponse::PreVote(reply)) => reply,
+                    Ok(other) => {
+                        tracing::warn!(
+                            node = self.config.id,
+                            from,
+                            ?other,
+                            "mismatched pre-vote reply"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::trace!(node = self.config.id, from, %error, "pre-vote rpc failed");
+                        return;
+                    }
+                };
+                if reply.term > self.current_term() {
+                    // A denial carrying a newer term: adopt it (this is how
+                    // a pre-candidate whose term fell behind catches up and
+                    // becomes eligible for grants next timeout).
+                    self.become_follower(reply.term, None);
+                    return;
+                }
+                // Count only grants for THIS pre-campaign: the prospective
+                // term must still be one beyond our (unmoved) current term.
+                if sent_term != self.current_term() + 1 || !reply.vote_granted {
+                    return;
+                }
+                if let Role::PreCandidate { votes } = &mut self.role {
+                    votes.insert(from);
+                    tracing::debug!(
+                        node = self.config.id,
+                        prospective_term = sent_term,
+                        from,
+                        votes = votes.len(),
+                        "pre-vote received"
+                    );
+                    self.maybe_start_election();
+                }
+            }
             Event::VoteReply {
                 sent_term,
                 from,
@@ -924,7 +1044,63 @@ impl<T: Transport + Clone> RaftNode<T> {
         }
     }
 
+    /// Election timeout → pre-campaign (§9.6): probe for a pre-vote
+    /// majority at the prospective term `current_term + 1`. Nothing is
+    /// persisted and our own term does not move; only a majority of grants
+    /// starts the real election.
     fn on_election_timeout(&mut self) {
+        let prospective = self.current_term() + 1;
+        self.role = Role::PreCandidate {
+            votes: HashSet::from([self.config.id]),
+        };
+        self.leader_id = None;
+        // Re-arm so a failed pre-campaign retries; one RNG draw per timeout.
+        self.reset_election_timer();
+        tracing::info!(
+            node = self.config.id,
+            term = self.current_term(),
+            prospective_term = prospective,
+            "election timeout; starting pre-campaign"
+        );
+
+        let args = RequestVoteArgs {
+            term: prospective,
+            candidate_id: self.config.id,
+            last_log_index: self.storage.last_index(),
+            last_log_term: self.storage.last_term(),
+        };
+        for &peer in &self.config.peers {
+            let transport = self.transport.clone();
+            let events = self.events_tx.clone();
+            let args = args.clone();
+            tokio::spawn(async move {
+                let result = transport.send(peer, RpcRequest::PreVote(args)).await;
+                let _ = events.send(Event::PreVoteReply {
+                    sent_term: prospective,
+                    from: peer,
+                    result,
+                });
+            });
+        }
+        // A single-node cluster is its own pre-vote majority.
+        self.maybe_start_election();
+    }
+
+    /// Promotes a pre-candidate holding a pre-vote majority to a real
+    /// candidacy. No-op otherwise.
+    fn maybe_start_election(&mut self) {
+        let votes = match &self.role {
+            Role::PreCandidate { votes } => votes.len(),
+            _ => return,
+        };
+        if votes >= self.majority() {
+            self.start_election();
+        }
+    }
+
+    /// The real election (§5.2): durably bump the term with a self-vote and
+    /// solicit binding votes. Reached only through a pre-vote majority.
+    fn start_election(&mut self) {
         let term = self.current_term() + 1;
         self.storage
             .save_hard_state(HardState {
@@ -940,7 +1116,7 @@ impl<T: Transport + Clone> RaftNode<T> {
         tracing::info!(
             node = self.config.id,
             term,
-            "election timeout; starting election"
+            "pre-vote majority; starting election"
         );
 
         let args = RequestVoteArgs {
@@ -1105,6 +1281,7 @@ impl<T: Transport + Clone> RaftNode<T> {
     fn role_kind(&self) -> RoleKind {
         match self.role {
             Role::Follower => RoleKind::Follower,
+            Role::PreCandidate { .. } => RoleKind::PreCandidate,
             Role::Candidate { .. } => RoleKind::Candidate,
             Role::Leader { .. } => RoleKind::Leader,
         }

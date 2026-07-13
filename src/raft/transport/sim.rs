@@ -286,8 +286,9 @@ impl Transport for SimTransport {
 }
 
 /// The event-level safety observer (see module docs). Only AppendEntries
-/// carries claims; other variants — including phase 11's PreVote — fall
-/// through the match and are ignored by construction.
+/// carries claims; other variants fall through the match and are ignored
+/// by construction. In particular a PreVote is a non-binding probe, not a
+/// leadership claim — the observer must not (and does not) see it.
 fn inspect_append_entries(st: &mut State, req: &RpcRequest) {
     let RpcRequest::AppendEntries(args) = req else {
         return;
@@ -384,6 +385,15 @@ mod tests {
         })
     }
 
+    fn pre_vote_req(term: Term, candidate_id: NodeId) -> RpcRequest {
+        RpcRequest::PreVote(RequestVoteArgs {
+            term,
+            candidate_id,
+            last_log_index: 0,
+            last_log_term: 0,
+        })
+    }
+
     fn ae_req(term: Term, leader_id: NodeId) -> RpcRequest {
         RpcRequest::AppendEntries(AppendEntriesArgs {
             term,
@@ -410,6 +420,10 @@ mod tests {
                             success: true,
                         })
                     }
+                    RpcRequest::PreVote(args) => RpcResponse::PreVote(RequestVoteReply {
+                        term: args.term,
+                        vote_granted: true,
+                    }),
                 };
                 let _ = inbound.reply.send(resp);
             }
@@ -740,6 +754,33 @@ mod tests {
         net.set_link_blocked(2, 3, true);
         let _ = t2.send(3, ae_req(6, 2)).await;
         assert_eq!(net.safety_violations().len(), 2);
+    }
+
+    /// A pre-vote is a probe, not a leadership claim: the safety observer
+    /// must record nothing about PreVote traffic, however conflicting it
+    /// looks — it ignores every non-AppendEntries variant by construction.
+    #[tokio::test(start_paused = true)]
+    async fn pre_votes_are_invisible_to_the_safety_observer() {
+        let net = SimNetwork::new(0, fixed_delay_config(ms(1)));
+        let (t1, _rx1) = net.register(1);
+        let (t2, _rx2) = net.register(2);
+        let (_t3, rx3) = net.register(3);
+        spawn_echo(rx3);
+
+        // Two nodes pre-voting for the same prospective term is normal
+        // (grants are non-binding) — not an Election Safety conflict.
+        t1.send(3, pre_vote_req(5, 1)).await.unwrap();
+        t2.send(3, pre_vote_req(5, 2)).await.unwrap();
+        // Nor does a pre-vote conflict with a REAL leadership claim for the
+        // same term, in either order.
+        t1.send(3, ae_req(5, 1)).await.unwrap();
+        t2.send(3, pre_vote_req(5, 2)).await.unwrap();
+        assert_eq!(net.safety_violations(), Vec::<String>::new());
+
+        // Sanity that the observer is still awake: a conflicting REAL claim
+        // for that term does record.
+        t2.send(3, ae_req(5, 2)).await.unwrap();
+        assert_eq!(net.safety_violations().len(), 1);
     }
 
     fn ae_with(

@@ -465,12 +465,78 @@ Untested / known gaps:
   (leader_commit monotonicity) — the former is covered by commit/convergence
   timeouts, the latter has no sound send-side observation point.
 
-## Project complete (phases 0-10)
-Remaining ideas beyond the original scope, in planned order: PreVote,
-client dedup tokens for 504 retries, snapshotting/compaction +
-InstallSnapshot, dynamic membership, connection pooling, scripted Docker
-partition test. (TLS on the raft port: dropped — blocked on the dependency
-whitelist.)
+## Phase 11 — PreVote ✅
+
+Done (`src/raft/rpc.rs`, `src/raft/node.rs`):
+- New RPC variants `RpcRequest::PreVote(RequestVoteArgs)` /
+  `RpcResponse::PreVote(RequestVoteReply)` — the RequestVote payloads
+  reused under distinct variants, so a probe is structurally impossible to
+  conflate with a binding vote. Serde gives wire compat for free (the HTTP
+  transport needed zero changes; three_process proves interop).
+- `Role::PreCandidate { votes }` + `RoleKind::PreCandidate` (surfaces in
+  `/cluster/status` via the existing Debug rendering). Election timeout now
+  starts a *pre-campaign*: NO term bump, NO persistence, probes carry the
+  prospective term `current_term + 1` while the node's own term stays
+  untouched. A pre-vote majority triggers the old election body (now
+  `start_election`): durable term+1 + self-vote, become Candidate.
+- Grant rule (`handle_pre_vote`): prospective term must exceed ours AND the
+  §5.4.1 log tuple compare (same as a real vote) AND leader stickiness —
+  denied while this node IS the leader or heard a valid AppendEntries
+  within `election_timeout_min` (`last_leader_contact`, set in
+  `handle_append_entries` even on log-mismatch rejections). The
+  leader-denies half is load-bearing: without it, in a 3-node cluster the
+  leader itself would hand a healed up-to-date node its pre-vote majority.
+  Granting records nothing, adopts nothing, and — unlike a real vote —
+  never resets the grantor's election timer.
+- `Event::PreVoteReply { sent_term (prospective), from, result }`. Guards
+  before counting: still PreCandidate AND `sent_term == current_term + 1`;
+  a denial carrying a higher term → `become_follower` (how a term-lagged
+  node catches up and becomes grantable next timeout). The REAL RequestVote
+  handler is deliberately unchanged (not sticky, still adopts terms); its
+  timer-reset liveness note now points at PreVote as the mitigation.
+
+Tested (93 total; 5 new, 1 inverted):
+- The headline INVERTS phase 3's isolated-follower test: 5 virtual seconds
+  of isolation (20+ timeouts) and the follower's term NEVER advances (it
+  sits in PreCandidate); on heal the leader keeps leading and the cluster
+  term is byte-identical — the churn the old test asserted as expected
+  behavior is gone.
+- RPC-level grant matrix (prepared storage): stale/short log denied,
+  prospective term not beyond current denied, up-to-date granted — to
+  multiple askers (no one-grant-per-term rule) — with the term provably
+  unmoved throughout, and the real term-3 vote still grantable after.
+- Stickiness: heartbeat a passive node, then an up-to-date pre-vote is
+  denied while a REAL RequestVote for the same term still succeeds.
+- Timer independence: a node fed a continuous stream of grantable probes
+  still starts its own pre-campaign within election_timeout_max.
+- Cold start: 3 seeds elect through pre-vote from a never-led cluster
+  (stickiness can't deadlock the first election).
+- Sim unit test pins that PreVote traffic is invisible to the phase-10
+  safety observer (conflicting-looking probes record nothing; a real
+  conflicting AE afterwards still records) — the observer ignores
+  non-AppendEntries by construction, as phase 10 predicted.
+- Full regression (faults + jepsen + duplication soaks + linearizable
+  checker + three OS-process cluster) passed WITHOUT re-pinning any seed:
+  stale mode still finds violations on all 6 seeds, both duplication soaks
+  and the zero-violation linearizable claim hold, and the crash-round
+  guards (nemesis-RNG-driven, schedule-independent) were unaffected.
+
+Untested / known gaps:
+- No CheckQuorum: an isolated leader still believes it leads its old term
+  (partitioned_leader test's inline comment remains true; harmless — its
+  writes can't commit and it steps down on first contact).
+- `last_leader_contact` is volatile: a freshly restarted node may grant a
+  pre-vote inside what would have been the stickiness window. Harmless —
+  a probe majority still needs real votes to matter.
+- Stale grant replies from an earlier pre-campaign round count toward a
+  later round with the same prospective term (grants are non-binding, so
+  this affects nothing safety-relevant; noted for precision).
+
+## Project complete (phases 0-11)
+Remaining ideas beyond the original scope, in planned order: client dedup
+tokens for 504 retries, snapshotting/compaction + InstallSnapshot, dynamic
+membership, connection pooling, scripted Docker partition test. (TLS on
+the raft port: dropped — blocked on the dependency whitelist.)
 
 ## Out of scope (deliberate)
 Snapshotting/log compaction, dynamic membership changes — leave clean TODOs.
