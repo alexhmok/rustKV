@@ -53,18 +53,33 @@ Untested / known gaps:
 - Concurrent access (single-owner by design), very large logs (no compaction).
 - Not wired into the server yet — that is phase 5.
 
-## Phase 2 — transport trait + deterministic simulator ⬜
+## Phase 2 — transport trait + deterministic simulator ✅
 
-Planned approach:
-- Trait owned by the Raft core, roughly
-  `async fn send(&self, to: NodeId, req: RpcRequest) -> Result<RpcResponse, TransportError>`;
-  exact shape may adjust when election lands.
-- `SimTransport` in the library proper (not #[cfg(test)]): in-process registry of node
-  handlers; seeded per-message delay/drop/reorder decisions.
-- PRNG hand-rolled (~20-line SplitMix64/xorshift) — `rand` is not on the runtime
-  whitelist and the simulator ships in the lib.
-- Determinism: `#[tokio::test(start_paused = true)]` (current-thread runtime, virtual
-  time) so a seed fully reproduces a schedule.
+Done (`src/raft/rpc.rs`, `src/raft/transport/{mod,sim}.rs`, `src/rng.rs`):
+- RPC message shapes (RequestVote/AppendEntries args+replies; semantics come in 3/4).
+- `Transport` trait (outbound: `send(to, req) -> Result<RpcResponse, TransportError>`)
+  plus the `Inbound{from, request, reply: oneshot}` type both transports deliver on an
+  mpsc channel — the Raft core's event loop will `select!` on it, owning no network code.
+- `SimNetwork`/`SimTransport` (in the lib proper): seeded per-leg delay + drop, RPC
+  timeout, runtime-swappable `FaultConfig`, directed link blocking (phase 6 partition
+  building block), crash-as-black-hole (drop the inbox receiver), node re-registration
+  for restarts. All randomness drawn up front per send (fixed draw count → stable traces).
+- Reordering is emergent from independent per-message delays (asserted by test).
+- `SplitMix64` PRNG hand-rolled in the lib (`rand` not whitelisted); verified against
+  Vigna's reference vectors. Tokio `test-util` (dev-only) enables virtual time.
+
+Tested (13 new): PRNG reference vectors/determinism/bounds; exact virtual-time
+roundtrip (both legs); drop-all → timeout at exactly rpc_timeout; unreachable vs
+timeout semantics; crashed node black-holes; block/unblock recovery; runtime config
+swap; same seed → byte-identical 20-message lossy trace, different seeds diverge;
+concurrent sends provably reorder and reproducibly so per seed.
+
+Untested / known gaps:
+- Determinism holds on a current-thread paused-time runtime (the phase 3-6 test
+  harness); not guaranteed on a multi-threaded runtime.
+- No bandwidth/duplicate-message modeling (Raft must tolerate duplicates anyway —
+  phase 4's idempotent AppendEntries handling covers it).
+- Trait shape may grow (e.g. broadcast helpers) when election lands.
 
 ## Phase 3 — leader election ⬜
 Terms, randomized timeouts, RequestVote, majority, election restriction (§5.4.1).
