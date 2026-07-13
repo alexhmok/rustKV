@@ -1,0 +1,2 @@
+# Build artifacts only. Cargo.lock is intentionally committed (application crate).
+/target
