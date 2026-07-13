@@ -230,9 +230,48 @@ Untested / known gaps:
 - cluster_http real-time tests hardened against CPU starvation (200–400ms election
   timeouts + agreement-based waits) after a cross-binary flake surfaced this phase.
 
-## Phase 7 — real HTTP transport + local/Docker cluster ⬜
-HTTP transport between nodes; 3-node local run (three processes); Dockerfile + Compose
-cluster for partition testing (Docker is deferred until here; user installs the daemon).
+## Phase 7 — real HTTP transport + local/Docker cluster ✅
+
+Done:
+- `src/raft/transport/http.rs`: JSON over HTTP/1.1. Outbound is a hand-rolled client
+  over TcpStream (no HTTP-client crate on the whitelist): one connection per RPC,
+  `Connection: close`, Content-Length/EOF framing, chunked rejected
+  (`TODO(perf)` for pooling). Inbound: `POST /raft` axum router feeding the same
+  `Inbound` channel as the simulator — the Raft core can't tell transports apart.
+  IO/parse/slow failures all map to Timeout; only an unknown id is Unreachable.
+- `src/config.rs`: env-based NodeConfig (RUSTKV_NODE_ID / LISTEN / RAFT_LISTEN /
+  DATA_DIR / PEERS / PEER_CLIENT_URLS), unit-tested incl. rejection cases.
+- Binary runs one member with two listeners (client API + raft RPC); no peers =
+  single-node. `scripts/run-cluster.sh` + `make cluster` = local 3-process cluster.
+- Dockerfile (multi-stage, builder pinned to rust:1.89.0 matching the toolchain file)
+  + compose.yaml with TWO networks: `client` (published ports) and `raft` (peer
+  traffic via network-scoped `*-raft` aliases). That split was learned the hard way:
+  with one network, `docker network disconnect` also severs the published port, so
+  the isolated node's 504 CP behavior can't be observed. `make compose-up/down`.
+
+Tested:
+- Unit: HTTP response parsing (content-length, close-delimited, non-200, chunked,
+  garbage); NodeConfig parsing.
+- tests/http_transport.rs: RPC roundtrip over real sockets; unreachable-vs-timeout
+  (unknown id, dead addr, black-holed listener); in-process 3-node cluster over the
+  real transport electing, replicating to every state machine, surviving leader crash.
+- tests/three_process.rs: three OS processes of the actual binary (CARGO_BIN_EXE),
+  driven purely via the client API — formation, redirected writes visible everywhere,
+  kill -9 of the leader process, survivor writes, killed node rejoining from its data
+  dir with old + new values.
+- Manual `make cluster` smoke (PUT/GET/DELETE across processes with redirects).
+- Docker (daemon started locally, image built and run): compose cluster formation,
+  replication; leader partitioned via `docker network disconnect` → client-visible
+  504, doomed key never committed anywhere, majority kept serving, heal converged
+  (doomed truncated, partition-era write everywhere); `docker restart` persistence.
+
+Untested / known gaps:
+- Docker verification was manual (this machine, daemon 24.0.5) — not automated in
+  `make test`; a scripted compose partition test would need the daemon in CI.
+- Compose healing requires re-adding the `--alias nodeN-raft` (documented in README);
+  omitting it leaves the node unresolvable by peers.
+- No TLS/auth on the raft port and no connection pooling (out of scope; TODOs).
+- Follower reads remain eventually consistent (documented since phase 5).
 
 ## Phase 8 — Jepsen harness (optional) ⬜
 Do NOT start without explicit user approval.

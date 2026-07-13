@@ -1,22 +1,25 @@
-//! Thin binary shell: config from the environment, tracing setup, axum server.
-//! All logic lives in the `rustkv` library so it can be tested in-process.
+//! Thin binary shell: env config, tracing setup, two axum servers (client
+//! API + raft RPC). All logic lives in the `rustkv` library.
 //!
-//! Currently runs a single-node Raft cluster: every write goes through the
-//! persisted log (fsync before ack) and the KV state is rebuilt from the log
-//! on startup. Phase 7 adds the HTTP node-to-node transport and multi-node
-//! cluster config; until then the transport is an inert simulator handle.
+//! Runs one cluster member. With no RUSTKV_PEERS it is a single-node
+//! cluster; with peers configured it forms a real multi-node cluster over
+//! the HTTP transport. See src/config.rs for all variables, and
+//! scripts/run-cluster.sh for a ready-made local 3-node setup.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use rustkv::api::{self, ApiContext};
+use rustkv::config::NodeConfig;
 use rustkv::kv::KvNode;
-use rustkv::raft::node::{RaftConfig, RaftNode};
+use rustkv::raft::node::{RaftConfig, RaftNode, StateMachine};
 use rustkv::raft::storage::Storage;
-use rustkv::raft::transport::sim::{FaultConfig, SimNetwork};
+use rustkv::raft::transport::http::HttpTransport;
 use rustkv::store::KvStore;
 use tracing_subscriber::EnvFilter;
+
+const RPC_TIMEOUT: Duration = Duration::from_millis(150);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() {
@@ -24,45 +27,52 @@ async fn main() {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
-    // No CLI-parsing crate is on the dependency whitelist, so config is a
-    // positional arg or env vars: `rustkv [listen-addr]`, RUSTKV_LISTEN,
-    // RUSTKV_DATA_DIR.
-    let listen = std::env::args()
-        .nth(1)
-        .or_else(|| std::env::var("RUSTKV_LISTEN").ok())
-        .unwrap_or_else(|| "127.0.0.1:8080".to_string());
-    let data_dir = std::env::var("RUSTKV_DATA_DIR").unwrap_or_else(|_| "./rustkv-data".to_string());
-
+    let config = NodeConfig::from_env().unwrap_or_else(|error| panic!("bad config: {error}"));
     let store = Arc::new(KvStore::new());
-    let storage = Storage::open(&data_dir)
-        .unwrap_or_else(|error| panic!("cannot open data dir {data_dir}: {error}"));
+    let storage = Storage::open(&config.data_dir)
+        .unwrap_or_else(|error| panic!("cannot open data dir {}: {error}", config.data_dir));
 
-    // Single-node cluster: the simulated transport is never used (no peers)
-    // but satisfies the wiring until the HTTP transport lands in phase 7.
-    let net = SimNetwork::new(0, FaultConfig::default());
-    let (transport, inbound) = net.register(1);
+    let peer_ids: Vec<_> = {
+        let mut ids: Vec<_> = config.peers.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    };
+    let (transport, raft_router, inbound) =
+        HttpTransport::new(config.id, config.peers.clone(), RPC_TIMEOUT);
     let raft = RaftNode::spawn(
-        RaftConfig::new(1, Vec::new()),
+        RaftConfig::new(config.id, peer_ids),
         storage,
         transport,
         inbound,
-        {
-            let sm: Arc<dyn rustkv::raft::node::StateMachine> = store.clone();
-            sm
-        },
+        store.clone() as Arc<dyn StateMachine>,
     );
-    let kv = KvNode::new(store, raft, Duration::from_secs(5));
+    let kv = KvNode::new(store, raft, WRITE_TIMEOUT);
     let ctx = Arc::new(ApiContext {
         kv,
-        peer_urls: HashMap::new(),
+        peer_urls: config.peer_client_urls.clone(),
     });
 
-    let listener = tokio::net::TcpListener::bind(&listen)
+    let raft_listener = tokio::net::TcpListener::bind(&config.raft_listen)
         .await
-        .unwrap_or_else(|error| panic!("failed to bind {listen}: {error}"));
-    tracing::info!(addr = %listen, data_dir, "rustkv listening (single-node cluster)");
+        .unwrap_or_else(|error| panic!("failed to bind raft {}: {error}", config.raft_listen));
+    let client_listener = tokio::net::TcpListener::bind(&config.listen)
+        .await
+        .unwrap_or_else(|error| panic!("failed to bind {}: {error}", config.listen));
+    tracing::info!(
+        node = config.id,
+        client_addr = %config.listen,
+        raft_addr = %config.raft_listen,
+        data_dir = %config.data_dir,
+        peers = config.peers.len(),
+        "rustkv listening"
+    );
 
-    axum::serve(listener, api::router(ctx))
+    tokio::spawn(async move {
+        axum::serve(raft_listener, raft_router)
+            .await
+            .expect("raft server error");
+    });
+    axum::serve(client_listener, api::router(ctx))
         .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("server error");

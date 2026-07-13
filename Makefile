@@ -21,7 +21,17 @@ lint:
 run:
 	cargo run
 
-# Phase 7 will add: `cluster` (3 local processes) and Docker Compose targets.
+# Local 3-node cluster (three processes; client APIs on 8081-8083).
+cluster: build
+	./scripts/run-cluster.sh
+
+# 3-node cluster in Docker Compose (requires the Docker daemon running).
+# Client APIs on localhost:8081-8083; see README for partition testing.
+compose-up:
+	docker compose up --build -d
+
+compose-down:
+	docker compose down
 
 clean:
 	cargo clean

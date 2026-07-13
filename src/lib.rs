@@ -6,14 +6,15 @@
 //! binary (`src/main.rs`) is a thin shell that wires up config, tracing, and
 //! the network.
 //!
-//! Current status: phase 5 — client writes go through the replicated log
-//! (majority commit before the HTTP response), committed entries apply to
-//! the KV state machine on every node, and non-leaders redirect writes to
-//! the leader. The node-to-node HTTP transport is phase 7; until then
-//! multi-node clusters exist only on the simulated transport. See PLAN.md
-//! for the roadmap.
+//! Current status: phase 7 — full system: client writes go through the
+//! replicated log (majority commit before the HTTP response), committed
+//! entries apply to the KV state machine on every node, non-leaders
+//! redirect writes to the leader, and clusters run either on the
+//! deterministic simulated transport (tests) or over the real HTTP
+//! transport (multi-process / Docker). See PLAN.md for the roadmap.
 
 pub mod api;
+pub mod config;
 pub mod kv;
 pub mod raft;
 pub mod rng;

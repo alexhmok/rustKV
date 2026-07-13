@@ -3,8 +3,8 @@
 //! ARCHITECTURE RULE (CLAUDE.md): the Raft core never touches the network —
 //! it sends RPCs through the [`Transport`] trait and receives them as
 //! [`Inbound`] values on a channel. Two implementations:
-//! - [`sim`]: in-memory, deterministic, fault-injecting (this phase);
-//! - HTTP over tokio/axum (phase 7).
+//! - [`sim`]: in-memory, deterministic, fault-injecting;
+//! - [`http`]: JSON over HTTP/1.1 between real listeners.
 
 use std::fmt;
 use std::future::Future;
@@ -14,6 +14,7 @@ use tokio::sync::oneshot;
 use super::rpc::{RpcRequest, RpcResponse};
 use super::types::NodeId;
 
+pub mod http;
 pub mod sim;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
