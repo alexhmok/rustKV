@@ -153,10 +153,43 @@ Untested / known gaps:
 - Client-visible semantics of "accepted but never committed" — phase 5 (writes will
   block on commit, so minority-side clients time out instead of seeing success).
 
-## Phase 5 — KV on top of Raft ⬜
-Apply committed entries to the KV map; client writes go through the log and commit to
-a majority before responding; leader forwarding/redirect for non-leaders. End-to-end
-tests.
+## Phase 5 — KV on top of Raft ✅
+
+Done (`src/kv.rs`, `src/api.rs`, `src/main.rs`, node/store changes):
+- `StateMachine` trait; committed entries applied in log order on every node (KvStore
+  impl; Noop skipped). Apply + commit-notification live in the Raft event loop.
+- `RaftHandle::propose` now returns a `Proposal` whose `committed` oneshot resolves
+  true (committed + applied locally) or false (truncated by another leader — definitely
+  not applied); unresolved = caller times out (that IS the CP behavior).
+- §8 leadership no-op (`Command::Noop`): each election win appends one, so prior-term
+  entries — and the KV state after restart — commit without client traffic. This closed
+  the phase-4 "prior-term entries commit late" gap and shifted log indexes in tests.
+- `KvNode.write`: propose → await commit with timeout → WriteError::{NotLeader(hint),
+  Timeout(outcome unknown), Superseded(safe retry), Shutdown}.
+- HTTP: PUT 201 / DELETE 204 only after commit; non-leaders send 307 + Location to the
+  leader's client URL (redirect chosen over proxy-forwarding; peer URL map filled from
+  config in phase 7), 503 no-leader/superseded (retryable), 504 unconfirmed (ambiguous).
+  GETs stay local: may be stale on followers; linearizable reads out of scope (TODO).
+- Binary = persistent single-node cluster (RUSTKV_DATA_DIR, default ./rustkv-data);
+  state rebuilt from the log on startup via the no-op re-commit.
+
+Tested (55 total; 12 new/e2e): all phase-4 scenarios re-verified with state-machine
+assertions (identical snapshots on all nodes; orphan/doomed keys never applied;
+commit-notification true/false semantics); RPC-level apply timing (nothing applied
+before commit; truncated entry never applied); single-node HTTP contract (7 tests,
+now raft-backed) + KV state surviving restart over the same data dir; 3-node clusters
+with real HTTP client APIs over the simulated transport: leader writes visible
+everywhere, raw 307 + Location and auto-followed redirects for PUT and DELETE,
+minority-partitioned leader → 504 with the doomed key never appearing anywhere, and
+majority-side recovery after heal. Manual binary smoke test incl. restart.
+
+Untested / known gaps:
+- Reads are not linearizable and this is documented, not fixed (no ReadIndex/leases).
+- Client-visible retry ambiguity on 504 (write may commit later) is inherent; no
+  client-side dedup tokens (would be a later phase / Jepsen finding).
+- HTTP cluster tests are real-time and serialized (a shared mutex) — poll-based, not
+  seed-deterministic; the deterministic coverage lives in the sim-transport suites.
+- Location header embeds keys as-is; exotic key encodings unhandled (noted in code).
 
 ## Phase 6 — deterministic fault tests ⬜
 Partitions, leader crash/restart mid-write, heal-and-re-partition across seeds.

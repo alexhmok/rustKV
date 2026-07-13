@@ -3,12 +3,14 @@
 //! binary, so not every binary uses every item.
 #![allow(dead_code)]
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use rustkv::raft::Storage;
-use rustkv::raft::node::{RaftConfig, RaftHandle, RaftNode, RoleKind, Status};
+use rustkv::raft::node::{RaftConfig, RaftHandle, RaftNode, RoleKind, StateMachine, Status};
 use rustkv::raft::transport::sim::{FaultConfig, SimNetwork};
 use rustkv::raft::types::{Command, LogEntry, LogIndex, NodeId, Term};
+use rustkv::store::KvStore;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -40,6 +42,12 @@ pub fn put(key: &str, value: u64) -> Command {
     }
 }
 
+/// A fresh throwaway state machine for RPC-level tests that spawn RaftNode
+/// directly.
+pub fn new_sm() -> Arc<dyn StateMachine> {
+    Arc::new(KvStore::new())
+}
+
 pub fn node_config(id: NodeId, n: u64, seed: u64) -> RaftConfig {
     let peers = (1..=n).filter(|&p| p != id).collect();
     let mut config = RaftConfig::new(id, peers);
@@ -60,6 +68,7 @@ pub fn passive_config(id: NodeId, peers: Vec<NodeId>) -> RaftConfig {
 pub struct TestCluster {
     pub net: SimNetwork,
     pub nodes: Vec<(NodeId, RaftHandle)>,
+    pub stores: Vec<(NodeId, Arc<KvStore>)>,
     dirs: Vec<(NodeId, TempDir)>,
 }
 
@@ -73,19 +82,33 @@ pub fn spawn_cluster_with(
 ) -> TestCluster {
     let net = SimNetwork::new(seed, faults);
     let mut nodes = Vec::new();
+    let mut stores = Vec::new();
     let mut dirs = Vec::new();
     for id in 1..=n {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut storage = Storage::open(dir.path()).expect("storage");
         prepare(id, &mut storage);
         let (transport, inbound) = net.register(id);
+        let store = Arc::new(KvStore::new());
         nodes.push((
             id,
-            RaftNode::spawn(node_config(id, n, seed), storage, transport, inbound),
+            RaftNode::spawn(
+                node_config(id, n, seed),
+                storage,
+                transport,
+                inbound,
+                store.clone() as Arc<dyn StateMachine>,
+            ),
         ));
+        stores.push((id, store));
         dirs.push((id, dir));
     }
-    TestCluster { net, nodes, dirs }
+    TestCluster {
+        net,
+        nodes,
+        stores,
+        dirs,
+    }
 }
 
 pub fn spawn_cluster(n: u64, seed: u64, faults: FaultConfig) -> TestCluster {
@@ -93,6 +116,16 @@ pub fn spawn_cluster(n: u64, seed: u64, faults: FaultConfig) -> TestCluster {
 }
 
 impl TestCluster {
+    /// The node's local KV state machine (what committed entries applied to).
+    pub fn store(&self, id: NodeId) -> &Arc<KvStore> {
+        &self
+            .stores
+            .iter()
+            .find(|(nid, _)| *nid == id)
+            .expect("no such node")
+            .1
+    }
+
     pub fn handle(&self, id: NodeId) -> &RaftHandle {
         &self
             .nodes

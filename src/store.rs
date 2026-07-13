@@ -1,13 +1,15 @@
 //! In-memory key-value state machine.
 //!
-//! In phase 0 the HTTP handlers mutate this directly. From phase 5 on, all
-//! mutations arrive by applying committed Raft log entries, and this type
-//! becomes the state machine behind the log.
+//! All mutations arrive by applying committed Raft log entries (the
+//! [`StateMachine`] impl); the HTTP layer only reads it directly.
 
 use std::collections::HashMap;
 use std::sync::RwLock;
 
 use serde_json::Value;
+
+use crate::raft::node::StateMachine;
+use crate::raft::types::{Command, LogEntry};
 
 /// Thread-safe map of string keys to arbitrary JSON values.
 ///
@@ -42,6 +44,23 @@ impl KvStore {
             .expect("kv lock poisoned")
             .remove(key)
             .is_some()
+    }
+
+    /// A copy of the full map — for tests and debugging, not the hot path.
+    pub fn snapshot(&self) -> HashMap<String, Value> {
+        self.map.read().expect("kv lock poisoned").clone()
+    }
+}
+
+impl StateMachine for KvStore {
+    fn apply(&self, entry: &LogEntry) {
+        match &entry.command {
+            Command::Put { key, value } => self.put(key.clone(), value.clone()),
+            Command::Delete { key } => {
+                self.delete(key);
+            }
+            Command::Noop => {}
+        }
     }
 }
 

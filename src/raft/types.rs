@@ -14,12 +14,14 @@ pub type Term = u64;
 /// (e.g. `prev_log_index` before the first entry).
 pub type LogIndex = u64;
 
-/// A state-machine command carried by a log entry. Applying these to the KV
-/// map is phase 5; the variants mirror the client API's write operations.
+/// A state-machine command carried by a log entry. Put/Delete mirror the
+/// client API's write operations; Noop is appended by a fresh leader (§8) to
+/// commit prior-term entries promptly and is skipped by the state machine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Command {
     Put { key: String, value: Value },
     Delete { key: String },
+    Noop,
 }
 
 /// One entry in the replicated log.

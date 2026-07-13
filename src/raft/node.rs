@@ -21,16 +21,17 @@
 //! Storage errors are fail-stop: a node that cannot persist its state
 //! panics (crashes) rather than continuing and risking a safety violation.
 //!
-//! Phase 4 scope: full replication — log-matching consistency check with
-//! conflict truncation on followers, per-peer next_index/match_index with
-//! backtracking on the leader, majority commit with the §5.4.2 current-term
-//! rule. Deliberately basic Raft: no no-op entry on election win, so entries
-//! from prior terms commit only once a current-term entry is proposed; no
-//! PreVote/CheckQuorum; no batching cap on AppendEntries payloads.
-//! TODO(phase 5): apply committed entries to the KV state machine and
-//! notify proposal waiters of commitment.
+//! Phase 5 additions: committed entries are applied, in order, to a
+//! [`StateMachine`] (the KV map), and every accepted proposal carries a
+//! `committed` notification that resolves once the entry commits (or
+//! resolves `false` if a leadership change truncated it). A new leader
+//! appends a no-op entry (§8) so prior-term entries — and therefore the
+//! applied state after restarts — commit promptly without client traffic.
+//! Deliberately basic Raft: no PreVote/CheckQuorum, no linearizable reads
+//! (ReadIndex/leases), no batching cap on AppendEntries payloads.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -118,6 +119,24 @@ impl std::fmt::Display for ProposeError {
 
 impl std::error::Error for ProposeError {}
 
+/// Where committed commands land. Applied exactly once per log position, in
+/// log order, on every node (leaders and followers alike).
+pub trait StateMachine: Send + Sync + 'static {
+    fn apply(&self, entry: &LogEntry);
+}
+
+/// A write accepted into the leader's log (durably appended, NOT committed).
+#[derive(Debug)]
+pub struct Proposal {
+    pub term: Term,
+    pub index: LogIndex,
+    /// Resolves `true` once the entry is committed and applied on this node,
+    /// `false` if it was truncated/replaced by another leader and can never
+    /// commit as proposed. May never resolve while the node is cut off from
+    /// a majority — callers own the timeout (that IS the CP behavior).
+    pub committed: oneshot::Receiver<bool>,
+}
+
 /// Handle to a running node.
 pub struct RaftHandle {
     status: watch::Receiver<Status>,
@@ -134,12 +153,10 @@ impl RaftHandle {
         self.status.clone()
     }
 
-    /// Submits a command to the replicated log. `Ok((term, index))` means the
-    /// entry was durably *appended* on the leader — NOT yet committed.
-    /// Commitment is observable as `Status::commit_index >= index` while the
-    /// term still matches. TODO(phase 5): notify on commit/apply instead of
-    /// making callers watch.
-    pub async fn propose(&self, command: Command) -> Result<(Term, LogIndex), ProposeError> {
+    /// Submits a command to the replicated log. On success the entry is
+    /// durably appended on the leader; await [`Proposal::committed`] to learn
+    /// whether it commits.
+    pub async fn propose(&self, command: Command) -> Result<Proposal, ProposeError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.control
             .send(Control::Propose {
@@ -167,8 +184,15 @@ enum Control {
     Shutdown,
     Propose {
         command: Command,
-        reply: oneshot::Sender<Result<(Term, LogIndex), ProposeError>>,
+        reply: oneshot::Sender<Result<Proposal, ProposeError>>,
     },
+}
+
+/// A proposal whose commit outcome is still unknown.
+struct PendingProposal {
+    term: Term,
+    index: LogIndex,
+    committed: oneshot::Sender<bool>,
 }
 
 /// Replies from outbound-RPC tasks, tagged with what was sent so stale or
@@ -208,10 +232,16 @@ pub struct RaftNode<T: Transport + Clone> {
     storage: Storage,
     transport: T,
     inbound: mpsc::UnboundedReceiver<Inbound>,
+    state_machine: Arc<dyn StateMachine>,
     role: Role,
     leader_id: Option<NodeId>,
     /// Volatile; re-learned from the leader (or majority) after restart.
     commit_index: LogIndex,
+    /// Everything up to here has been applied to the state machine.
+    last_applied: LogIndex,
+    /// Local proposals awaiting their commit outcome. Survives step-down
+    /// (a deposed leader's entry may still commit under its successor).
+    pending: Vec<PendingProposal>,
     election_deadline: Instant,
     next_heartbeat: Instant,
     rng: SplitMix64,
@@ -229,6 +259,7 @@ impl<T: Transport + Clone> RaftNode<T> {
         storage: Storage,
         transport: T,
         inbound: mpsc::UnboundedReceiver<Inbound>,
+        state_machine: Arc<dyn StateMachine>,
     ) -> RaftHandle {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let (control_tx, control_rx) = mpsc::unbounded_channel();
@@ -254,9 +285,12 @@ impl<T: Transport + Clone> RaftNode<T> {
             storage,
             transport,
             inbound,
+            state_machine,
             role: Role::Follower,
             leader_id: None,
             commit_index: 0,
+            last_applied: 0,
+            pending: Vec::new(),
             election_deadline: Instant::now(),
             next_heartbeat: Instant::now(),
             rng,
@@ -319,7 +353,7 @@ impl<T: Transport + Clone> RaftNode<T> {
     fn handle_propose(
         &mut self,
         command: Command,
-        reply: oneshot::Sender<Result<(Term, LogIndex), ProposeError>>,
+        reply: oneshot::Sender<Result<Proposal, ProposeError>>,
     ) {
         if !self.is_leader() {
             let _ = reply.send(Err(ProposeError::NotLeader {
@@ -337,7 +371,17 @@ impl<T: Transport + Clone> RaftNode<T> {
             }])
             .expect("cannot persist proposal; fail-stop");
         tracing::info!(node = self.config.id, term, index, "proposal appended");
-        let _ = reply.send(Ok((term, index)));
+        let (committed_tx, committed_rx) = oneshot::channel();
+        self.pending.push(PendingProposal {
+            term,
+            index,
+            committed: committed_tx,
+        });
+        let _ = reply.send(Ok(Proposal {
+            term,
+            index,
+            committed: committed_rx,
+        }));
         // A single-node cluster commits immediately; otherwise replicate now.
         self.maybe_advance_commit();
         for &peer in &self.config.peers {
@@ -482,6 +526,9 @@ impl<T: Transport + Clone> RaftNode<T> {
                         from_index = entry.index,
                         "truncated conflicting log suffix"
                     );
+                    // Any of our own proposals in the truncated suffix can
+                    // now never commit as proposed — tell their waiters.
+                    self.resolve_pending();
                     append_from = Some(entry.index);
                     break;
                 }
@@ -517,12 +564,54 @@ impl<T: Transport + Clone> RaftNode<T> {
                 commit_index = new_commit,
                 "commit advanced"
             );
-            // TODO(phase 5): apply newly committed entries to the KV map.
+            self.apply_committed();
         }
 
         AppendEntriesReply {
             term,
             success: true,
+        }
+    }
+
+    // ---- applying committed entries ----
+
+    /// Applies everything in (last_applied, commit_index] to the state
+    /// machine, in log order, then settles proposal waiters.
+    fn apply_committed(&mut self) {
+        while self.last_applied < self.commit_index {
+            self.last_applied += 1;
+            let entry = self
+                .storage
+                .entry(self.last_applied)
+                .expect("committed entries exist in the log")
+                .clone();
+            self.state_machine.apply(&entry);
+            tracing::debug!(
+                node = self.config.id,
+                index = entry.index,
+                entry_term = entry.term,
+                "applied"
+            );
+        }
+        self.resolve_pending();
+    }
+
+    /// Settles proposal waiters: `true` once committed (and, via
+    /// [`Self::apply_committed`]'s ordering, already applied locally),
+    /// `false` if the entry was truncated/replaced and can never commit.
+    fn resolve_pending(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending);
+        for p in pending {
+            if self.storage.term(p.index) != Some(p.term) {
+                let _ = p.committed.send(false);
+            } else if self.commit_index >= p.index {
+                let _ = p.committed.send(true);
+            } else {
+                self.pending.push(p);
+            }
         }
     }
 
@@ -721,14 +810,26 @@ impl<T: Transport + Clone> RaftNode<T> {
         }
         let term = self.current_term();
         tracing::info!(node = self.config.id, term, votes, "became leader");
+        // next_index points at the pre-no-op tail so the no-op ships in the
+        // very first heartbeat without a backtracking round-trip.
         let next = self.storage.last_index() + 1;
         self.role = Role::Leader {
             next_index: self.config.peers.iter().map(|&p| (p, next)).collect(),
             match_index: self.config.peers.iter().map(|&p| (p, 0)).collect(),
         };
         self.leader_id = Some(self.config.id);
-        // Basic Raft: no no-op entry on election win, so prior-term entries
-        // commit only once a current-term proposal lands (§5.4.2).
+        // §8: commit a no-op at the start of the term. Under the §5.4.2 rule
+        // this is what lets prior-term entries (and thus the KV state after
+        // a restart) commit promptly even with no client traffic.
+        self.storage
+            .append(&[LogEntry {
+                term,
+                index: next,
+                command: Command::Noop,
+            }])
+            .expect("cannot persist leadership no-op; fail-stop");
+        // A single-node cluster commits it immediately.
+        self.maybe_advance_commit();
         // Assert authority immediately; also schedules the next heartbeat.
         self.on_heartbeat_tick();
     }
@@ -810,7 +911,7 @@ impl<T: Transport + Clone> RaftNode<T> {
                 commit_index = candidate,
                 "commit advanced"
             );
-            // TODO(phase 5): apply committed entries + notify proposers.
+            self.apply_committed();
         }
     }
 

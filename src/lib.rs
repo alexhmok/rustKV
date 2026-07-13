@@ -6,12 +6,15 @@
 //! binary (`src/main.rs`) is a thin shell that wires up config, tracing, and
 //! the network.
 //!
-//! Current status: phase 4 — single-node server; the Raft core (persistence,
-//! simulated transport, election, replication with majority commit) is
-//! complete but not wired to the server yet; that is phase 5. See PLAN.md
+//! Current status: phase 5 — client writes go through the replicated log
+//! (majority commit before the HTTP response), committed entries apply to
+//! the KV state machine on every node, and non-leaders redirect writes to
+//! the leader. The node-to-node HTTP transport is phase 7; until then
+//! multi-node clusters exist only on the simulated transport. See PLAN.md
 //! for the roadmap.
 
 pub mod api;
+pub mod kv;
 pub mod raft;
 pub mod rng;
 pub mod store;

@@ -308,6 +308,7 @@ async fn vote_rules_and_vote_persistence_across_restart() {
         Storage::open(dir.path()).unwrap(),
         t1,
         rx1,
+        new_sm(),
     );
 
     // Candidate 2 gets the vote for term 1.
@@ -332,6 +333,7 @@ async fn vote_rules_and_vote_persistence_across_restart() {
         Storage::open(dir.path()).unwrap(),
         t1b,
         rx1b,
+        new_sm(),
     );
     assert_eq!(node.status().term, 1, "term survived the restart");
 
@@ -359,7 +361,7 @@ async fn election_restriction_rejects_stale_logs_at_rpc_level() {
         .unwrap();
     storage.append(&[entry(2, 1)]).unwrap();
     let (t1, rx1) = net.register(1);
-    let node = RaftNode::spawn(passive_config(1, vec![2, 3]), storage, t1, rx1);
+    let node = RaftNode::spawn(passive_config(1, vec![2, 3]), storage, t1, rx1, new_sm());
 
     // A candidate with an empty log is refused despite its higher term —
     // and the node adopts that term (§5.1).
