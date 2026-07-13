@@ -25,16 +25,33 @@ Untested / known gaps:
   DELETE is idempotent (204 for absent keys); any JSON value (not just objects) is
   accepted; keys are single path segments.
 
-## Phase 1 — log + persistence types ⬜
+## Phase 1 — log + persistence types ✅
 
-Planned approach:
-- Types: `Command { Put { key, value }, Delete { key } }`,
-  `LogEntry { term, index, command }`, `HardState { current_term, voted_for }`.
-- HardState: small JSON file, atomic write (temp file → sync_all → rename → fsync dir).
-- Log: append-only newline-delimited JSON, sync_all before acking; conflict/suffix
-  truncation = atomic whole-file rewrite (fine without compaction; `TODO(compaction)`).
-- Startup replay rebuilds the in-memory log; a torn trailing line is by construction
-  un-acked → dropped safely (unit-tested via mid-line truncation).
+Done (`src/raft/types.rs`, `src/raft/storage.rs`):
+- Types: `Command { Put, Delete }`, `LogEntry { term, index, command }`,
+  `HardState { current_term, voted_for }`; `NodeId`/`Term`/`LogIndex` aliases
+  (indexes 1-based, 0 = sentinel).
+- `Storage::open(dir)`: creates/loads `hard_state.json` + `log.jsonl`, replays and
+  validates the log (contiguous indexes), keeps an in-memory mirror.
+- Durability: hard state written atomically (temp → fsync → rename → fsync dir); log
+  appends are newline-delimited JSON fsynced before returning; `truncate_from` is an
+  atomic whole-file rewrite (`TODO(compaction)` marks where snapshots would change this).
+- Torn-write repair: an unparsable or newline-less FINAL line is un-acked by
+  construction → dropped and the file truncated; anywhere else fails as `Corrupt`.
+- Sync `std::fs` I/O by design; the Raft core will own storage from its own task.
+- tempfile added as dev-dependency (test temp dirs).
+
+Tested (10 unit tests): fresh-dir defaults; hard state and log survive reopen;
+non-contiguous appends rejected (incl. gap inside a batch, nothing written); truncate
+durably drops suffix and indexes are reusable; truncate past end is a no-op,
+truncate(0) rejected; torn final line dropped + file repaired (partial line, and a
+complete-but-garbage line); corrupt middle line and on-disk index gap fail loudly.
+
+Untested / known gaps:
+- No real power-loss testing — crash tolerance is simulated by hand-corrupting files.
+- fsync guarantees are whatever `File::sync_all` provides per platform.
+- Concurrent access (single-owner by design), very large logs (no compaction).
+- Not wired into the server yet — that is phase 5.
 
 ## Phase 2 — transport trait + deterministic simulator ⬜
 
