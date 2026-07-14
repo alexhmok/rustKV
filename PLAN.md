@@ -1250,7 +1250,10 @@ Untested / known gaps (recorded from the concern review; deliberate):
   the no-op gate and one-in-flight rule are implemented and their firing
   is tested, but the disjoint-majority disease they prevent was not
   constructed in the sim (needs the gate disabled plus a 4-server
-  interleaving). Test-the-fix debt, noted honestly.
+  interleaving). Test-the-fix debt, noted honestly. [PAID in phase 18:
+  the disease is constructed as STACKED removals on a 5-server cluster —
+  the sketched 4-server two-leader form turned out unconstructible; see
+  the phase-18 record.]
 - **Shrink to 2 members is legal** and halves availability (either
   node's hiccup deposes the leader via CheckQuorum); the guard doesn't
   block it since both members are reachable at propose time.
@@ -1557,124 +1560,247 @@ lint at every step, `make partition-test` (real Docker network, PASS),
 and the payload experiments archived in the session job dir.
 
 Untested / known gaps (unchanged by this review, recorded in
-FAILURE_MODES.md): Ongaro concurrent-change schedule (test debt), reply
+FAILURE_MODES.md): Ongaro concurrent-change schedule (test debt — since
+paid in phase 18), reply
 duplication fault injection, real power-loss testing, the residual
 partial-partition liveness gap, sessions-table growth, and the
 chunking/streaming path for genuinely slow-network snapshot transfer.
 
-## Phases 0-17 + testing review complete; phases 18-21 planned below
+## Phase 18 — the Ongaro concurrent-change schedule ✅ (2026-07-14)
+
+The test-the-fix debt from phase 15, paid: the disjoint-majority
+disease the reconfig gates prevent is demonstrated gates-off and the
+identical driver is refused gates-on. Pure test work plus one harness
+hook; default-config behavior bit-for-bit unchanged.
+
+Done:
+- `RaftConfig.test_disable_reconfig_gates: bool` (default false; doc
+  comment marks it harness-only — main.rs untouched, so it is never
+  reachable from env config). Skips exactly the two SAFETY gates in
+  `validate_config_change` (no ConfigChange before this term's no-op
+  commits; at most one in flight); the structural checks (non-empty,
+  single-server delta) and the availability guard stay on even in the
+  harness. Threaded through the TestCluster
+  (`spawn_cluster_without_reconfig_gates`, preserved across
+  restart/add_node like the snapshot knobs). Seed-churn firewall holds
+  by construction: the flag adds zero RNG draws, zero messages, zero
+  wire changes.
+- FINDING (the plan's named fallback, hit for the sketched schedule):
+  the 4-server TWO-LEADER interleaving — leader 1 commits `remove 4`
+  with {1,3} while node 2 wins term+1 with votes {2,3,4} — is NOT
+  constructible in this implementation, gates or no gates. With a
+  single change in flight, every commit-majority of the new config
+  intersects every vote-majority of the old (single-server overlap:
+  2-of-3 + 3-of-4 > 4 servers), and the intersecting node faces a
+  contradiction either way it sequences: ack-the-entry-then-vote is
+  denied by the §5.4.1 log check (its log is now longer than the
+  rival's), vote-then-ack is rejected by the AppendEntries term check
+  (the old leader's RPC arrives below the freshly bumped term). The
+  binding defense for ONE in-flight single-server change is base Raft.
+- The disease IS constructible in the form the one-in-flight rule
+  uniquely prevents — STACKED uncommitted changes (thesis §4.1's actual
+  rationale), and it needs no timing races at all, just a partition:
+  5 servers, partition {L, F} | {A, B, C}, and L (an established
+  leader, no-op long committed) stacks `remove C` then `remove B` —
+  members 5 → 4 → 3, quorum 3 → 2, each change effective on append —
+  making {L, F} self-sufficient, while {A, B, C} is still a 3-of-5
+  majority of the config THEY hold and elects a higher-term leader.
+  Disjoint majorities {L,F} and {A,B,C} both commit.
+- Tests (tests/membership.rs, shared driver `ongaro_stacked_removals`
+  so the two legs are literally the same schedule):
+  - `stacked_config_changes_commit_on_disjoint_majorities_without_the_
+    gates` (expected-unsafe, gates off): both ConfigChanges and a
+    payload write confirm commit on {L,F}; the far side elects at a
+    higher term and its committed write lands at THE SAME log index as
+    the minority's committed second ConfigChange (asserted equal); both
+    leaders coexist and each side serves granted linearizable
+    (ReadIndex) reads of state the other has never heard of.
+    Deliberately no heal: healing trips the fail-stop
+    "asked to truncate committed entry" assert on the ex-leader —
+    correct behavior, but a panic swallowed in a spawned task proves
+    nothing; the divergence assertions are the violation record.
+  - `the_reconfig_gates_refuse_the_stacked_removal_that_splits_
+    majorities` (gates on): the identical driver is refused at exactly
+    the stacking step (`InvalidConfigChange`, reason "already in
+    flight" — asserted on the reason string), rejections are
+    side-effect-free, and after an immediate heal the lone in-flight
+    removal commits under its true 3-of-4 majority, the four survivors
+    converge byte-identical, and writes proceed.
+- The availability guard is passed HONESTLY in both legs (no
+  dependence on the phase-19 blind-spot bug): the removals are proposed
+  on an established leader moments after the partition, while every
+  `last_contact` is genuinely fresh (~50ms old against the 300ms
+  window). The phase-19(a) ack-tracking fix will not invalidate this
+  schedule.
+- SECOND FINDING, recorded in FAILURE_MODES.md: the phase-10
+  event-level observer is structurally silent through the unsafe run —
+  election-safety and log-matching are both per-term checks, and the
+  two split-brain leaders hold different terms. Disjoint cross-term
+  commits are invisible to it by design; divergence/WGL assertions are
+  the detector for this class.
+
+Tested:
+- Inversion verified both directions: the unsafe leg was re-run with
+  gates on during development and fails at exactly the stacking step
+  (the disease assertions are not vacuous); the gates-on leg fails
+  under the flag by construction (expect_err on the same call).
+- `make lint` green; full suite 183/183 (was 181 + the two new tests)
+  with ZERO seed re-pins — every previously pinned seeded schedule
+  passes byte-identical, as the firewall demands. (One cluster_http
+  flake on one of the runs, the documented real-time starvation class —
+  clean on rerun, and unreachable by this change: the flag is
+  hard-false everywhere outside the two new sim tests.)
+- Wide soaks rerun as the regression gate (`cargo test --release
+  --test faults --test jepsen -- --ignored`): both extended soaks
+  green, zero safety or linearizability violations.
+
+Untested / known gaps:
+- The no-op gate's INCREMENTAL necessity is not separately
+  demonstrated: on an established leader the one-in-flight check
+  subsumes it, and on a fresh leader a stale-low `commit_index` only
+  makes `members_index > commit_index` fire MORE often (conservative in
+  the safe direction). The flag disables both gates as a unit and the
+  tests demonstrate the pair; no constructible schedule was found where
+  ONLY the no-op gate stands between the cluster and the disease.
+- The two-leader form's impossibility is an analytic argument (quorum
+  overlap + the two base-Raft checks), not a machine-checked proof —
+  recorded as the reason no such test exists, per the plan's fallback
+  clause.
+
+## Phase 19 — membership hardening pair ✅ (2026-07-14)
+
+The two small membership fixes, one phase: (a) the reconfig guard's
+fresh-term blind spot, (b) parting notification for removed servers. Both
+landed test-first, with the disease demonstrated before each fix.
+
+Done:
+- (a) Guard ack-tracking: `validate_config_change`'s availability guard
+  now requires — besides `last_contact` freshness — that the member has
+  ACKED an AppendEntries at THIS term. Implemented with zero new state:
+  `acked_seq`'s key set IS the plan's per-peer acked-this-term flag (the
+  map starts empty at each leadership and gains entries at exactly the
+  one any-AppendEntries-reply-at-our-term site); self always counts.
+  InstallSnapshot replies deliberately do not count (they never counted
+  for `acked_seq`) — a snapshot-fed peer turns reachable one heartbeat
+  later, conservative in the safe direction. Zero RNG draws, zero
+  messages, zero wire changes.
+- (a) Test (`add_in_a_fresh_term_is_refused_until_members_ack`, seed
+  166), failed pre-fix by ACCEPTING the add: crash the LEADER of a
+  3-node cluster — a member down and a forced leadership change in one
+  event (the planned "crash a member, force a leadership change" merged
+  into one crash; tighter than the 5-node partition geometry and the
+  same blind spot) — survivors elect, and the add of a silent joiner is
+  proposed the moment the no-op gate opens. Post-fix: refused by the
+  availability guard (reason string asserted), with a vacuity bound
+  pinning the refusal INSIDE the old 300ms blind window, so the ack
+  requirement — not contact staleness — is what refused it. Restart the
+  crashed member → the IDENTICAL add is accepted and commits with 3 of
+  the new 4.
+- (b) Parting sends: `Role::Leader` gains
+  `departing: BTreeMap<NodeId, (LogIndex, MemberAddr)>` — BTreeMap
+  rather than the planned HashMap so parting fan-out ORDER is
+  deterministic under seeds (the map is iterated; a HashMap would churn
+  every seeded schedule containing a removal per process run), and the
+  address rides along because the watch payload needs it. Populated in
+  `adopt_membership` on the leader when a configuration drops a peer
+  (self excluded — a self-removing leader keeps its §4.2.2
+  step-down-on-commit path; a re-add purges any leftover entry).
+  `send_append`'s §4.1 gate admits departing peers; the heartbeat and
+  propose fan-outs target members ∪ departing; the peer leaves the map
+  at the first ack with `match_index >=` the removal entry's index (or
+  an InstallSnapshot boundary covering it — the compacted-removal path),
+  and the whole map dies on step-down: best-effort by design, residual
+  recorded in FAILURE_MODES.md.
+- (b) Watch payload: `membership_watch` now carries
+  `MembershipView { members, departing }` (watch-only type, never
+  serialized); `RaftHandle::membership()` — and so the kv/api/admin
+  layers — still returns members only. main.rs installs raft transport
+  addresses from members ∪ departing and withdraws the departed peer on
+  the second watch update; client redirect URLs stay members-only. The
+  planned main.rs pitfall was demonstrated for real: with the core fix
+  in but the address book built from members only, the new binary test
+  fails exactly as predicted ("node 3 never learned of its own
+  removal") — then passes with the merge.
+- (b) Tests, failed pre-fix by timing out waiting for the victim to
+  learn: `removed_follower_cannot_disrupt_the_members` extended — the
+  victim now adopts the configuration that excludes it (append-time,
+  §4.1), then 5 virtual seconds of pinned quiescence (Follower at every
+  sample — a probing server would sit in PreCandidate, since nothing
+  ever turns it back; frozen term; frozen log/commit; a write committed
+  by the members mid-window never reaches it) before the original
+  disruption phases run unchanged. Real-transport leg:
+  `three_process::removed_process_learns_of_its_removal_and_goes_quiet`
+  — actual binaries over real HTTP with main.rs's watch in the loop:
+  DELETE /cluster/members/3, node 3's own members view drops it, then
+  ~3s of real-time Follower/frozen-term/frozen-log samples while the
+  survivors keep committing on their 2-of-2 quorum.
+- FINDING, recorded in FAILURE_MODES.md: the parting protocol
+  guarantees delivery of the removal ENTRY, not the commit index — the
+  victim normally acks before the leader learns the entry committed, so
+  a parked server may hold its removal uncommitted-locally forever.
+  Harmless by construction: adoption is append-time and the campaign
+  gate parks on adoption.
+
+Tested:
+- Inversion verified for all three claims: (a)'s test pre-fix accepts
+  the add inside the blind window; (b)'s sim extension pre-fix times out
+  (the victim is never told); (b)'s binary test fails with the core fix
+  but without the main.rs address-book merge.
+- `make lint` green; full suite 185/185 (was 183, + the blind-window
+  test + the three_process quiet test) with ZERO seed re-pins.
+  Static-membership suites are untouched by construction: only
+  membership.rs proposes ConfigChanges, `departing` stays empty
+  everywhere else, and the guard change draws no RNG and sends nothing.
+  The pinned seed-156 phantom-member schedule is byte-identical (its
+  config change is an ADD — no departing entries exist in that run).
+  Both phase-18 Ongaro schedule tests pass unchanged, as required —
+  their guard passage rests on genuinely fresh acked contacts, not the
+  blind spot. The membership churn soak passed unchanged with both
+  fixes in.
+- Wide soaks rerun as the regression gate (`cargo test --release
+  --test faults --test jepsen -- --ignored`): both green, zero safety
+  or linearizability violations.
+- One cluster_http failure in the first full parallel run, clean solo
+  and in the following full run — the documented real-time starvation
+  flake class, unreachable by these changes.
+
+Untested / known gaps:
+- The step-down residual — a peer removed under a leader that crashes
+  or is deposed inside the one-RTT parting window parks probing forever
+  — is documented, not constructed: it needs a crash inside that
+  window, and what it degrades to is exactly the pre-fix probing
+  scenario the original test already covered.
+- No wire-visible changes to pin: parting sends are ordinary
+  AppendEntries/InstallSnapshot RPCs; `MembershipView` lives on the
+  watch channel only.
+- The three_process quiet test asserts role/term/log quiescence over
+  ~3s of real time; it does not count RPCs on the wire, so "quiet" is
+  behavioral (frozen state), not packet-level.
+
+## Phases 0-19 + testing review complete; phases 20-21 planned below
 The original scope shipped in phase 17; the 2026-07-14 testing review
 added the failure-mode catalog (FAILURE_MODES.md) and the follow-on
-phases below were planned from its findings. (TLS on the raft port:
-still dropped — blocked on the dependency whitelist; the mitigation
-ladder is in FAILURE_MODES.md.)
+phases were planned from its findings — phase 18 (above) is the first
+of them, shipped. (TLS on the raft port: still dropped — blocked on the
+dependency whitelist; the mitigation ladder is in FAILURE_MODES.md.)
 
-## Planned phases 18-21 (not started)
+## Planned phases 20-21 (not started)
 
-Ordered so each phase strengthens the net under the next: the Ongaro
-test first (insurance on the subtlest safety argument, before any
-membership code moves), then the two small membership hardenings, then
-the catch-up scalability work (which learner catch-up will lean on),
-then learners — the largest change — last, landing on top of all three.
+Ordered so each phase strengthens the net under the next: the catch-up
+scalability work first (learner catch-up will lean on it), then
+learners — the largest change — landing on top of it and of the
+phase-19 hardenings shipped above.
 
-Standing rules for all four (beyond CLAUDE.md): the seed-churn firewall
-— new behavior must default OFF in `RaftConfig` (`None`/`false`) so
-every seeded sim schedule stays byte-identical, with the binary opting
-in via env config, exactly as `snapshot_threshold` did in phase 14; any
-wire-visible change gets verbatim serde pins proving old encodings are
-readable and default-config output is byte-identical; test-first for
-every claim of the form "X prevents Y" (demonstrate Y with X disabled,
-then invert); FAILURE_MODES.md is updated in the same commit as any
-phase that changes a documented failure mode.
-
-### Phase 18 — the Ongaro concurrent-change schedule (test-the-fix debt)
-
-Goal: demonstrate the disjoint-majority disease that the phase-15
-reconfig gates (no ConfigChange before this term's no-op commits +
-one-in-flight) exist to prevent, then show the gates refuse the same
-schedule. Pure test work plus one harness hook; no product behavior
-changes.
-
-Design:
-- `RaftConfig.test_disable_reconfig_gates: bool` (default false; doc
-  comment marks it harness-only — it must never be reachable from env
-  config). Threaded through `TestCluster` spawn/restart like the
-  snapshot knobs.
-- Schedule (from Ongaro's 2015 raft-dev counterexample, adapted to
-  effect-on-append): 4-server base {1,2,3,4}. With gates OFF, leader 1
-  appends `remove 4` (new quorum set {1,2,3}) and, via directed link
-  blocks, replicates it only to node 3 — {1,3} is a 2-of-3 majority
-  under the new config, so leader 1 commits it plus a payload write.
-  Concurrently node 2 (which never saw the entry) wins term+1 with
-  votes {2,3,4} gathered BEFORE the entry reached 3 (fixed sim delays
-  make this window constructible), appends `remove 3` (quorum set
-  {1,2,4}) and commits its own payload write with {2,4}. {1,3} and
-  {2,4} are disjoint: two leaders commit independently.
-- Assertions, gates OFF: the phase-10 event-level observer (log
-  matching / election safety) or the final-log divergence check MUST
-  fire — the run is expected-unsafe, written as a `#[should_panic]` or
-  explicit-violation-count test.
-- Assertions, gates ON: the identical driver refuses the second
-  proposal at the exact step (`InvalidConfigChange`), the run converges,
-  and the WGL/divergence checks pass.
-- Honest fallback, recorded if hit: if §5.4.1 log-completeness (node 3
-  denying candidate 2 once it holds the entry) independently blocks
-  every constructible interleaving, tighten the timing (grant-then-
-  deliver orderings are schedulable with fixed delays); if it STILL
-  cannot be constructed, document which defense actually binds in this
-  implementation — that finding replaces the test as the phase
-  deliverable, recorded here and in FAILURE_MODES.md.
-
-Done when: both directions land (disease demonstrated gates-off,
-refused gates-on), zero seed re-pins elsewhere (the flag adds no RNG
-draws), lint green, checkpoint.
-
-### Phase 19 — membership hardening pair (guard ack-tracking + removed-server notification)
-
-Two small, independent fixes in the same area; one phase, one
-checkpoint.
-
-(a) Reconfig guard blind spot in a fresh term (FAILURE_MODES.md
-"Reconfig guard blind spot"):
-- Today `last_contact` initializes to leadership start, so for the
-  first `election_timeout_max` of a term every member LOOKS recently
-  heard and a ConfigChange can pass while a member is down.
-- Fix: a member counts as reachable only once it has ACKED this term —
-  a per-peer flag set at the same site that updates `acked_seq`
-  (any AppendEntries reply at our term), self always counting.
-  Latency cost ~one heartbeat RTT, and in practice zero: the no-op
-  gate already forces waiting for a majority of acks.
-- Test (test-first): crash a member, force a leadership change, propose
-  the add inside the old blind window → must now be refused; after the
-  survivors ack → accepted. The existing guard tests must pass
-  unchanged (they operate on long-established leaders).
-
-(b) Removed servers are never told (FAILURE_MODES.md "Removed servers
-are never told"):
-- Today the leader stops replicating to a removed peer immediately, so
-  the peer never learns of its removal and probes forever.
-- Fix: keep sending AppendEntries to a removed peer until
-  `match_index[peer] >= the removal entry's index`, then stop. The
-  peer applies the ConfigChange, derives a membership excluding
-  itself, and the EXISTING campaign gate (self ∈ members, built for
-  join mode) parks it silently. Track a `departing: HashMap<NodeId,
-  LogIndex>` in `Role::Leader`, populated when a removal takes effect
-  on append; departing peers never count toward any quorum (already
-  excluded by membership) and are dropped from the map on ack or
-  step-down (a successor leader inherits nothing — a peer removed
-  under a crashed leader may still park probing; the fix is
-  best-effort by design, document that residual).
-- Known pitfall to solve in-phase: main.rs's membership watch installs
-  ONLY current members into the transport address book, which would
-  make the parting sends `Unreachable` in the real binary. The watch
-  payload must carry departing members' addresses until their removal
-  is replicated (a second watch update drops them). Sim tests don't
-  need addresses; add a real-transport assertion (cluster_http or
-  three_process) that a removed node goes quiet.
-- Test (test-first): extend `removed_follower_cannot_disrupt_the_
-  members` — after the fix the removed node must APPLY its own removal
-  and go silent (Follower, frozen term, zero pre-campaigns over N
-  virtual seconds), instead of probing forever.
+Standing rules for both (beyond CLAUDE.md): the seed-churn
+firewall — new behavior must default OFF in `RaftConfig`
+(`None`/`false`) so every seeded sim schedule stays byte-identical,
+with the binary opting in via env config, exactly as
+`snapshot_threshold` did in phase 14; any wire-visible change gets
+verbatim serde pins proving old encodings are readable and
+default-config output is byte-identical; test-first for every claim of
+the form "X prevents Y" (demonstrate Y with X disabled, then invert);
+FAILURE_MODES.md is updated in the same commit as any phase that
+changes a documented failure mode.
 
 ### Phase 20 — catch-up scalability (AE batch cap, size-aware timeout, §7 snapshot chunking)
 

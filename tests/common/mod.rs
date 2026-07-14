@@ -118,6 +118,11 @@ pub struct TestCluster {
     /// Every node's `RaftConfig.snapshot_trailing` (phase-14 amendment),
     /// preserved across restarts for the same reason.
     snapshot_trailing: u64,
+    /// Every node's `RaftConfig.test_disable_reconfig_gates` (phase 18,
+    /// harness-only), preserved across restarts/joins like the snapshot
+    /// knobs. Default false everywhere; only the Ongaro-schedule tests
+    /// switch it on.
+    disable_reconfig_gates: bool,
 }
 
 /// Spawns nodes 1..=n; `prepare` can pre-populate each node's storage
@@ -130,6 +135,34 @@ pub fn spawn_cluster_full(
     faults: FaultConfig,
     snapshot_threshold: Option<u64>,
     snapshot_trailing: u64,
+    prepare: impl Fn(NodeId, &mut Storage),
+) -> TestCluster {
+    spawn_cluster_gated(
+        n,
+        seed,
+        faults,
+        snapshot_threshold,
+        snapshot_trailing,
+        false,
+        prepare,
+    )
+}
+
+/// [`spawn_cluster_full`] with the phase-18 harness switch: every node runs
+/// with `RaftConfig.test_disable_reconfig_gates` set, so the Ongaro
+/// disjoint-majority schedule becomes constructible. Only the expected-unsafe
+/// leg of that test may use it.
+pub fn spawn_cluster_without_reconfig_gates(n: u64, seed: u64, faults: FaultConfig) -> TestCluster {
+    spawn_cluster_gated(n, seed, faults, None, 0, true, |_, _| {})
+}
+
+fn spawn_cluster_gated(
+    n: u64,
+    seed: u64,
+    faults: FaultConfig,
+    snapshot_threshold: Option<u64>,
+    snapshot_trailing: u64,
+    disable_reconfig_gates: bool,
     prepare: impl Fn(NodeId, &mut Storage),
 ) -> TestCluster {
     let net = SimNetwork::new(seed, faults);
@@ -145,6 +178,7 @@ pub fn spawn_cluster_full(
         let mut config = node_config(id, n, seed);
         config.snapshot_threshold = snapshot_threshold;
         config.snapshot_trailing = snapshot_trailing;
+        config.test_disable_reconfig_gates = disable_reconfig_gates;
         nodes.push((
             id,
             Arc::new(RaftNode::spawn(
@@ -170,6 +204,7 @@ pub fn spawn_cluster_full(
         joined: Mutex::new(HashMap::new()),
         snapshot_threshold,
         snapshot_trailing,
+        disable_reconfig_gates,
     }
 }
 
@@ -359,6 +394,7 @@ impl TestCluster {
         let store = Arc::new(KvStore::new());
         let mut config = node_config(id, self.initial_n, self.seed);
         config.timeout_seed ^= incarnation << 32;
+        config.test_disable_reconfig_gates = self.disable_reconfig_gates;
         if let Some(&(threshold, trailing)) = self.lock_joined().get(&id) {
             config.join = true;
             config.snapshot_threshold = threshold;
@@ -408,6 +444,7 @@ impl TestCluster {
         config.join = true;
         config.snapshot_threshold = threshold;
         config.snapshot_trailing = trailing;
+        config.test_disable_reconfig_gates = self.disable_reconfig_gates;
         let handle = Arc::new(RaftNode::spawn(
             config,
             storage,

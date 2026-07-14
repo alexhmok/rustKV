@@ -4,8 +4,11 @@
 //!
 //! Covered: cluster formation, a write through any node (following
 //! redirects) visible on all three, kill -9 of the leader process with
-//! continued writes on the survivors, and the killed node rejoining from
-//! its data directory with full state.
+//! continued writes on the survivors, the killed node rejoining from
+//! its data directory with full state, and (phase 19b) a removed member
+//! being told of its own removal through the parting sends — exercising
+//! main.rs's membership watch keeping departing addresses installed —
+//! and going quiet.
 //! NOT covered: OS-level network partitions (that is what the Docker
 //! Compose setup in the README is for).
 //! Real-time test; generous poll-based waits.
@@ -118,6 +121,115 @@ async fn wait_for_value(client: &reqwest::Client, url: &str, key: &str, expect: 
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Phase 19(b) over the REAL stack: the parting notification must survive
+/// main.rs's membership watch, which installs transport addresses from the
+/// watch payload — if the removed peer's raft address were dropped the
+/// moment the removal took effect, the parting AppendEntries would be
+/// unreachable and the removed process would probe forever (the sim tests
+/// cannot see this: the sim transport routes by id). Remove node 3 from a
+/// live 3-process cluster and assert it actually goes quiet: it learns a
+/// configuration that excludes it, parks as a Follower (a never-told
+/// server sits in PreCandidate), and its log freezes while the survivors
+/// keep committing.
+#[tokio::test]
+async fn removed_process_learns_of_its_removal_and_goes_quiet() {
+    let cluster = spawn_cluster(22030);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let urls: Vec<String> = (1..=3).map(|id| cluster.client_urls[&id].clone()).collect();
+    wait_for_working_write_path(&client, &urls, "probe-remove").await;
+
+    // Remove node 3 (redirects land the DELETE on the leader; retry through
+    // startup-window 409s/503s — rejections are side-effect-free).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let response = client
+            .delete(format!("{}/cluster/members/3", urls[0]))
+            .send()
+            .await;
+        if let Ok(response) = response
+            && response.status() == 204
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the removal was never accepted"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // The removed process must LEARN of its own removal: its own view of
+    // the membership drops it (the parting send delivered the entry).
+    let removed_url = &urls[2];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(response) = client
+            .get(format!("{removed_url}/cluster/members"))
+            .send()
+            .await
+            && response.status() == 200
+        {
+            let members: Value = response.json().await.unwrap();
+            let members = members.as_object().unwrap();
+            if !members.contains_key("3") {
+                assert!(members.contains_key("1") && members.contains_key("2"));
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node 3 never learned of its own removal (parting send never arrived)"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Survivors keep serving (2-of-2 quorum), and the removed node goes
+    // QUIET: over ~3s (many election timeouts) it stays a Follower with a
+    // frozen term and a frozen log — no pre-campaigns, no replication.
+    let survivor_urls = &urls[..2];
+    wait_for_working_write_path(&client, survivor_urls, "after-removal").await;
+    tokio::time::sleep(Duration::from_millis(500)).await; // in-flight settles
+    let baseline: Value = client
+        .get(format!("{removed_url}/cluster/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for _ in 0..15 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let status: Value = client
+            .get(format!("{removed_url}/cluster/status"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            status["role"], "Follower",
+            "the removed process must park, not probe: {status}"
+        );
+        assert_eq!(status["term"], baseline["term"], "term must freeze");
+        assert_eq!(
+            status["last_log_index"], baseline["last_log_index"],
+            "the leader must have stopped replicating to the removed node"
+        );
+    }
+    // ...while the survivors committed writes it never saw.
+    let put = client
+        .put(format!("{}/final-after-quiet", survivor_urls[0]))
+        .json(&json!("done"))
+        .send()
+        .await
+        .unwrap();
+    assert!(put.status() == 201 || put.status() == 307);
 }
 
 #[tokio::test]

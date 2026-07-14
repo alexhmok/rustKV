@@ -101,18 +101,27 @@ async fn main() {
 
     // Fold membership changes into the transport's address book and the
     // API's redirect map (phase 15). Runs once immediately (idempotent for
-    // the bootstrap config), then on every change.
+    // the bootstrap config), then on every change. The raft address book
+    // keeps DEPARTING peers too (phase 19b): a removed peer is owed one
+    // last replication of its own removal entry, and dropping its address
+    // before that ack would make the parting sends unreachable — the core
+    // withdraws it from the view once the peer has acked (or on
+    // step-down). Client redirect URLs stay members-only: a removed peer
+    // is not a place to send clients.
     let self_id = config.id;
     tokio::spawn(async move {
         loop {
-            let members = membership_rx.borrow_and_update().clone();
-            let raft_addrs: HashMap<NodeId, String> = members
+            let view = membership_rx.borrow_and_update().clone();
+            let raft_addrs: HashMap<NodeId, String> = view
+                .members
                 .iter()
+                .chain(view.departing.iter())
                 .filter(|(id, addr)| **id != self_id && !addr.raft.is_empty())
                 .map(|(id, addr)| (*id, addr.raft.clone()))
                 .collect();
             transport.set_peers(raft_addrs);
-            let client_urls: HashMap<NodeId, String> = members
+            let client_urls: HashMap<NodeId, String> = view
+                .members
                 .iter()
                 .filter(|(id, addr)| **id != self_id && !addr.client.is_empty())
                 .map(|(id, addr)| (*id, addr.client.clone()))

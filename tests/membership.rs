@@ -22,11 +22,25 @@
 //!   down to an empty configuration;
 //! - a joiner never campaigns before a configuration includes it;
 //! - the named removed-server disruption scenario (thesis §4.2.3, deferred
-//!   here from phases 11/12): a removed follower left RUNNING keeps
-//!   probing forever but never disturbs the members — and even during the
+//!   here from phases 11/12, extended in phase 19b): a removed follower
+//!   left RUNNING is now TOLD of its own removal — the leader keeps
+//!   replicating to it until the removal entry is acked — and parks
+//!   silently instead of probing forever; and even during the
 //!   stickiness-lapsed window of a real election (leader crash) it cannot
-//!   win, because the committed removal entry makes every member's log
-//!   strictly longer than its own. See PLAN.md for the decision record.
+//!   win. See PLAN.md for the decision record.
+//! - the reconfig guard's fresh-term blind spot, closed (phase 19a): a
+//!   member counts as reachable only once it has ACKED at the new
+//!   leader's term, so a change can no longer slip through the window in
+//!   which every `last_contact` is freshly initialized while a member is
+//!   actually down.
+//! - the Ongaro concurrent-change schedule (phase 18): with the reconfig
+//!   gates harness-disabled, a minority-partitioned leader STACKS two
+//!   uncommitted removals until its own partition is a quorum — two
+//!   disjoint majorities then commit different entries at the same index
+//!   (split-brain, demonstrated down to conflicting linearizable reads);
+//!   with the gates on, the identical driver is refused at the exact
+//!   stacking step. See the section comment for why the two-competing-
+//!   leaders form of the disease is NOT constructible here.
 
 mod common;
 
@@ -34,7 +48,7 @@ use std::sync::Arc;
 
 use common::lin::{OpKind, Recorded, WriteKind, WriteOutcome, check_linearizable};
 use common::*;
-use rustkv::raft::node::{ProposeError, RoleKind};
+use rustkv::raft::node::{Proposal, ProposeError, RoleKind, Status};
 use rustkv::raft::transport::sim::FaultConfig;
 use rustkv::raft::types::{Command, LogIndex, Membership, NodeId, Session};
 use rustkv::rng::SplitMix64;
@@ -1025,6 +1039,93 @@ async fn add_is_rejected_while_a_member_is_unreachable() {
     cluster.shutdown();
 }
 
+/// Phase 19(a): the guard's fresh-term blind spot, closed. `last_contact`
+/// initializes to leadership start, so for the first `election_timeout_max`
+/// of a new term every member LOOKED recently heard — a change proposed in
+/// that window used to pass while a member was actually down. Now a member
+/// counts as reachable only once it has ACKED an AppendEntries at the new
+/// leader's term. Crash the leader (a member down AND a forced leadership
+/// change in one event), let the survivors elect, and propose the add the
+/// moment the no-op gate opens: the new majority (3 of {1,2,3,4}) counts
+/// only the successor + the survivor that acked = 2 — refused. Restart the
+/// crashed member; once it acks at the new term, the IDENTICAL add is
+/// accepted and commits. Pre-fix this test fails at the refusal step (the
+/// add is accepted inside the blind window) — recorded in PLAN.md.
+#[tokio::test(start_paused = true)]
+async fn add_in_a_fresh_term_is_refused_until_members_ack() {
+    let cluster = spawn_cluster(3, 166, low_loss_faults());
+    let all = cluster.all_ids();
+    let leader = cluster.wait_for_leader().await;
+    confirm_put(&cluster, &all, "ready", 1).await;
+    converge_among(&cluster, &all).await;
+
+    // The joiner exists (silent, join mode) so the add can eventually be
+    // accepted for real at the end.
+    cluster.add_node(4);
+
+    cluster.crash(leader.id);
+    let survivors: Vec<NodeId> = all.iter().copied().filter(|&id| id != leader.id).collect();
+    let successor = cluster.wait_for_leader_among(&survivors).await;
+    assert!(successor.term > leader.term, "a fresh term began");
+    let observed_at = Instant::now();
+
+    // Ride through the no-op gate ("retry shortly") to the availability
+    // guard's own verdict — the first non-no-op rejection is the one under
+    // test. Guard rejections are side-effect-free, so retrying is safe.
+    let handle = cluster.handle(successor.id);
+    let mut add4 = handle.membership();
+    add4.insert(4, member_addr(4));
+    let reason = loop {
+        match handle
+            .propose(Command::ConfigChange {
+                members: add4.clone(),
+            })
+            .await
+        {
+            Err(ProposeError::InvalidConfigChange { reason }) if reason.contains("no-op") => {
+                tokio::time::sleep(ms(5)).await;
+            }
+            Err(ProposeError::InvalidConfigChange { reason }) => break reason,
+            Ok(_) => panic!(
+                "the add was accepted inside the fresh term's blind window while \
+                 a member is down — the reconfig guard blind spot"
+            ),
+            Err(other) => panic!("unexpected rejection: {other}"),
+        }
+    };
+    assert!(
+        reason.contains("reachable"),
+        "the availability guard must be what binds, got: {reason}"
+    );
+    // Vacuity guard: the refusal landed INSIDE the old blind window (the
+    // crashed ex-leader's initialized last_contact was still fresher than
+    // the 300ms horizon), so the ack requirement — not contact staleness —
+    // is what refused it.
+    assert!(
+        observed_at.elapsed() < ms(250),
+        "too slow: the pre-fix guard would have refused this on staleness alone"
+    );
+
+    // Restart the crashed member; once it ACKS at the successor's term the
+    // identical add is accepted and commits (successor + survivor +
+    // restarted member = 3 of the new 4).
+    cluster.restart(leader.id).await;
+    let accepted = loop {
+        match handle
+            .propose(Command::ConfigChange {
+                members: add4.clone(),
+            })
+            .await
+        {
+            Ok(proposal) => break proposal,
+            Err(ProposeError::InvalidConfigChange { .. }) => tokio::time::sleep(ms(10)).await,
+            Err(other) => panic!("unexpected rejection after restart: {other}"),
+        }
+    };
+    assert_eq!(accepted.committed.await, Ok(true));
+    cluster.shutdown();
+}
+
 /// Removals are guarded by the same rule, and it cuts both ways: removing a
 /// LIVE member while another is down would strand the survivors (new
 /// majority 2 of {leader, dead node} — unreachable), so it is refused; but
@@ -1106,19 +1207,236 @@ async fn joiner_never_campaigns_before_a_config_includes_it() {
     cluster.shutdown();
 }
 
+// ---- the Ongaro concurrent-change schedule (phase 18) ----
+//
+// The disjoint-majority disease the phase-15 gates exist to prevent,
+// constructed for real. Two findings shape these tests:
+//
+// 1. The classic TWO-LEADER form (leader 1 commits `remove 4` with {1,3}
+//    while node 2 wins term+1 with votes {2,3,4}) is NOT constructible in
+//    this implementation, gates or no gates: with a single change in
+//    flight, any commit-majority of the new config and any vote-majority
+//    of the old config intersect (single-server overlap: e.g. 2-of-3 plus
+//    3-of-4 > 4 nodes), and the intersecting node faces a contradiction —
+//    if it acks the ConfigChange first, its longer log makes it deny the
+//    rival's vote (§5.4.1); if it votes first, its bumped term makes it
+//    reject the old leader's AppendEntries. The defense that binds there
+//    is Raft's base machinery, not the gates.
+//
+// 2. What the gates DO uniquely prevent is STACKING: a second change
+//    appended while the first is uncommitted computes its quorum from an
+//    unsettled basis, and configs two deltas apart need not overlap. A
+//    minority-partitioned 5-node leader that stacks `remove far_c` then
+//    `remove far_b` (members 5 → 4 → 3, quorum 3 → 2) becomes
+//    self-sufficient with one follower — while the far three are still a
+//    3-of-5 majority of the config THEY hold. Both sides then commit
+//    different entries at the same indexes. That schedule needs no timing
+//    races at all — just the partition — which is exactly why the
+//    one-in-flight rule is load-bearing.
+//
+// The event-level observer stays silent through the unsafe run — its
+// election-safety and log-matching checks are both per-term, and the two
+// leaders here hold different terms — so the assertions below (both sides
+// confirm commits and serve conflicting linearizable reads at overlapping
+// indexes) are the violation record, per the phase-10 observer's
+// documented scope.
+
+/// Runs the shared schedule up to the decisive step on an ESTABLISHED
+/// leader (no-op long committed, so the no-op gate is satisfied in both
+/// legs and the one-in-flight rule is the only gate in play): converge a
+/// 5-node cluster, partition {leader, one follower} from the other three,
+/// and immediately — while every last_contact is still fresh, so the
+/// availability guard passes honestly in both legs — propose the two
+/// stacked removals of far-side members. Returns the sides and both
+/// proposal outcomes; the callers assert opposite fates for the second.
+async fn ongaro_stacked_removals(
+    cluster: &TestCluster,
+) -> (
+    Status,
+    NodeId,
+    Vec<NodeId>,
+    Proposal,
+    Result<Proposal, ProposeError>,
+) {
+    let all = cluster.all_ids();
+    assert_eq!(all.len(), 5, "the schedule is sized for five nodes");
+    let leader = cluster.wait_for_leader().await;
+    confirm_put(cluster, &all, "before", 1).await;
+    converge_among(cluster, &all).await;
+
+    let near = *all.iter().find(|&&id| id != leader.id).unwrap();
+    let far: Vec<NodeId> = all
+        .iter()
+        .copied()
+        .filter(|&id| id != leader.id && id != near)
+        .collect();
+    for &m in &[leader.id, near] {
+        for &f in &far {
+            cluster.net.set_pair_blocked(m, f, true);
+        }
+    }
+
+    // Both removals target far-side members, proposed back to back inside
+    // the contact-freshness window (the far side acked heartbeats moments
+    // ago, so the availability guard sees a reachable new majority — a
+    // TRUE statement about 50ms ago, which is all the guard ever has).
+    let handle = cluster.handle(leader.id);
+    let mut minus_c = handle.membership();
+    minus_c.remove(&far[2]);
+    let c1 = handle
+        .propose(Command::ConfigChange { members: minus_c })
+        .await
+        .expect("the first removal is admitted in both legs");
+    let mut minus_b = handle.membership();
+    minus_b.remove(&far[1]);
+    let c2 = handle
+        .propose(Command::ConfigChange { members: minus_b })
+        .await;
+    (leader, near, far, c1, c2)
+}
+
+/// EXPECTED-UNSAFE (gates harness-disabled): the stacked removals leave
+/// {leader, near} believing in a 3-member config with quorum 2, so the
+/// minority partition commits a write — while the far three, still on the
+/// 5-member config, elect their own leader (3 of 5) and commit a different
+/// write AT AN OVERLAPPING INDEX. Two disjoint majorities, {L, near} and
+/// the far three, each confirm commits and each serve linearizable reads
+/// of state the other side has never heard of. This is the disease; the
+/// companion test below shows the gates refuse the identical driver.
+#[tokio::test(start_paused = true)]
+async fn stacked_config_changes_commit_on_disjoint_majorities_without_the_gates() {
+    let cluster = spawn_cluster_without_reconfig_gates(5, 181, fixed_delay_faults());
+    let (leader, near, far, c1, c2) = ongaro_stacked_removals(&cluster).await;
+    let c2 = c2.expect("gates off: the stacked second removal is admitted");
+
+    // The minority side commits: with the stacked config {leader, near,
+    // far[0]} in effect, leader + near is a 2-of-3 quorum. All three
+    // entries — both ConfigChanges and the payload — confirm commit.
+    let l_handle = cluster.handle(leader.id);
+    let poison = l_handle
+        .propose(put("poison", 13))
+        .await
+        .expect("the split-brain leader takes writes");
+    assert_eq!(poison.committed.await, Ok(true), "committed by {{L, near}}");
+    assert_eq!(c1.committed.await, Ok(true));
+    assert_eq!(c2.committed.await, Ok(true));
+
+    // The far side never saw the removals: its three nodes are a 3-of-5
+    // majority of the config they hold, and elect a leader of a HIGHER
+    // term once stickiness lapses.
+    let rival = cluster.wait_for_leader_among(&far).await;
+    assert!(
+        rival.term > leader.term,
+        "the far side elects at a fresh term"
+    );
+    let r_handle = cluster.handle(rival.id);
+    let rival_write = r_handle
+        .propose(put("rival", 99))
+        .await
+        .expect("the far-side leader takes writes");
+    assert_eq!(rival_write.committed.await, Ok(true), "committed by 3 of 5");
+
+    // The smoking gun, part 1 — overlapping log positions: the far side's
+    // no-op landed at c1's index, so its committed write occupies the SAME
+    // index as the minority side's committed second ConfigChange. One log
+    // slot, two committed entries.
+    assert_eq!(
+        rival_write.index, c2.index,
+        "both sides committed different entries at index {}",
+        c2.index
+    );
+    assert!(poison.index > rival_write.index);
+
+    // Part 2 — both leaders coexist and each side serves LINEARIZABLE
+    // reads of divergent committed state (ReadIndex confirms against each
+    // side's own quorum, so both grants succeed).
+    assert_eq!(l_handle.status().role, RoleKind::Leader);
+    assert_eq!(r_handle.status().role, RoleKind::Leader);
+    let ticket = l_handle.read().await.expect("split-brain leader read");
+    tokio::time::timeout(ms(1500), ticket.granted)
+        .await
+        .expect("granted in time")
+        .expect("leadership held");
+    assert_eq!(cluster.store(leader.id).get("poison"), Some(json!(13)));
+    assert_eq!(cluster.store(leader.id).get("rival"), None);
+    let ticket = r_handle.read().await.expect("far-side leader read");
+    tokio::time::timeout(ms(1500), ticket.granted)
+        .await
+        .expect("granted in time")
+        .expect("leadership held");
+    assert_eq!(cluster.store(rival.id).get("rival"), Some(json!(99)));
+    assert_eq!(cluster.store(rival.id).get("poison"), None);
+
+    // Deliberately NO heal: healing makes the successor's entries truncate
+    // committed entries on the ex-leader, which correctly trips the
+    // fail-stop "asked to truncate committed entry" assertion inside its
+    // task. The divergence above IS the demonstrated violation. The
+    // observer teardown check passes vacuously — see the section comment.
+    let _ = near;
+    cluster.shutdown();
+}
+
+/// The inversion: the IDENTICAL driver on a default cluster is refused at
+/// the exact stacking step — `InvalidConfigChange`, "already in flight" —
+/// and the run converges safely: the first removal commits after heal, the
+/// remaining four agree byte-for-byte, and writes proceed. Together with
+/// the test above this is the "demonstrate the disease, then show the gate
+/// refuses it" pair the phase-15 gates were shipped without.
+#[tokio::test(start_paused = true)]
+async fn the_reconfig_gates_refuse_the_stacked_removal_that_splits_majorities() {
+    let cluster = spawn_cluster(5, 182, fixed_delay_faults());
+    let (leader, near, far, c1, c2) = ongaro_stacked_removals(&cluster).await;
+
+    // The one-in-flight gate fires at the exact step the unsafe leg needed
+    // admitted (rejections are side-effect-free: nothing was appended).
+    let err = c2.expect_err("gates on: the stacked second removal is refused");
+    let ProposeError::InvalidConfigChange { reason } = err else {
+        panic!("expected InvalidConfigChange, got {err}");
+    };
+    assert!(
+        reason.contains("in flight"),
+        "the ONE-IN-FLIGHT gate must be what binds, got: {reason}"
+    );
+
+    // Heal immediately (the far side has not even reached an election
+    // timeout): the lone in-flight removal replicates, commits under its
+    // own 3-of-4 majority, and the cluster converges — no divergence, no
+    // second leader, and the observer check at shutdown stays the real
+    // assertion it always is.
+    for &m in &[leader.id, near] {
+        for &f in &far {
+            cluster.net.set_pair_blocked(m, f, false);
+        }
+    }
+    assert_eq!(c1.committed.await, Ok(true));
+    let members: Vec<NodeId> = cluster
+        .all_ids()
+        .into_iter()
+        .filter(|&id| id != far[2])
+        .collect();
+    converge_among(&cluster, &members).await;
+    assert_states_identical(&cluster, &members);
+    confirm_put(&cluster, &members, "after", 2).await;
+    cluster.shutdown();
+}
+
 // ---- the removed-server disruption scenario (design decision, §4.2.3) ----
 
-/// The named stickiness re-evaluation deferred from phases 11/12. A removed
-/// follower is left RUNNING: it stops receiving heartbeats (leaders never
-/// send outside the configuration), times out forever, and probes with
-/// pre-votes. The members deny — first by leader stickiness, and, in the
-/// stickiness-lapsed window after the leader crashes, by the §5.4.1 log
-/// check: the committed removal entry makes every member's log strictly
-/// longer than the removed server's, and a pre-vote majority in the removed
-/// server's own (stale, 4-member) view needs 3 grants it can never get. So
-/// it never reaches a REAL candidacy, and the cluster's terms move only for
-/// the one legitimate election. This is the evidence for the PLAN.md
-/// decision: real votes stay non-sticky; no lease/force-flag machinery.
+/// The named stickiness re-evaluation deferred from phases 11/12, extended
+/// in phase 19(b) with the parting-notification fix. A removed follower is
+/// left RUNNING. Pre-fix, leaders stopped replicating to it the moment the
+/// removal took effect, so it never learned and probed with pre-votes
+/// forever (denied by stickiness and the §5.4.1 log check — that remains
+/// the backstop for the documented residual: a peer removed under a leader
+/// that crashes before the parting send may still park probing). Post-fix,
+/// the leader keeps sending AppendEntries until the removal entry is acked:
+/// the victim appends it, adopts the configuration that excludes itself
+/// (effective on append, §4.1), and the campaign gate parks it — Follower,
+/// frozen term, frozen log, zero pre-campaigns — while the leader goes
+/// quiet toward it. The disruption assertions from the original scenario
+/// (members' terms move only for legitimate elections; the victim never
+/// leads, even in the stickiness-lapsed window after a leader crash) are
+/// kept unchanged on top.
 #[tokio::test(start_paused = true)]
 async fn removed_follower_cannot_disrupt_the_members() {
     let cluster = spawn_cluster(4, 161, low_loss_faults());
@@ -1138,24 +1456,54 @@ async fn removed_follower_cannot_disrupt_the_members() {
     confirm_put(&cluster, &members, "after", 2).await;
     let term_before = cluster.wait_for_leader_among(&members).await.term;
 
-    // Phase 1: leader alive. 5 virtual seconds of the removed server timing
-    // out and probing; stickiness denies it, the members' term never moves,
-    // and the victim never even reaches a candidacy (PreVote persists
-    // nothing, so its own term is frozen too).
-    for _ in 0..10 {
+    // Phase 0 (phase 19b): the parting sends deliver the removal entry to
+    // the victim itself — it adopts the configuration that excludes it.
+    // Pre-fix this times out: the leader never sends outside the config,
+    // so the victim's view still includes itself forever.
+    wait_until("the removed server learns of its own removal", || {
+        !cluster.handle(victim).membership().contains_key(&victim)
+    })
+    .await;
+    // Let in-flight deliveries settle, then pin the parked state.
+    tokio::time::sleep(ms(300)).await;
+    let parked = cluster.handle(victim).status();
+    assert_eq!(parked.role, RoleKind::Follower);
+
+    // Phase 1: leader alive. 5 virtual seconds — MANY election timeouts —
+    // of total quiescence: the victim stays a Follower (a probing server
+    // would sit in PreCandidate; nothing ever turns it back), its term and
+    // log never move, and the members' term never moves either. A write
+    // committed by the members mid-window must never reach it: the leader
+    // has stopped sending.
+    for round in 0..10 {
         tokio::time::sleep(ms(500)).await;
-        assert_ne!(
-            cluster.handle(victim).status().role,
-            RoleKind::Leader,
-            "the removed server must never lead"
+        let status = cluster.handle(victim).status();
+        assert_eq!(
+            status.role,
+            RoleKind::Follower,
+            "the removed server must stay parked (zero pre-campaigns)"
         );
+        assert_eq!(status.term, parked.term, "a parked server's term is frozen");
+        assert_eq!(
+            status.last_log_index, parked.last_log_index,
+            "the leader must stop replicating once the removal is acked"
+        );
+        assert_eq!(status.commit_index, parked.commit_index);
         for status in cluster.statuses_among(&members) {
             assert_eq!(
                 status.term, term_before,
                 "a removed server moved the members' term — disruption"
             );
         }
+        if round == 4 {
+            confirm_put(&cluster, &members, "while-parked", 3).await;
+        }
     }
+    assert_eq!(
+        cluster.store(victim).get("while-parked"),
+        None,
+        "a write committed after the parting ack leaked to the removed server"
+    );
 
     // Phase 2: the stickiness-lapsed window. Crash the leader; while the
     // two surviving members elect, the removed server is free to probe with
