@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use rustkv::raft::Storage;
 use rustkv::raft::node::{RaftConfig, RaftHandle, RaftNode, RoleKind, StateMachine, Status};
-use rustkv::raft::transport::sim::{FaultConfig, SimNetwork};
+use rustkv::raft::transport::sim::{FaultConfig, FaultStats, SimNetwork};
 use rustkv::raft::types::{
     Command, LogEntry, LogIndex, MemberAddr, NodeId, Session, Snapshot, Term,
 };
@@ -123,6 +123,20 @@ pub struct TestCluster {
     /// knobs. Default false everywhere; only the Ongaro-schedule tests
     /// switch it on.
     disable_reconfig_gates: bool,
+    /// The phase-20 catch-up knobs (batch cap, snapshot chunking),
+    /// preserved across restarts/joins like the snapshot knobs. Default
+    /// off everywhere — the pre-phase-20 behavior, byte for byte.
+    tuning: ClusterTuning,
+}
+
+/// The phase-20 `RaftConfig` knobs a test can switch on cluster-wide. Both
+/// default to `None` (= unbounded batches, single-shot snapshots — the
+/// pre-phase-20 behavior), so every seeded schedule that doesn't opt in
+/// stays pinned.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClusterTuning {
+    pub max_append_bytes: Option<usize>,
+    pub snapshot_chunk_bytes: Option<usize>,
 }
 
 /// Spawns nodes 1..=n; `prepare` can pre-populate each node's storage
@@ -144,7 +158,30 @@ pub fn spawn_cluster_full(
         snapshot_threshold,
         snapshot_trailing,
         false,
+        ClusterTuning::default(),
         prepare,
+    )
+}
+
+/// [`spawn_cluster_full`] with the phase-20 catch-up knobs (batch cap,
+/// snapshot chunking) applied to every node, including restarts and joiners.
+pub fn spawn_cluster_tuned(
+    n: u64,
+    seed: u64,
+    faults: FaultConfig,
+    snapshot_threshold: Option<u64>,
+    snapshot_trailing: u64,
+    tuning: ClusterTuning,
+) -> TestCluster {
+    spawn_cluster_gated(
+        n,
+        seed,
+        faults,
+        snapshot_threshold,
+        snapshot_trailing,
+        false,
+        tuning,
+        |_, _| {},
     )
 }
 
@@ -153,9 +190,19 @@ pub fn spawn_cluster_full(
 /// disjoint-majority schedule becomes constructible. Only the expected-unsafe
 /// leg of that test may use it.
 pub fn spawn_cluster_without_reconfig_gates(n: u64, seed: u64, faults: FaultConfig) -> TestCluster {
-    spawn_cluster_gated(n, seed, faults, None, 0, true, |_, _| {})
+    spawn_cluster_gated(
+        n,
+        seed,
+        faults,
+        None,
+        0,
+        true,
+        ClusterTuning::default(),
+        |_, _| {},
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_cluster_gated(
     n: u64,
     seed: u64,
@@ -163,6 +210,7 @@ fn spawn_cluster_gated(
     snapshot_threshold: Option<u64>,
     snapshot_trailing: u64,
     disable_reconfig_gates: bool,
+    tuning: ClusterTuning,
     prepare: impl Fn(NodeId, &mut Storage),
 ) -> TestCluster {
     let net = SimNetwork::new(seed, faults);
@@ -179,6 +227,8 @@ fn spawn_cluster_gated(
         config.snapshot_threshold = snapshot_threshold;
         config.snapshot_trailing = snapshot_trailing;
         config.test_disable_reconfig_gates = disable_reconfig_gates;
+        config.max_append_bytes = tuning.max_append_bytes;
+        config.snapshot_chunk_bytes = tuning.snapshot_chunk_bytes;
         nodes.push((
             id,
             Arc::new(RaftNode::spawn(
@@ -205,6 +255,7 @@ fn spawn_cluster_gated(
         snapshot_threshold,
         snapshot_trailing,
         disable_reconfig_gates,
+        tuning,
     }
 }
 
@@ -395,6 +446,8 @@ impl TestCluster {
         let mut config = node_config(id, self.initial_n, self.seed);
         config.timeout_seed ^= incarnation << 32;
         config.test_disable_reconfig_gates = self.disable_reconfig_gates;
+        config.max_append_bytes = self.tuning.max_append_bytes;
+        config.snapshot_chunk_bytes = self.tuning.snapshot_chunk_bytes;
         if let Some(&(threshold, trailing)) = self.lock_joined().get(&id) {
             config.join = true;
             config.snapshot_threshold = threshold;
@@ -445,6 +498,8 @@ impl TestCluster {
         config.snapshot_threshold = threshold;
         config.snapshot_trailing = trailing;
         config.test_disable_reconfig_gates = self.disable_reconfig_gates;
+        config.max_append_bytes = self.tuning.max_append_bytes;
+        config.snapshot_chunk_bytes = self.tuning.snapshot_chunk_bytes;
         let handle = Arc::new(RaftNode::spawn(
             config,
             storage,
@@ -506,6 +561,42 @@ impl TestCluster {
             .snapshot()
             .cloned()
     }
+}
+
+/// Vacuity guard (testing-regime T2): asserts that the probabilistic faults
+/// a test SCHEDULED actually FIRED during the run — a test whose fault never
+/// fired must fail, not silently pass as if the system had survived it.
+/// Returns the stats so callers can add cross-seed claims (e.g. reorders or
+/// partition-suppressed legs over a whole seed set) on top of the per-run
+/// ones. Reading the counters consumes no RNG draws, so pinned schedules
+/// are unaffected.
+pub fn assert_scheduled_faults_fired(
+    cluster: &TestCluster,
+    faults: &FaultConfig,
+    context: &str,
+) -> FaultStats {
+    let stats = cluster.net.fault_stats();
+    assert!(
+        stats.sends > 0,
+        "{context}: no message ever crossed the network"
+    );
+    if faults.drop_probability > 0.0 {
+        assert!(
+            stats.requests_dropped + stats.replies_dropped > 0,
+            "{context}: loss was scheduled (p={}) but no leg was ever \
+             dropped — the scenario is vacuous",
+            faults.drop_probability
+        );
+    }
+    if faults.duplicate_probability > 0.0 {
+        assert!(
+            stats.duplicates_delivered > 0,
+            "{context}: duplication was scheduled (p={}) but no duplicate \
+             was ever delivered — the scenario is vacuous",
+            faults.duplicate_probability
+        );
+    }
+    stats
 }
 
 /// Polls `pred` every 5ms of virtual time; panics after 60 virtual seconds.

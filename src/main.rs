@@ -50,9 +50,12 @@ async fn main() {
         config.peers.clone(),
         Duration::from_millis(config.rpc_timeout_ms),
     );
+    let transport = transport.with_assumed_bandwidth(config.assumed_bandwidth);
     let mut raft_config = RaftConfig::new(config.id, peer_ids);
     raft_config.snapshot_threshold = config.snapshot_threshold;
     raft_config.snapshot_trailing = config.snapshot_trailing;
+    raft_config.max_append_bytes = config.max_append_bytes;
+    raft_config.snapshot_chunk_bytes = config.snapshot_chunk_bytes;
     raft_config.join = config.join;
     // Address book for the bootstrap membership. Self uses its ADVERTISE
     // addresses (default: the listen addresses): whatever goes in here is

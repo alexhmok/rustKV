@@ -22,7 +22,7 @@
 mod common;
 
 use common::*;
-use rustkv::raft::types::{LogIndex, NodeId};
+use rustkv::raft::types::{Command, LogIndex, NodeId};
 use serde_json::json;
 
 /// Proposes `key = value` on the current leader among `ids` and waits for
@@ -146,7 +146,7 @@ async fn single_node_restarts_from_its_own_snapshot() {
 async fn run_install_snapshot_catch_up(seed: u64, duplicate_probability: f64) {
     let mut faults = low_loss_faults();
     faults.duplicate_probability = duplicate_probability;
-    let cluster = spawn_cluster_with_threshold(3, seed, faults, Some(8));
+    let cluster = spawn_cluster_with_threshold(3, seed, faults.clone(), Some(8));
     let all = cluster.all_ids();
 
     let leader = cluster.wait_for_leader().await;
@@ -175,6 +175,9 @@ async fn run_install_snapshot_catch_up(seed: u64, duplicate_probability: f64) {
         );
     }
 
+    // Vacuity (T2): when the duplication variant runs, duplicates must
+    // actually have been delivered.
+    assert_scheduled_faults_fired(&cluster, &faults, &format!("seed {seed}"));
     cluster.shutdown();
     tokio::time::sleep(ms(100)).await;
     // Construction guard: the survivors really compacted past the victim's
@@ -569,4 +572,235 @@ async fn slow_live_peer_catches_up_via_entries_inside_the_trailing_window() {
             "the victim's boundary covers entries it never held as entries"
         );
     }
+}
+
+// ---- phase 20c: chunked InstallSnapshot (§7 offset/done) ----
+
+/// [`confirm_put`] with payload weight (phase 20c): a 2 KiB string value,
+/// so twenty writes give the snapshot state real size on the wire.
+async fn confirm_big_put(cluster: &TestCluster, ids: &[NodeId], i: u64) {
+    let leader = cluster.wait_for_leader_among(ids).await;
+    let proposal = cluster
+        .handle(leader.id)
+        .propose(Command::Put {
+            key: format!("k{i}"),
+            value: json!(format!("{i}:{}", "x".repeat(2048))),
+            session: None,
+        })
+        .await
+        .expect("leader accepts the proposal");
+    assert_eq!(proposal.committed.await, Ok(true), "write {i} must commit");
+}
+
+/// The money-test schedule with payload weight: values are 2 KiB strings,
+/// so the survivors' snapshot state is tens of KiB — enough that chunk
+/// sizing is observable on the wire. Returns the largest InstallSnapshot
+/// message (serialized bytes) the sim saw. All the original money-test
+/// proofs are kept: convergence, identical states, and a victim log that
+/// never contains the compacted prefix (only a snapshot can have carried
+/// it).
+async fn run_weighted_install_snapshot_catch_up(
+    seed: u64,
+    duplicate_probability: f64,
+    snapshot_chunk_bytes: Option<usize>,
+) -> usize {
+    let mut faults = low_loss_faults();
+    faults.duplicate_probability = duplicate_probability;
+    let cluster = spawn_cluster_tuned(
+        3,
+        seed,
+        faults.clone(),
+        Some(8),
+        0,
+        ClusterTuning {
+            snapshot_chunk_bytes,
+            ..ClusterTuning::default()
+        },
+    );
+    let all = cluster.all_ids();
+
+    let leader = cluster.wait_for_leader().await;
+    for i in 1..=2u64 {
+        confirm_big_put(&cluster, &all, i).await;
+    }
+    converge_among(&cluster, &all).await;
+
+    let victim = *all.iter().find(|&&id| id != leader.id).unwrap();
+    let victim_last = cluster.handle(victim).status().last_log_index;
+    cluster.crash(victim);
+
+    let survivors: Vec<NodeId> = all.iter().copied().filter(|&id| id != victim).collect();
+    for i in 3..=20u64 {
+        confirm_big_put(&cluster, &survivors, i).await;
+    }
+    converge_among(&cluster, &survivors).await;
+
+    cluster.restart(victim).await;
+    converge_among(&cluster, &all).await;
+    assert_states_identical(&cluster);
+    for i in 1..=20u64 {
+        let value = cluster.store(victim).get(&format!("k{i}"));
+        assert_eq!(
+            value.and_then(|v| v.as_str().map(|s| s.starts_with(&format!("{i}:")))),
+            Some(true),
+            "seed {seed}: k{i} missing or wrong on the caught-up node"
+        );
+    }
+    assert_scheduled_faults_fired(&cluster, &faults, &format!("seed {seed}"));
+
+    cluster.shutdown();
+    tokio::time::sleep(ms(100)).await;
+    for &id in &survivors {
+        let boundary = cluster
+            .disk_snapshot(id)
+            .expect("survivors compacted")
+            .last_included_index;
+        assert!(
+            boundary > victim_last,
+            "seed {seed}: survivor {id} boundary {boundary} not past the \
+             victim's log ({victim_last}) — the scenario lost its teeth"
+        );
+    }
+    let snapshot = cluster
+        .disk_snapshot(victim)
+        .expect("the victim caught up via a snapshot");
+    assert!(snapshot.last_included_index > victim_last);
+    let log = cluster.disk_log(victim);
+    assert!(
+        log.iter().all(|e| e.index > victim_last),
+        "seed {seed}: the victim's log contains compacted-prefix entries — \
+         something backfilled what only a snapshot should carry"
+    );
+    cluster.net.max_rpc_bytes().install_snapshot
+}
+
+/// Phase 20c, the inversion pair. Disease first: single-shot (the
+/// default), the whole tens-of-KiB state rides ONE InstallSnapshot RPC —
+/// exactly what races a timeout on a real network. Inverted: 1 KiB chunks
+/// keep every InstallSnapshot message bounded (2× the chunk covers JSON
+/// string escaping of the payload slice, plus fixed metadata framing)
+/// while the same catch-up still converges — which takes tens of chunks,
+/// each offset-contiguous, or the reassembly could not have parsed.
+#[tokio::test(start_paused = true)]
+async fn chunked_install_snapshot_catches_up_in_bounded_messages() {
+    const CHUNK: usize = 1024;
+    const METADATA_SLACK: usize = 512;
+
+    let single_shot = run_weighted_install_snapshot_catch_up(81, 0.0, None).await;
+    assert!(
+        single_shot > 8 * (CHUNK + METADATA_SLACK),
+        "single-shot must ship the whole state in one RPC (saw \
+         {single_shot} bytes; the scenario has lost its teeth if this shrank)"
+    );
+
+    let chunked = run_weighted_install_snapshot_catch_up(81, 0.0, Some(CHUNK)).await;
+    assert!(
+        chunked <= 2 * CHUNK + METADATA_SLACK,
+        "chunked transfer sent an InstallSnapshot of {chunked} bytes, over \
+         the {CHUNK}-byte chunk bound"
+    );
+}
+
+/// Every request delivered twice, chunking on: duplicated chunks hit the
+/// follower's offset-idempotence (a copy at an already-staged offset is a
+/// no-op), duplicated final chunks hit the phase-14 boundary guard, and
+/// the catch-up still converges to identical states.
+#[tokio::test(start_paused = true)]
+async fn duplicated_snapshot_chunks_are_harmless() {
+    let chunked = run_weighted_install_snapshot_catch_up(82, 1.0, Some(1024)).await;
+    assert!(
+        chunked <= 2 * 1024 + 512,
+        "duplication must not change the chunk bound (saw {chunked} bytes)"
+    );
+}
+
+/// Leader crash mid-chunked-transfer (phase 20c): the victim's staged
+/// chunks are keyed to the dead leader's (term, leader, boundary), so the
+/// successor's fresh transfer supersedes them (the term bump alone
+/// discards the staging) and restarts from offset 0 — the victim still
+/// converges to the identical state, which a stitched-together mix of two
+/// leaders' transfers could not produce reliably. Construction is guarded:
+/// the crash happens strictly after the first chunk crossed and strictly
+/// before the victim installed anything.
+#[tokio::test(start_paused = true)]
+async fn leader_crash_mid_transfer_is_restarted_by_the_successor() {
+    let seed = 83;
+    let cluster = spawn_cluster_tuned(
+        3,
+        seed,
+        low_loss_faults(),
+        Some(8),
+        0,
+        ClusterTuning {
+            snapshot_chunk_bytes: Some(256),
+            ..ClusterTuning::default()
+        },
+    );
+    let all = cluster.all_ids();
+
+    let first_leader = cluster.wait_for_leader().await;
+    for i in 1..=2u64 {
+        confirm_big_put(&cluster, &all, i).await;
+    }
+    converge_among(&cluster, &all).await;
+    let victim = *all.iter().find(|&&id| id != first_leader.id).unwrap();
+    let victim_last = cluster.handle(victim).status().last_log_index;
+    cluster.crash(victim);
+
+    let survivors: Vec<NodeId> = all.iter().copied().filter(|&id| id != victim).collect();
+    // ~60 KiB of state → hundreds of 256-byte chunks: a wide window to
+    // crash inside.
+    for i in 3..=30u64 {
+        confirm_big_put(&cluster, &survivors, i).await;
+    }
+    converge_among(&cluster, &survivors).await;
+    let leader = cluster.wait_for_leader_among(&survivors).await;
+    let boundary_floor = victim_last + 1;
+
+    cluster.restart(victim).await;
+    wait_until("the chunked transfer to the victim starts", || {
+        cluster.net.max_rpc_bytes().install_snapshot > 0
+    })
+    .await;
+    // Construction guard: the victim must not have installed anything yet —
+    // the crash below really lands mid-transfer.
+    let at_crash = cluster.handle(victim).status().commit_index;
+    assert!(
+        at_crash < boundary_floor,
+        "seed {seed}: the transfer completed (victim at {at_crash}) before \
+         the crash could interrupt it — pick a different seed/chunk size"
+    );
+    cluster.crash(leader.id);
+
+    // The successor (the other survivor — the victim's log is too old to
+    // win an election) restarts the transfer and the victim converges.
+    let rest: Vec<NodeId> = all.iter().copied().filter(|&id| id != leader.id).collect();
+    converge_among(&cluster, &rest).await;
+    cluster.restart(leader.id).await;
+    converge_among(&cluster, &all).await;
+    assert_states_identical(&cluster);
+    for i in 1..=30u64 {
+        let value = cluster.store(victim).get(&format!("k{i}"));
+        assert_eq!(
+            value.and_then(|v| v.as_str().map(|s| s.starts_with(&format!("{i}:")))),
+            Some(true),
+            "seed {seed}: k{i} missing or wrong on the caught-up victim"
+        );
+    }
+
+    cluster.shutdown();
+    tokio::time::sleep(ms(100)).await;
+    // The money-test proof, unchanged: only a snapshot can have carried
+    // the compacted prefix.
+    let snapshot = cluster
+        .disk_snapshot(victim)
+        .expect("the victim caught up via a snapshot");
+    assert!(snapshot.last_included_index > victim_last);
+    assert!(
+        cluster
+            .disk_log(victim)
+            .iter()
+            .all(|e| e.index > victim_last),
+        "seed {seed}: the victim's log contains compacted-prefix entries"
+    );
 }

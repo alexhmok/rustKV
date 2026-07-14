@@ -751,3 +751,128 @@ async fn cluster_over_real_http_transport_elects_replicates_and_survives_leader_
         handle.shutdown();
     }
 }
+
+// ---- phase 20b: the size-aware RPC timeout ----
+
+/// A raft peer that answers every RPC correctly but only after `pause` —
+/// the deterministic stand-in for a slow link: the transport maps slow
+/// peers and slow networks to the same thing by design, and real loopback
+/// speed would make any transfer-time-based leg machine-dependent.
+async fn spawn_slow_server(pause: Duration) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let accept_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                while let Some(body) = read_framed_request(&mut stream).await {
+                    tokio::time::sleep(pause).await;
+                    let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let response =
+                        if let Some(term) = envelope["request"]["AppendEntries"]["term"].as_u64() {
+                            serde_json::to_vec(&RpcResponse::AppendEntries(
+                                rustkv::raft::rpc::AppendEntriesReply {
+                                    term,
+                                    success: true,
+                                },
+                            ))
+                            .unwrap()
+                        } else {
+                            let term = envelope["request"]["RequestVote"]["term"].as_u64().unwrap();
+                            serde_json::to_vec(&vote_reply(term)).unwrap()
+                        };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                        response.len()
+                    );
+                    if stream.write_all(head.as_bytes()).await.is_err()
+                        || stream.write_all(&response).await.is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    (addr, accept_task)
+}
+
+/// Phase 20b inversion, on real sockets against a slow peer (300ms to
+/// answer anything). Disease first: a catch-up-sized payload under the
+/// flat (pre-phase-20, constructor-default) timeout at a heartbeat-scale
+/// 50ms budget times out — and every retry would be the identical doomed
+/// RPC (the FAILURE_MODES.md "bandwidth × timeout" gap). Inverted: the
+/// same payload against the same base budget goes through once the
+/// transport grows the budget by the body's transfer time at the assumed
+/// bandwidth (1 MiB body at 1 MiB/s = ~+1s > the peer's 300ms). The
+/// small-RPC leg then proves the growth keys on BODY SIZE, not on
+/// configuration: the same size-aware transport gives a small RPC exactly
+/// the tight base budget, timing out long before the slow peer answers.
+#[tokio::test]
+async fn size_aware_timeout_lets_big_payloads_through_and_keeps_small_ones_tight() {
+    let _serial = SERIAL.lock().await;
+    let base = Duration::from_millis(50);
+    let pause = Duration::from_millis(300);
+    let bandwidth = 1024 * 1024;
+    let (addr, accept_task) = spawn_slow_server(pause).await;
+
+    let big_request = || {
+        RpcRequest::AppendEntries(rustkv::raft::rpc::AppendEntriesArgs {
+            term: 7,
+            leader_id: 1,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![rustkv::raft::types::LogEntry {
+                term: 7,
+                index: 1,
+                command: rustkv::raft::types::Command::Put {
+                    key: "big".to_string(),
+                    value: serde_json::Value::String("x".repeat(1024 * 1024)),
+                    session: None,
+                },
+            }],
+            leader_commit: 0,
+        })
+    };
+
+    // The disease: flat timeout (the constructor default) — the payload
+    // can never be delivered within the heartbeat-scale budget.
+    let flat = client_transport(addr.clone(), base);
+    assert_eq!(
+        flat.send(2, big_request()).await,
+        Err(TransportError::Timeout),
+        "a slow-peer payload must not fit the flat base budget"
+    );
+
+    // Inverted: same base budget, size-aware — the 1 MiB body earns ~1s.
+    let aware = client_transport(addr, base).with_assumed_bandwidth(Some(bandwidth));
+    assert_eq!(
+        aware.send(2, big_request()).await,
+        Ok(RpcResponse::AppendEntries(
+            rustkv::raft::rpc::AppendEntriesReply {
+                term: 7,
+                success: true
+            }
+        )),
+        "the same payload against the same base budget must fit once the \
+         timeout is size-aware"
+    );
+
+    // Small RPCs keep tight failure detection on the SAME transport: a
+    // vote times out at the base budget, well before the peer's 300ms
+    // answer — the budget grew for the body above, not for the config.
+    let start = std::time::Instant::now();
+    assert_eq!(
+        aware.send(2, vote_request(1)).await,
+        Err(TransportError::Timeout),
+        "a small RPC against the slow peer must still time out at base"
+    );
+    assert!(
+        start.elapsed() < pause,
+        "a small RPC's budget must stay at the flat base ({:?} elapsed)",
+        start.elapsed()
+    );
+    accept_task.abort();
+}

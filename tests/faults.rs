@@ -345,7 +345,12 @@ async fn randomized_fault_schedule(
     seed: u64,
     duplicate_probability: f64,
     snapshot_threshold: Option<u64>,
-) -> (Vec<String>, Vec<LogEntry>, usize) {
+) -> (
+    Vec<String>,
+    Vec<LogEntry>,
+    usize,
+    rustkv::raft::transport::sim::FaultStats,
+) {
     let context = format!("seed {seed}");
     let faults = rustkv::raft::transport::sim::FaultConfig {
         min_delay: ms(1),
@@ -354,7 +359,7 @@ async fn randomized_fault_schedule(
         duplicate_probability,
         rpc_timeout: ms(40),
     };
-    let cluster = spawn_cluster_with_threshold(3, seed, faults, snapshot_threshold);
+    let cluster = spawn_cluster_with_threshold(3, seed, faults.clone(), snapshot_threshold);
     let all = cluster.all_ids();
     let mut rng = SplitMix64::new(seed.wrapping_mul(0x5851_F42D_4C95_7F2D).wrapping_add(99));
     let mut trace = Vec::new();
@@ -449,13 +454,16 @@ async fn randomized_fault_schedule(
     }
     converge(&cluster).await;
     trace.push(format!("done: {} confirmed writes", confirmed.len()));
+    // Vacuity (T2): the losses/duplications this schedule promised must
+    // have actually occurred, or the run proved nothing about them.
+    let stats = assert_scheduled_faults_fired(&cluster, &faults, &context);
     let compacted_nodes = if snapshot_threshold.is_none() {
         assert_final_consistency(&cluster, &confirmed, &context).await;
         0
     } else {
         assert_final_consistency_with_snapshots(&cluster, &confirmed, &context).await
     };
-    (trace, cluster.disk_log(1), compacted_nodes)
+    (trace, cluster.disk_log(1), compacted_nodes, stats)
 }
 
 /// The snapshot-aware final check (see `randomized_fault_schedule` docs):
@@ -530,9 +538,19 @@ async fn assert_final_consistency_with_snapshots(
 
 #[tokio::test(start_paused = true)]
 async fn randomized_fault_schedules_preserve_safety_across_seeds() {
+    let mut total_reorders = 0u64;
+    let mut total_blocked = 0u64;
     for seed in 0..8 {
-        randomized_fault_schedule(seed, 0.0, None).await;
+        let (_, _, _, stats) = randomized_fault_schedule(seed, 0.0, None).await;
+        total_reorders += stats.reorders;
+        total_blocked += stats.legs_blocked;
     }
+    // Cross-set vacuity (T2): a single quiet seed is legal, but across the
+    // set the schedules must have exercised emergent reordering and real
+    // partition suppression, or the "survives partitions and reordering"
+    // claim was never actually stressed.
+    assert!(total_reorders > 0, "no seed ever reordered a message");
+    assert!(total_blocked > 0, "no partition ever suppressed a message");
 }
 
 /// The duplication soak: the same randomized schedules with 10% of all
@@ -541,9 +559,12 @@ async fn randomized_fault_schedules_preserve_safety_across_seeds() {
 /// crashes and loss at once.
 #[tokio::test(start_paused = true)]
 async fn randomized_fault_schedules_survive_message_duplication() {
+    let mut total_reorders = 0u64;
     for seed in 0..8 {
-        randomized_fault_schedule(seed, 0.10, None).await;
+        let (_, _, _, stats) = randomized_fault_schedule(seed, 0.10, None).await;
+        total_reorders += stats.reorders;
     }
+    assert!(total_reorders > 0, "no seed ever reordered a message");
 }
 
 /// Phase 14: the same randomized fault mix with an aggressively low
@@ -553,7 +574,7 @@ async fn randomized_fault_schedules_survive_message_duplication() {
 #[tokio::test(start_paused = true)]
 async fn randomized_fault_schedules_survive_with_snapshots_on() {
     for seed in 0..4 {
-        let (_, _, compacted) = randomized_fault_schedule(seed, 0.0, Some(8)).await;
+        let (_, _, compacted, _) = randomized_fault_schedule(seed, 0.0, Some(8)).await;
         assert!(
             compacted > 0,
             "seed {seed}: no node compacted — raise the write mix or lower the threshold"
@@ -575,7 +596,7 @@ async fn extended_soak_duplication_and_snapshots_across_seeds() {
         .unwrap_or(24);
     let mut seeds_with_compaction = 0u64;
     for seed in 0..seeds {
-        let (_, _, compacted) = randomized_fault_schedule(seed, 0.10, Some(8)).await;
+        let (_, _, compacted, _) = randomized_fault_schedule(seed, 0.10, Some(8)).await;
         if compacted > 0 {
             seeds_with_compaction += 1;
         }
@@ -590,10 +611,159 @@ async fn extended_soak_duplication_and_snapshots_across_seeds() {
 
 #[tokio::test(start_paused = true)]
 async fn same_seed_reproduces_the_same_fault_run() {
-    let (trace_a, log_a, _) = randomized_fault_schedule(5, 0.10, None).await;
-    let (trace_b, log_b, _) = randomized_fault_schedule(5, 0.10, None).await;
+    let (trace_a, log_a, _, stats_a) = randomized_fault_schedule(5, 0.10, None).await;
+    let (trace_b, log_b, _, stats_b) = randomized_fault_schedule(5, 0.10, None).await;
     assert_eq!(trace_a, trace_b, "action/outcome traces must be identical");
     assert_eq!(log_a, log_b, "final logs must be identical");
+    assert_eq!(
+        stats_a, stats_b,
+        "fault-event counts must be identical too — a diverging count means \
+         nondeterminism the trace comparison happened not to see"
+    );
+}
+
+/// T2 determinism audit: the phase-14 configuration (snapshots compacting
+/// mid-schedule) had no repeated-run determinism check — compaction adds
+/// disk truncation, snapshot capture, and InstallSnapshot to the replayed
+/// surface. Same seed must reproduce the identical trace, retained log,
+/// compaction count, and fault-event counts.
+#[tokio::test(start_paused = true)]
+async fn same_seed_reproduces_the_same_fault_run_with_snapshots_on() {
+    for seed in 0..2 {
+        let (trace_a, log_a, compacted_a, stats_a) =
+            randomized_fault_schedule(seed, 0.10, Some(8)).await;
+        let (trace_b, log_b, compacted_b, stats_b) =
+            randomized_fault_schedule(seed, 0.10, Some(8)).await;
+        assert_eq!(trace_a, trace_b, "seed {seed}: traces diverge");
+        assert_eq!(log_a, log_b, "seed {seed}: retained logs diverge");
+        assert_eq!(
+            (compacted_a, stats_a),
+            (compacted_b, stats_b),
+            "seed {seed}: compaction or fault counts diverge"
+        );
+    }
+}
+
+/// Extended determinism soak, excluded from the default run (wired into
+/// `make soak` via the extended_soak name filter): every seed in the range
+/// is run TWICE under the strongest fault mix (10% duplication + snapshots)
+/// and must reproduce byte-identically. This is the wide-N version of the
+/// audit above — HashMap iteration order, real time leaking into paused
+/// time, or unseeded randomness anywhere in the stack shows up here as a
+/// trace/log/stats divergence on some seed.
+#[tokio::test(start_paused = true)]
+#[ignore = "extended soak; run explicitly with --ignored"]
+async fn extended_soak_same_seed_determinism_across_seeds() {
+    let seeds: u64 = std::env::var("RUSTKV_SOAK_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24);
+    for seed in 0..seeds {
+        let (trace_a, log_a, compacted_a, stats_a) =
+            randomized_fault_schedule(seed, 0.10, Some(8)).await;
+        let (trace_b, log_b, compacted_b, stats_b) =
+            randomized_fault_schedule(seed, 0.10, Some(8)).await;
+        assert_eq!(trace_a, trace_b, "seed {seed}: traces diverge");
+        assert_eq!(log_a, log_b, "seed {seed}: retained logs diverge");
+        assert_eq!(
+            (compacted_a, stats_a),
+            (compacted_b, stats_b),
+            "seed {seed}: compaction or fault counts diverge"
+        );
+    }
+}
+
+// ---- T2 checker sensitivity: the final-consistency checker itself must
+// reject the violations it claims to guard against. Each probe runs a real
+// healthy cluster, then presents the checker with evidence of a specific
+// violation — a lost acknowledged write, a replaced acknowledged write, an
+// at-least-once double commit, a double-applied (diverged) replica — and
+// the run must FAIL. These are negative tests of the checker, not of
+// rustkv: a checker that never fires is indistinguishable from one that
+// works. ----
+
+/// A quiet 3-node cluster with one genuinely confirmed write, the fixture
+/// every sensitivity probe below tampers with.
+async fn healthy_cluster_with_one_confirmed_write(seed: u64) -> (TestCluster, Vec<Confirmed>) {
+    let cluster = spawn_cluster(3, seed, low_loss_faults());
+    cluster.wait_for_leader().await;
+    let mut confirmed = Vec::new();
+    let mut next_value = 0;
+    write_until_confirmed(
+        &cluster,
+        &cluster.all_ids(),
+        &mut next_value,
+        &mut confirmed,
+    )
+    .await;
+    converge(&cluster).await;
+    (cluster, confirmed)
+}
+
+/// A lost acknowledged write: the client was told v999 committed, but no
+/// node ever applied it. The final-state check must refuse.
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "missing from the final state")]
+async fn the_checker_rejects_a_lost_acknowledged_write() {
+    let (cluster, mut confirmed) = healthy_cluster_with_one_confirmed_write(62).await;
+    confirmed.push(Confirmed {
+        term: confirmed[0].term,
+        index: confirmed[0].index,
+        value: 999,
+        session: None,
+    });
+    assert_final_consistency(&cluster, &confirmed, "lost-ack probe").await;
+}
+
+/// A replaced acknowledged write: the log no longer holds the confirmed
+/// command at its assigned (term, index) — what a rolled-back-but-acked
+/// entry looks like. The disk-log check must refuse.
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "was lost")]
+async fn the_checker_rejects_a_replaced_confirmed_write() {
+    let (cluster, mut confirmed) = healthy_cluster_with_one_confirmed_write(63).await;
+    confirmed[0].term += 1;
+    assert_final_consistency(&cluster, &confirmed, "replaced-write probe").await;
+}
+
+/// An at-least-once double commit: one key committed twice without a shared
+/// dedup token is the log signature of a duplicated untokened apply (the
+/// fault workloads write unique per-value keys, so it can't arise
+/// legitimately there). The log-scan rule must refuse.
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "without a shared dedup token")]
+async fn the_checker_rejects_an_untokened_double_commit() {
+    let (cluster, confirmed) = healthy_cluster_with_one_confirmed_write(64).await;
+    for value in [1, 2] {
+        while try_confirmed_command(&cluster, &cluster.all_ids(), put("dup", value))
+            .await
+            .is_none()
+        {
+            tokio::time::sleep(ms(50)).await;
+        }
+    }
+    // Let every replica apply both commits, so the only violation left for
+    // the checker to find is the untokened double occupancy in the log.
+    converge(&cluster).await;
+    wait_until("all replicas apply the second commit", || {
+        cluster
+            .all_ids()
+            .iter()
+            .all(|&id| cluster.store(id).get("dup") == Some(json!(2)))
+    })
+    .await;
+    assert_final_consistency(&cluster, &confirmed, "double-commit probe").await;
+}
+
+/// A double-applied write, simulated by poking one replica's state machine
+/// directly: replica 2 now holds state no correct log replay produced. The
+/// cross-node divergence check must refuse.
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "state machine diverges")]
+async fn the_checker_rejects_a_diverged_state_machine() {
+    let (cluster, confirmed) = healthy_cluster_with_one_confirmed_write(65).await;
+    cluster.store(2).put("v_forged".to_string(), json!(1));
+    assert_final_consistency(&cluster, &confirmed, "divergence probe").await;
 }
 
 // ---- the teardown safety assert itself has teeth ----

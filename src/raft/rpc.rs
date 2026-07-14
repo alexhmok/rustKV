@@ -45,14 +45,51 @@ pub struct AppendEntriesReply {
 
 /// InstallSnapshot (§7, phase 14): sent instead of AppendEntries when a
 /// follower's next_index falls at or below the leader's snapshot boundary —
-/// the entries it needs no longer exist as entries. Single-shot: the whole
-/// snapshot rides in one RPC (no §7 offset/chunking — payloads are small by
-/// scope; a documented gap, like the unbounded in-memory payload it implies).
+/// the entries it needs no longer exist as entries.
+///
+/// Chunking (§7's offset/done, phase 20c): with the leader's
+/// `snapshot_chunk_bytes` set, the serialized `state` is streamed as
+/// `data` slices at byte `offset`s (each chunk carrying the boundary
+/// metadata in `snapshot`, its `state` left `null`), and the follower
+/// persists + restores only at `done`. The serde defaults are chosen so a
+/// phase-14..19 single-shot message — no `offset`/`data`/`done` fields at
+/// all — reads as an offset-0, done, data-inline chunk, and a phase-20
+/// single-shot sender (chunking off, the default) skips all three fields
+/// and emits byte-identical phase-14 output (both pinned below). Chunked
+/// messages themselves are NOT readable by pre-phase-20 binaries (their
+/// `state` is `null`): don't enable chunking mid-rolling-upgrade.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InstallSnapshotArgs {
     pub term: Term,
     pub leader_id: NodeId,
+    /// The boundary metadata; carries the whole state inline when (and
+    /// only when) `data` is `None` — the single-shot form.
     pub snapshot: Snapshot,
+    /// Byte offset of `data` within the serialized state (§7). Absent on
+    /// the wire when 0.
+    #[serde(default, skip_serializing_if = "offset_is_zero")]
+    pub offset: u64,
+    /// One chunk of the serialized state, split on UTF-8 boundaries.
+    /// `None` = single-shot: the state rides in `snapshot.state` instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+    /// True on the final chunk (and, via the default, on every single-shot
+    /// message). Absent on the wire when true.
+    #[serde(default = "done_default", skip_serializing_if = "done_is_true")]
+    pub done: bool,
+}
+
+fn offset_is_zero(offset: &u64) -> bool {
+    *offset == 0
+}
+
+fn done_default() -> bool {
+    true
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde requires the &bool shape
+fn done_is_true(done: &bool) -> bool {
+    *done
 }
 
 /// Per Figure 13 the reply carries only the follower's term: a higher term
@@ -138,6 +175,40 @@ mod tests {
         );
     }
 
+    /// A phase-14..19 single-shot InstallSnapshot on today's wire, both
+    /// directions (phase 20c): a single-shot sender (chunking off, the
+    /// default) must emit the pre-phase-20 encoding VERBATIM — no
+    /// offset/data/done fields — and that old encoding must deserialize
+    /// as an offset-0, done, data-inline message. Mixed-version clusters
+    /// (with chunking off) depend on both.
+    #[test]
+    fn single_shot_install_snapshot_wire_format_is_pinned_to_phase_14() {
+        let phase_14_wire = r#"{"InstallSnapshot":{"term":5,"leader_id":2,"snapshot":{"last_included_index":9,"last_included_term":4,"membership":null,"state":{"map":{"k":1},"sessions":{}}}}}"#;
+        let single_shot = RpcRequest::InstallSnapshot(InstallSnapshotArgs {
+            term: 5,
+            leader_id: 2,
+            snapshot: Snapshot {
+                last_included_index: 9,
+                last_included_term: 4,
+                membership: None,
+                state: json!({"map": {"k": 1}, "sessions": {}}),
+            },
+            offset: 0,
+            data: None,
+            done: true,
+        });
+        assert_eq!(
+            serde_json::to_string(&single_shot).unwrap(),
+            phase_14_wire,
+            "single-shot messages must serialize exactly as phase 14 did"
+        );
+        assert_eq!(
+            serde_json::from_str::<RpcRequest>(phase_14_wire).unwrap(),
+            single_shot,
+            "a pre-phase-20 message must read as an offset-0/done single chunk"
+        );
+    }
+
     #[test]
     fn install_snapshot_roundtrips() {
         let req = RpcRequest::InstallSnapshot(InstallSnapshotArgs {
@@ -149,6 +220,9 @@ mod tests {
                 membership: None,
                 state: json!({"map": {"k": 1}, "sessions": {}}),
             },
+            offset: 0,
+            data: None,
+            done: true,
         });
         let encoded = serde_json::to_string(&req).unwrap();
         assert_eq!(serde_json::from_str::<RpcRequest>(&encoded).unwrap(), req);
@@ -157,6 +231,59 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<RpcResponse>(&encoded).unwrap(),
             reply
+        );
+    }
+
+    /// The chunked form (phase 20c) has a pinned encoding of its own: the
+    /// boundary metadata rides every chunk with a `null` state, and the
+    /// offset/data/done trio appears exactly when it is informative
+    /// (offset nonzero, data present, done false).
+    #[test]
+    fn chunked_install_snapshot_serialization_is_pinned_and_roundtrips() {
+        let chunk = RpcRequest::InstallSnapshot(InstallSnapshotArgs {
+            term: 5,
+            leader_id: 2,
+            snapshot: Snapshot {
+                last_included_index: 9,
+                last_included_term: 4,
+                membership: None,
+                state: serde_json::Value::Null,
+            },
+            offset: 16,
+            data: Some("k\":1},\"sessions".to_string()),
+            done: false,
+        });
+        let encoded = serde_json::to_string(&chunk).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"InstallSnapshot":{"term":5,"leader_id":2,"snapshot":{"last_included_index":9,"last_included_term":4,"membership":null,"state":null},"offset":16,"data":"k\":1},\"sessions","done":false}}"#
+        );
+        assert_eq!(serde_json::from_str::<RpcRequest>(&encoded).unwrap(), chunk);
+
+        // A FINAL chunk (done=true, offset 0 on a one-chunk transfer)
+        // omits the defaulted fields but keeps `data` — still a chunk, not
+        // a single-shot.
+        let final_chunk = RpcRequest::InstallSnapshot(InstallSnapshotArgs {
+            term: 5,
+            leader_id: 2,
+            snapshot: Snapshot {
+                last_included_index: 9,
+                last_included_term: 4,
+                membership: None,
+                state: serde_json::Value::Null,
+            },
+            offset: 0,
+            data: Some("{}".to_string()),
+            done: true,
+        });
+        let encoded = serde_json::to_string(&final_chunk).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"InstallSnapshot":{"term":5,"leader_id":2,"snapshot":{"last_included_index":9,"last_included_term":4,"membership":null,"state":null},"data":"{}"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<RpcRequest>(&encoded).unwrap(),
+            final_chunk
         );
     }
 }

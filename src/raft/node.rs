@@ -111,7 +111,9 @@ use super::rpc::{
 };
 use super::storage::Storage;
 use super::transport::{Inbound, Transport, TransportError};
-use super::types::{Command, HardState, LogEntry, LogIndex, MemberAddr, Membership, NodeId, Term};
+use super::types::{
+    Command, HardState, LogEntry, LogIndex, MemberAddr, Membership, NodeId, Snapshot, Term,
+};
 use crate::rng::SplitMix64;
 
 #[derive(Debug, Clone)]
@@ -150,6 +152,26 @@ pub struct RaftConfig {
     /// term movement — until a ConfigChange that includes it arrives from
     /// the leader; catch-up rides InstallSnapshot/AppendEntries as usual.
     pub join: bool,
+    /// Byte budget for one AppendEntries batch (phase 20a — undoes the
+    /// deliberate phase-4 "no batching cap" simplification): `send_append`
+    /// truncates the suffix once the entries' estimated serialized size
+    /// exceeds it (the first entry always ships, so progress never stalls
+    /// on one oversized entry). Raft handles the partial batch natively —
+    /// the follower acks the prefix, match/next advance, and the
+    /// still-lagging resend is the pump. `None` (the default) is unbounded,
+    /// the pre-phase-20 behavior: nothing changes on the wire or in any
+    /// seeded schedule.
+    pub max_append_bytes: Option<usize>,
+    /// Chunk size for InstallSnapshot transfers (§7's offset/done, phase
+    /// 20c): the serialized snapshot state is streamed in slices of at
+    /// most this many bytes (rounded to UTF-8 boundaries), each riding an
+    /// ordinary InstallSnapshot RPC, and the follower persists + restores
+    /// only at the final chunk. `None` (the default) is single-shot — the
+    /// whole state in one RPC, the pre-phase-20 behavior, byte-identical
+    /// on the wire. Duplicated or re-sent chunks are offset-idempotent;
+    /// a leader crash mid-transfer discards the follower's staging and the
+    /// successor restarts the transfer.
+    pub snapshot_chunk_bytes: Option<usize>,
     /// HARNESS-ONLY (phase 18): disables the two phase-15 reconfig safety
     /// gates — "no ConfigChange before this term's no-op commits" and "at
     /// most one change in flight" — so the sim can construct the
@@ -174,6 +196,8 @@ impl RaftConfig {
             snapshot_trailing: 0,
             bootstrap_addrs: BTreeMap::new(),
             join: false,
+            max_append_bytes: None,
+            snapshot_chunk_bytes: None,
             test_disable_reconfig_gates: false,
         }
     }
@@ -424,10 +448,47 @@ enum Event {
         sent_term: Term,
         from: NodeId,
         /// The boundary of the snapshot this reply answers: on success the
-        /// follower holds everything through it.
+        /// follower holds everything through it (single-shot or final
+        /// chunk; a mid-transfer chunk ack promises nothing yet).
         last_included_index: LogIndex,
+        /// The byte offset the answered message carried (phase 20c;
+        /// 0 for single-shot).
+        sent_offset: u64,
+        /// How many payload bytes it carried (0 for single-shot, where the
+        /// state rides inline instead).
+        sent_len: usize,
+        /// Whether it completed the transfer (always true for single-shot).
+        sent_done: bool,
         result: Result<RpcResponse, TransportError>,
     },
+}
+
+/// A chunked InstallSnapshot being reassembled on a follower (phase 20c).
+/// Volatile by design: a crash or a superseding transfer just discards it
+/// and the leader (or its successor) restarts from offset 0. Only at the
+/// final chunk does anything persist.
+struct SnapshotStaging {
+    /// The transfer key: a chunk from any other (term, leader, boundary)
+    /// supersedes this staging.
+    term: Term,
+    leader: NodeId,
+    last_included_index: LogIndex,
+    /// The serialized state reassembled so far; `buf.len()` is the next
+    /// offset expected, which is what makes duplicated and re-sent chunks
+    /// idempotent.
+    buf: String,
+}
+
+/// A chunked InstallSnapshot in flight to one peer (phase 20c, leader
+/// side): the serialized state and the next offset to send. Lives inside
+/// [`Role::Leader`], so it dies on step-down — the follower's staging is
+/// then superseded by the successor's fresh transfer key.
+struct SnapshotTransfer {
+    /// Boundary of the snapshot being transferred; a newer compaction
+    /// restarts the transfer with a fresh payload.
+    last_included_index: LogIndex,
+    payload: Arc<String>,
+    offset: usize,
 }
 
 // Exactly one Role value exists per node, so the Leader variant's size is
@@ -474,6 +535,12 @@ enum Role {
         /// nothing, so a peer removed under a crashed leader may still
         /// park probing. BTreeMap so fan-out order stays deterministic.
         departing: BTreeMap<NodeId, (LogIndex, MemberAddr)>,
+        /// Chunked snapshot transfers in flight (phase 20c), per peer.
+        /// Only populated with `snapshot_chunk_bytes` set; single-shot
+        /// sends never touch it. An entry whose peer completes (or whose
+        /// boundary a newer compaction supersedes) is dropped; the map
+        /// dies with the leadership like everything else in the role.
+        snapshot_transfers: HashMap<NodeId, SnapshotTransfer>,
         /// Reads awaiting confirmation. Deliberately inside the role: losing
         /// leadership drops them, resolving every ticket with an error —
         /// unlike `pending` proposals, which survive step-down.
@@ -506,6 +573,9 @@ pub struct RaftNode<T: Transport + Clone> {
     /// crash just means the next trigger re-stages (the boundary lags a
     /// little longer).
     staged_snapshot: Option<(LogIndex, serde_json::Value, Option<Membership>)>,
+    /// A chunked InstallSnapshot being reassembled (phase 20c, follower
+    /// side). Volatile — see [`SnapshotStaging`].
+    snapshot_staging: Option<SnapshotStaging>,
     /// The in-effect cluster configuration (phase 15): latest ConfigChange
     /// in the log (effective on APPEND, §4.1), else the snapshot's, else
     /// bootstrap from `config` (empty in join mode).
@@ -596,6 +666,7 @@ impl<T: Transport + Clone> RaftNode<T> {
             last_applied: snapshot_index,
             pending: Vec::new(),
             staged_snapshot: None,
+            snapshot_staging: None,
             members,
             members_index,
             membership_tx,
@@ -972,7 +1043,9 @@ impl<T: Transport + Clone> RaftNode<T> {
 
     /// InstallSnapshot (§7, phase 14): replaces our compacted-away past with
     /// the leader's snapshot. Persisted (fsynced) before replying, like every
-    /// other RPC-visible state change.
+    /// other RPC-visible state change. Chunked transfers (phase 20c) stage
+    /// in memory and reach persistence — and every install side effect —
+    /// only at the final chunk.
     fn handle_install_snapshot(&mut self, args: InstallSnapshotArgs) -> InstallSnapshotReply {
         let current = self.current_term();
         if args.term < current {
@@ -994,7 +1067,8 @@ impl<T: Transport + Clone> RaftNode<T> {
 
         // Idempotence guard: everything through the boundary is already
         // committed here, so re-installing (a duplicated or reordered
-        // delivery — phase 10's standing fault) would rewind nothing and
+        // delivery — phase 10's standing fault, or a straggler chunk of a
+        // transfer that already completed) would rewind nothing and
         // rewrite disk for no reason. Success as a no-op: the reply's
         // meaning ("I hold everything through the boundary") is true.
         if boundary <= self.commit_index {
@@ -1008,10 +1082,17 @@ impl<T: Transport + Clone> RaftNode<T> {
             return InstallSnapshotReply { term };
         }
 
+        // Chunk staging (phase 20c): a mid-transfer chunk is acknowledged
+        // without installing anything; only a completed reassembly (or a
+        // legacy single-shot message) proceeds to the install below.
+        let Some(snapshot) = self.stage_snapshot_chunk(&args) else {
+            return InstallSnapshotReply { term };
+        };
+
         self.storage
-            .install_snapshot(&args.snapshot)
+            .install_snapshot(&snapshot)
             .expect("cannot persist snapshot; fail-stop");
-        self.state_machine.restore(&args.snapshot.state);
+        self.state_machine.restore(&snapshot.state);
         self.commit_index = boundary;
         self.last_applied = boundary;
         // Adopt the snapshot's membership under the §4.1 precedence: a
@@ -1039,6 +1120,127 @@ impl<T: Transport + Clone> RaftNode<T> {
             "installed snapshot from leader"
         );
         InstallSnapshotReply { term }
+    }
+
+    /// Folds one InstallSnapshot message into the chunk staging (phase
+    /// 20c) and returns the complete [`Snapshot`] once one is on hand:
+    /// immediately for a legacy single-shot message (state inline, no
+    /// `data`), or at the final chunk of a reassembly. `None` means "acked,
+    /// nothing to install yet".
+    ///
+    /// Staging is keyed by (term, leader, boundary): a chunk from any
+    /// other transfer discards what was staged (the deposed leader's
+    /// half-transfer can never complete; its successor restarts from
+    /// offset 0). Within a transfer, `buf.len()` is the only offset that
+    /// appends — lower offsets are duplicates (idempotent no-ops, phase
+    /// 10's standing fault), and a gap can only mean this node lost its
+    /// staging while the leader advanced (e.g. a crash-restart mid-
+    /// transfer): the staging is discarded and the leader self-heals — its
+    /// post-"done" AppendEntries probe is rejected, backtracks to the
+    /// boundary, and the transfer restarts from offset 0.
+    fn stage_snapshot_chunk(&mut self, args: &InstallSnapshotArgs) -> Option<Snapshot> {
+        let Some(data) = &args.data else {
+            // Legacy single-shot: the whole state rides inline. (A
+            // data-less done=false message is unconstructible by any
+            // sender; treated as a pure ack.)
+            return args.done.then(|| args.snapshot.clone());
+        };
+        let term = self.current_term();
+        let boundary = args.snapshot.last_included_index;
+        let offset = usize::try_from(args.offset).expect("chunk offset fits in usize");
+        if self.snapshot_staging.as_ref().is_some_and(|staging| {
+            (staging.term, staging.leader, staging.last_included_index)
+                != (term, args.leader_id, boundary)
+        }) {
+            let staging = self.snapshot_staging.take().expect("just matched Some");
+            tracing::info!(
+                node = self.config.id,
+                term,
+                staged_from = staging.leader,
+                staged_boundary = staging.last_included_index,
+                from = args.leader_id,
+                boundary,
+                "discarding staged snapshot chunks: transfer superseded"
+            );
+        }
+        match &mut self.snapshot_staging {
+            None => {
+                if offset != 0 {
+                    tracing::debug!(
+                        node = self.config.id,
+                        term,
+                        offset,
+                        "mid-transfer snapshot chunk with nothing staged; ignored"
+                    );
+                    return None;
+                }
+                self.snapshot_staging = Some(SnapshotStaging {
+                    term,
+                    leader: args.leader_id,
+                    last_included_index: boundary,
+                    buf: data.clone(),
+                });
+            }
+            Some(staging) => {
+                if offset == staging.buf.len() {
+                    staging.buf.push_str(data);
+                } else if offset.saturating_add(data.len()) <= staging.buf.len() {
+                    // A duplicated or re-sent chunk we already hold.
+                    tracing::debug!(
+                        node = self.config.id,
+                        term,
+                        offset,
+                        staged = staging.buf.len(),
+                        "duplicate snapshot chunk ignored"
+                    );
+                } else {
+                    tracing::warn!(
+                        node = self.config.id,
+                        term,
+                        offset,
+                        staged = staging.buf.len(),
+                        "snapshot chunk gap; discarding staging (the leader \
+                         restarts the transfer after its next probe)"
+                    );
+                    self.snapshot_staging = None;
+                    return None;
+                }
+            }
+        }
+        if !args.done {
+            tracing::debug!(
+                node = self.config.id,
+                term,
+                offset,
+                len = data.len(),
+                boundary,
+                "snapshot chunk staged"
+            );
+            return None;
+        }
+        let staging = self.snapshot_staging.take().expect("staged above");
+        match serde_json::from_str(&staging.buf) {
+            Ok(state) => Some(Snapshot {
+                last_included_index: boundary,
+                last_included_term: args.snapshot.last_included_term,
+                membership: args.snapshot.membership.clone(),
+                state,
+            }),
+            Err(error) => {
+                // A contiguous reassembly of one leader's serialization
+                // cannot legally be unparseable — but a peer bug must not
+                // crash us: discard and let the transfer restart.
+                tracing::error!(
+                    node = self.config.id,
+                    term,
+                    from = args.leader_id,
+                    boundary,
+                    %error,
+                    "reassembled snapshot is unparseable; discarding staging"
+                );
+                None
+            }
+        }
     }
 
     /// Full §5.3 AppendEntries: consistency check, duplicate-tolerant entry
@@ -1478,6 +1680,9 @@ impl<T: Transport + Clone> RaftNode<T> {
                 sent_term,
                 from,
                 last_included_index,
+                sent_offset,
+                sent_len,
+                sent_done,
                 result,
             } => {
                 let reply = match result {
@@ -1506,12 +1711,14 @@ impl<T: Transport + Clone> RaftNode<T> {
                 if sent_term != self.current_term() {
                     return;
                 }
+                let node_id = self.config.id;
                 let last_index = self.storage.last_index();
                 let Role::Leader {
                     next_index,
                     match_index,
                     last_contact,
                     departing,
+                    snapshot_transfers,
                     ..
                 } = &mut self.role
                 else {
@@ -1522,6 +1729,39 @@ impl<T: Transport + Clone> RaftNode<T> {
                 // confirmation stays AppendEntries-seq-tagged only, so a
                 // snapshot-fed peer never confirms a read it didn't ack.
                 last_contact.insert(from, Instant::now());
+                if !sent_done {
+                    // A mid-transfer chunk ack (phase 20c): nothing is
+                    // installed yet, so match/next stay put — just advance
+                    // the transfer and pump the next chunk. The offset
+                    // guard drops stale acks (a duplicated reply, or a
+                    // chunk of a transfer a newer compaction superseded);
+                    // the heartbeat-pace re-send owns those retries.
+                    let advanced = snapshot_transfers.get_mut(&from).is_some_and(|t| {
+                        if t.last_included_index == last_included_index
+                            && t.offset as u64 == sent_offset
+                        {
+                            t.offset += sent_len;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    tracing::debug!(
+                        node = node_id,
+                        term = sent_term,
+                        peer = from,
+                        sent_offset,
+                        sent_len,
+                        advanced,
+                        "snapshot chunk acked"
+                    );
+                    if advanced {
+                        self.send_append(from);
+                    }
+                    return;
+                }
+                // The transfer (if this was chunked) is complete.
+                snapshot_transfers.remove(&from);
                 // The follower now holds everything through the boundary
                 // (including the duplicate case, where it already did).
                 let matched = match_index.entry(from).or_insert(0);
@@ -1566,6 +1806,17 @@ impl<T: Transport + Clone> RaftNode<T> {
                     voted_for: None,
                 })
                 .expect("cannot persist term; fail-stop");
+            // A term change orphans any half-staged snapshot transfer
+            // (phase 20c): its leader is deposed — or must restart from
+            // offset 0 under the new term — so the staging can never
+            // complete under its old key.
+            if self.snapshot_staging.take().is_some() {
+                tracing::info!(
+                    node = self.config.id,
+                    term,
+                    "discarding staged snapshot chunks: term changed"
+                );
+            }
         }
         let was = self.role_kind();
         if let Role::Leader { pending_reads, .. } = &self.role
@@ -1742,6 +1993,7 @@ impl<T: Transport + Clone> RaftNode<T> {
             acked_seq: HashMap::new(),
             last_contact: peers.iter().map(|&p| (p, now)).collect(),
             departing: BTreeMap::new(),
+            snapshot_transfers: HashMap::new(),
             pending_reads: Vec::new(),
         };
         self.leader_id = Some(self.config.id);
@@ -1803,9 +2055,11 @@ impl<T: Transport + Clone> RaftNode<T> {
     }
 
     /// Sends `peer` everything from its next_index (an empty batch doubles
-    /// as the heartbeat). TODO(batching): sends the whole tail in one RPC;
-    /// fine while compaction is out of scope and logs stay small.
-    fn send_append(&self, peer: NodeId) {
+    /// as the heartbeat), truncated at `max_append_bytes` when set (phase
+    /// 20a): the follower acks the prefix, match/next advance, and the
+    /// still-lagging immediate resend below pumps the rest — bounded-size
+    /// steps with no protocol change.
+    fn send_append(&mut self, peer: NodeId) {
         // §4.1: never replicate to a server outside the current config —
         // EXCEPT a departing peer still owed its own removal entry (phase
         // 19b). The gate also stops reply-triggered resends that straggle
@@ -1842,12 +2096,17 @@ impl<T: Transport + Clone> RaftNode<T> {
             .term(prev_log_index)
             .expect("next_index stays within log bounds");
         let term = self.current_term();
+        let suffix = self.storage.entries_from(next);
+        let entries = match self.config.max_append_bytes {
+            None => suffix.to_vec(),
+            Some(budget) => suffix[..batch_len_within(suffix, budget)].to_vec(),
+        };
         let args = AppendEntriesArgs {
             term,
             leader_id: self.config.id,
             prev_log_index,
             prev_log_term,
-            entries: self.storage.entries_from(next).to_vec(),
+            entries,
             leader_commit: self.commit_index,
         };
         let sent_entries = args.entries.len() as u64;
@@ -1867,28 +2126,130 @@ impl<T: Transport + Clone> RaftNode<T> {
     }
 
     /// Ships the current snapshot to a peer whose next_index fell at or
-    /// below the snapshot boundary. The payload is storage's in-memory copy
-    /// (small by scope; replaced — never stale — on each compaction).
-    fn send_install_snapshot(&self, peer: NodeId) {
-        let snapshot = self
-            .storage
-            .snapshot()
-            .expect("a nonzero snapshot boundary implies a snapshot")
-            .clone();
+    /// below the snapshot boundary. Single-shot (`snapshot_chunk_bytes`
+    /// unset, the default): the whole payload — storage's in-memory copy —
+    /// in one RPC, exactly as phase 14 did. Chunked (phase 20c): one
+    /// bounded slice of the serialized state per call, resumed from the
+    /// per-peer transfer offset — the reply pump advances it, and the
+    /// heartbeat-pace re-send retries the current chunk after a lost
+    /// reply (offset-idempotent on the follower).
+    fn send_install_snapshot(&mut self, peer: NodeId) {
         let term = self.current_term();
-        let last_included_index = snapshot.last_included_index;
-        tracing::debug!(
-            node = self.config.id,
-            term,
-            peer,
-            last_included_index,
-            "peer is behind the snapshot boundary; sending InstallSnapshot"
-        );
+        let (last_included_index, last_included_term, membership) = {
+            let snapshot = self
+                .storage
+                .snapshot()
+                .expect("a nonzero snapshot boundary implies a snapshot");
+            (
+                snapshot.last_included_index,
+                snapshot.last_included_term,
+                snapshot.membership.clone(),
+            )
+        };
+        let Some(chunk_bytes) = self.config.snapshot_chunk_bytes else {
+            let snapshot = self
+                .storage
+                .snapshot()
+                .expect("a nonzero snapshot boundary implies a snapshot")
+                .clone();
+            tracing::debug!(
+                node = self.config.id,
+                term,
+                peer,
+                last_included_index,
+                "peer is behind the snapshot boundary; sending InstallSnapshot"
+            );
+            let args = InstallSnapshotArgs {
+                term,
+                leader_id: self.config.id,
+                snapshot,
+                offset: 0,
+                data: None,
+                done: true,
+            };
+            self.spawn_install_snapshot_rpc(peer, args, 0, 0, true);
+            return;
+        };
+        // (Re)build the transfer when the peer has none, or when a newer
+        // compaction moved the boundary out from under the old one — the
+        // follower discards its staging on the key change and the transfer
+        // restarts cleanly at offset 0.
+        let needs_payload = match &self.role {
+            Role::Leader {
+                snapshot_transfers, ..
+            } => snapshot_transfers
+                .get(&peer)
+                .is_none_or(|t| t.last_included_index != last_included_index),
+            _ => return,
+        };
+        let payload = needs_payload.then(|| {
+            let state = &self
+                .storage
+                .snapshot()
+                .expect("a nonzero snapshot boundary implies a snapshot")
+                .state;
+            Arc::new(serde_json::to_string(state).expect("snapshot state serializes"))
+        });
+        let node_id = self.config.id;
+        let Role::Leader {
+            snapshot_transfers, ..
+        } = &mut self.role
+        else {
+            return;
+        };
+        if let Some(payload) = payload {
+            tracing::debug!(
+                node = node_id,
+                term,
+                peer,
+                last_included_index,
+                payload_bytes = payload.len(),
+                chunk_bytes,
+                "peer is behind the snapshot boundary; starting chunked \
+                 InstallSnapshot transfer"
+            );
+            snapshot_transfers.insert(
+                peer,
+                SnapshotTransfer {
+                    last_included_index,
+                    payload,
+                    offset: 0,
+                },
+            );
+        }
+        let transfer = snapshot_transfers
+            .get(&peer)
+            .expect("inserted or validated above");
+        let (data, done) = next_snapshot_chunk(&transfer.payload, transfer.offset, chunk_bytes);
         let args = InstallSnapshotArgs {
             term,
-            leader_id: self.config.id,
-            snapshot,
+            leader_id: node_id,
+            snapshot: Snapshot {
+                last_included_index,
+                last_included_term,
+                membership,
+                state: serde_json::Value::Null,
+            },
+            offset: transfer.offset as u64,
+            data: Some(data.to_string()),
+            done,
         };
+        let (sent_offset, sent_len) = (transfer.offset as u64, data.len());
+        self.spawn_install_snapshot_rpc(peer, args, sent_offset, sent_len, done);
+    }
+
+    /// Fires one InstallSnapshot RPC (single-shot or one chunk) and routes
+    /// its reply back as an [`Event`], tagged with what was sent.
+    fn spawn_install_snapshot_rpc(
+        &self,
+        peer: NodeId,
+        args: InstallSnapshotArgs,
+        sent_offset: u64,
+        sent_len: usize,
+        sent_done: bool,
+    ) {
+        let term = args.term;
+        let last_included_index = args.snapshot.last_included_index;
         let transport = self.transport.clone();
         let events = self.events_tx.clone();
         tokio::spawn(async move {
@@ -1899,6 +2260,9 @@ impl<T: Transport + Clone> RaftNode<T> {
                 sent_term: term,
                 from: peer,
                 last_included_index,
+                sent_offset,
+                sent_len,
+                sent_done,
                 result,
             });
         });
@@ -2195,6 +2559,46 @@ impl<T: Transport + Clone> RaftNode<T> {
     }
 }
 
+/// The next chunk of a serialized snapshot payload (phase 20c): at most
+/// `chunk_bytes` from `offset`, shrunk to the nearest UTF-8 character
+/// boundary so every chunk is valid `String` data — or grown to the NEXT
+/// boundary when a single character exceeds the budget (progress over
+/// exactness, like the batch cap's first-entry rule). Returns the slice
+/// and whether it exhausts the payload; an offset already at the end
+/// yields an empty final chunk (the lost-done-ack retry).
+fn next_snapshot_chunk(payload: &str, offset: usize, chunk_bytes: usize) -> (&str, bool) {
+    let mut end = offset.saturating_add(chunk_bytes.max(1)).min(payload.len());
+    while end > offset && !payload.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == offset && offset < payload.len() {
+        end = (offset + 1..=payload.len())
+            .find(|&i| payload.is_char_boundary(i))
+            .expect("payload.len() is always a char boundary");
+    }
+    (&payload[offset..end], end == payload.len())
+}
+
+/// How many leading entries fit a `max_append_bytes` budget (phase 20a),
+/// estimated by each entry's serialized size — the array framing around
+/// them is not counted (exactness is not required, only boundedness). The
+/// first entry always ships even when it alone exceeds the budget:
+/// replication must make progress on any entry a client got appended.
+fn batch_len_within(entries: &[LogEntry], budget: usize) -> usize {
+    let mut used = 0usize;
+    for (i, entry) in entries.iter().enumerate() {
+        used = used.saturating_add(
+            serde_json::to_vec(entry)
+                .expect("log entries serialize")
+                .len(),
+        );
+        if used > budget {
+            return i.max(1);
+        }
+    }
+    entries.len()
+}
+
 /// The §4.1 membership precedence, evaluated against durable state — used
 /// at boot and re-used by every rescan so the two can never disagree:
 /// latest ConfigChange in the retained log > the snapshot's membership >
@@ -2227,4 +2631,95 @@ fn derive_membership(storage: &Storage, config: &RaftConfig) -> (Membership, Log
         })
         .collect();
     (members, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An entry whose serialized size is exactly measurable by the same
+    /// estimate `batch_len_within` uses.
+    fn sized_entry(index: LogIndex, value_bytes: usize) -> LogEntry {
+        LogEntry {
+            term: 1,
+            index,
+            command: Command::Put {
+                key: format!("k{index}"),
+                value: serde_json::json!("v".repeat(value_bytes)),
+                session: None,
+            },
+        }
+    }
+
+    #[test]
+    fn batch_len_within_stops_at_the_budget_but_always_ships_one() {
+        let entries: Vec<LogEntry> = (1..=4).map(|i| sized_entry(i, 100)).collect();
+        let each = serde_json::to_vec(&entries[0]).unwrap().len();
+
+        assert_eq!(
+            batch_len_within(&entries, usize::MAX),
+            4,
+            "unreachable budget"
+        );
+        assert_eq!(
+            batch_len_within(&entries, 4 * each),
+            4,
+            "exact fit ships all"
+        );
+        assert_eq!(batch_len_within(&entries, 3 * each), 3);
+        assert_eq!(batch_len_within(&entries, each + each / 2), 1);
+        // A budget below even one entry still ships the first: progress
+        // must never stall on an oversized entry.
+        assert_eq!(batch_len_within(&entries, 1), 1);
+        assert_eq!(batch_len_within(&[], 1), 0, "heartbeats stay empty");
+    }
+
+    /// Walks a payload to the end via `next_snapshot_chunk`, asserting
+    /// every chunk respects the budget (module the char-boundary round-up)
+    /// and the concatenation is the original payload.
+    fn walk_chunks(payload: &str, chunk_bytes: usize) -> Vec<String> {
+        let mut chunks = Vec::new();
+        let mut offset = 0;
+        loop {
+            let (chunk, done) = next_snapshot_chunk(payload, offset, chunk_bytes);
+            offset += chunk.len();
+            chunks.push(chunk.to_string());
+            if done {
+                break;
+            }
+            assert!(!chunk.is_empty(), "only the final chunk may be empty");
+        }
+        assert_eq!(chunks.concat(), payload, "chunks must reassemble exactly");
+        chunks
+    }
+
+    #[test]
+    fn next_snapshot_chunk_covers_the_payload_in_bounded_utf8_safe_steps() {
+        let ascii = r#"{"map":{"k":"value"},"sessions":{}}"#;
+        let chunks = walk_chunks(ascii, 8);
+        assert!(chunks.len() > 3, "a small budget must force many chunks");
+        assert!(chunks.iter().all(|c| c.len() <= 8));
+
+        // Multi-byte characters: chunk ends shrink to a char boundary...
+        let multibyte = "aé£€🦀x";
+        for budget in 1..=8 {
+            for chunk in walk_chunks(multibyte, budget) {
+                assert!(
+                    chunk.len() <= budget.max(4),
+                    "budget {budget}: chunk {chunk:?} exceeds even the \
+                     one-character round-up"
+                );
+            }
+        }
+
+        // ...and a budget smaller than the character grows to include it
+        // whole (progress over exactness), rather than looping forever.
+        let (chunk, done) = next_snapshot_chunk("🦀", 0, 1);
+        assert_eq!((chunk, done), ("🦀", true));
+
+        // The lost-done-ack retry: an offset at the end yields an empty
+        // final chunk.
+        assert_eq!(next_snapshot_chunk("ab", 2, 8), ("", true));
+        assert_eq!(next_snapshot_chunk("", 0, 8), ("", true));
+    }
 }

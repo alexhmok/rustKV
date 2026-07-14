@@ -82,26 +82,68 @@ and pinned by `rpcs_larger_than_two_mebibytes_roundtrip`. After the fix the
 same 3.8 MiB scenarios recover in 2-3s, and a 64 MiB snapshot transfers in
 ~5s on loopback at the default timeout.
 
-### Single-shot snapshot / batch vs the RPC timeout — mitigated (knob), fix path named
-InstallSnapshot rides ONE HTTP RPC (no §7 chunking), and AppendEntries has
-no batch-size cap, so a whole catch-up must fit through one RPC within
-`RUSTKV_RPC_TIMEOUT_MS` (default 150). If it can't — slow network or disk,
-huge state — the transfer times out and retries indefinitely: same symptom
-as the fixed bug above, but bandwidth-bound instead of hard-capped.
-Loopback measurements put the default budget at ≥ 64 MiB, so this binds
-only on real networks (e.g. 150ms ≈ 1.8 MiB on a gigabit link). Mitigation:
-raise `RUSTKV_RPC_TIMEOUT_MS` (raising it also delays per-RPC failure
-detection, though election timeouts are independent). The real fix —
-size-aware timeout, then streaming/chunked InstallSnapshot and an AE batch
-cap — is documented in PLAN.md as out of scope. Also note both ends hold
-the payload in memory whole, and the leader's staged trailing-window
-capture holds another full copy.
+### Snapshot / batch size vs the RPC timeout — closed in phase 20 (was: mitigated)
+Historically a whole catch-up had to fit through ONE RPC within
+`RUSTKV_RPC_TIMEOUT_MS` (default 150): InstallSnapshot rode a single HTTP
+RPC (no §7 chunking) and AppendEntries had no batch cap, so a transfer the
+network couldn't move in one budget timed out and retried the identical
+doomed RPC forever — same symptom as the fixed body-cap bug above, but
+bandwidth-bound (150ms ≈ 1.8 MiB on a gigabit link). Closed three ways,
+each independently sufficient in the common cases and all on by default in
+the binary (each opts out with `0`; all three default OFF in `RaftConfig`,
+so seeded sim schedules are untouched):
+- **AE batch cap** (`RUSTKV_MAX_APPEND_BYTES`, default 1 MiB): `send_append`
+  truncates the batch at the budget; the follower acks the prefix and the
+  existing still-lagging resend pumps the rest — catch-up in bounded steps,
+  no wire change.
+- **Size-aware RPC timeout** (`RUSTKV_ASSUMED_BANDWIDTH`, default 8 MiB/s,
+  HTTP transport only): bodies over 64 KiB get `rpc_timeout +
+  body/bandwidth`, so a big transfer earns transfer time while small RPCs
+  keep tight failure detection.
+- **Chunked InstallSnapshot** (`RUSTKV_SNAPSHOT_CHUNK_BYTES`, default
+  4 MiB; §7 offset/data/done): snapshots stream in bounded chunks the
+  follower stages in memory and persists only at `done` (fsync-before-
+  reply and the idempotence guard apply there); chunk retries are
+  offset-idempotent, staging dies on term change or a superseding
+  transfer, and a leader crash mid-transfer just means the successor
+  restarts from offset 0. The old single-shot wire format is pinned
+  verbatim both directions — but old binaries cannot read CHUNKED
+  messages, so set `RUSTKV_SNAPSHOT_CHUNK_BYTES=0` while any pre-phase-20
+  binary is in the cluster.
+Verified end-to-end by the payload experiment on binary defaults
+(loopback, 3 processes): AE backfill (compaction off) converged 64 MiB
+behind in 4s and 256 MiB in 8s; wiped-dir snapshot recovery (threshold 8)
+converged at 64 MiB in 6s and at 256 MiB inside the experiment's 45s
+catch-up window. Residuals, by design: both ends still hold the FULL
+snapshot payload in memory (staging buffer on the follower, serialized
+transfer payload plus the staged trailing-window capture on the leader),
+and one AppendEntries entry larger than the batch cap still ships whole
+(progress beats the budget; the size-aware timeout is what covers it).
+
+### Snapshot capture stalls the event loop — open (found in phase 20's experiment)
+The state-machine capture, serialization, and fsync for compaction run
+INSIDE the node's event loop. With a large state and an aggressive
+threshold this stalls heartbeats past the election timeout and the leader
+gets deposed mid-write-load: at threshold 8 with 1 MiB values, leadership
+began wobbling around an ~80 MiB state (a 307/503 storm for naive
+clients; a leader-aware client retries through it and every write still
+commits — the CP contract holds, this is availability jitter, not a
+safety problem). The same cost hits the chunked-transfer payload
+serialization, once per transfer. Mitigation: size `RUSTKV_SNAPSHOT_
+THRESHOLD` for your value sizes (the stall is per-capture, so a larger
+threshold amortizes it); the real fix (capture/serialize off the event
+loop) is deliberately not built — it would break the run-loop's
+single-owner determinism contract and needs its own design round.
 
 ### Snapshot re-send waste — by design (bandwidth, not correctness)
-A lagging peer is re-sent the full snapshot at heartbeat pace until its
+A lagging peer is re-sent the snapshot at heartbeat pace until its
 first reply folds `next_index` forward; duplicates are follower no-ops
 (idempotence guard). With pooling, a stale-connection retry can transmit
 the payload twice inside one RPC window. Wasteful, never incorrect.
+Chunking (phase 20) shrinks the unit of waste from the whole payload to
+one chunk: the heartbeat re-send retries the CURRENT chunk (the reply
+pump advances the offset), and duplicated chunks are offset-idempotent
+no-ops on the follower.
 
 ### Leader compacts independently of slow peers — mitigated (off by default)
 With `snapshot_trailing` at its default 0, a leader may compact past a

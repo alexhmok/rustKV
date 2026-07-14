@@ -63,10 +63,13 @@ through `/cluster/members` (phase 15).
 Logging uses `tracing`; control verbosity with `RUST_LOG` (default `info`), e.g.
 `RUST_LOG=debug make run`.
 
-Node-to-node RPCs share one budget, `RUSTKV_RPC_TIMEOUT_MS` (default 150). Snapshot
-transfers and catch-up batches ride single RPCs, so on slow networks a large state may
-need a larger budget — see FAILURE_MODES.md ("Single-shot snapshot / batch vs the RPC
-timeout") for the sizing math.
+Node-to-node RPCs share one base budget, `RUSTKV_RPC_TIMEOUT_MS` (default 150). Since
+phase 20, large transfers no longer have to fit it in one piece: catch-up batches are
+capped (`RUSTKV_MAX_APPEND_BYTES`, default 1 MiB), snapshots stream in chunks
+(`RUSTKV_SNAPSHOT_CHUNK_BYTES`, default 4 MiB — set to `0` while any pre-phase-20
+binary is in the cluster), and bodies over 64 KiB earn transfer time on top of the base
+budget (`RUSTKV_ASSUMED_BANDWIDTH`, default 8 MiB/s) — see FAILURE_MODES.md ("Snapshot
+/ batch size vs the RPC timeout") for the details.
 
 Known limitations and operational edges are cataloged in **FAILURE_MODES.md**.
 
