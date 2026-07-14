@@ -28,6 +28,10 @@ pub enum WriteError {
     /// Definitely not applied: a leadership change replaced the entry.
     /// Safe to retry.
     Superseded,
+    /// A configuration change was rejected before being appended (phase 15):
+    /// not a single-server delta, another change in flight, or the leader's
+    /// no-op not yet committed. Definitely did not happen.
+    InvalidConfig { reason: &'static str },
     /// The node has shut down.
     Shutdown,
 }
@@ -43,6 +47,9 @@ impl std::fmt::Display for WriteError {
             }
             WriteError::Timeout => write!(f, "write not confirmed in time; outcome unknown"),
             WriteError::Superseded => write!(f, "write superseded by a leadership change"),
+            WriteError::InvalidConfig { reason } => {
+                write!(f, "invalid configuration change: {reason}")
+            }
             WriteError::Shutdown => write!(f, "node has shut down"),
         }
     }
@@ -113,6 +120,8 @@ impl KvNode {
             Err(ProposeError::NotLeader { leader_hint }) => {
                 return Err(ReadError::NotLeader { leader_hint });
             }
+            // Reads carry no configuration; unreachable, mapped for totality.
+            Err(ProposeError::InvalidConfigChange { .. }) => return Err(ReadError::Retry),
             Err(ProposeError::Shutdown) => return Err(ReadError::Shutdown),
         };
         match tokio::time::timeout(self.write_timeout, ticket.granted).await {
@@ -130,12 +139,20 @@ impl KvNode {
         &self.raft
     }
 
+    /// The in-effect cluster membership (phase 15), for the admin API.
+    pub fn membership(&self) -> crate::raft::types::Membership {
+        self.raft.membership()
+    }
+
     /// Proposes a write and waits for majority commit + local apply.
     pub async fn write(&self, command: Command) -> Result<(), WriteError> {
         let proposal = match self.raft.propose(command).await {
             Ok(proposal) => proposal,
             Err(ProposeError::NotLeader { leader_hint }) => {
                 return Err(WriteError::NotLeader { leader_hint });
+            }
+            Err(ProposeError::InvalidConfigChange { reason }) => {
+                return Err(WriteError::InvalidConfig { reason });
             }
             Err(ProposeError::Shutdown) => return Err(WriteError::Shutdown),
         };

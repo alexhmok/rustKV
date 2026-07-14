@@ -18,7 +18,7 @@
 //! design); only an id missing from the peer map is `Unreachable`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use axum::Router;
@@ -45,8 +45,10 @@ struct Envelope {
 #[derive(Clone)]
 pub struct HttpTransport {
     id: NodeId,
-    /// Peer id → raft address (`host:port`). Fixed cluster membership.
-    peers: Arc<HashMap<NodeId, String>>,
+    /// Peer id → raft address (`host:port`). Bootstrapped from config;
+    /// replaced at runtime when membership changes (phase 15) — main.rs
+    /// follows the Raft core's membership watch and calls [`Self::set_peers`].
+    peers: Arc<RwLock<HashMap<NodeId, String>>>,
     rpc_timeout: Duration,
 }
 
@@ -64,18 +66,34 @@ impl HttpTransport {
             .with_state(inbound_tx);
         let transport = Self {
             id,
-            peers: Arc::new(peers),
+            peers: Arc::new(RwLock::new(peers)),
             rpc_timeout,
         };
         (transport, router, inbound_rx)
+    }
+
+    /// Replaces the peer address book (phase 15: membership changed). All
+    /// clones share it — in-flight RPCs already resolved their address and
+    /// finish against the old one, exactly like a real network change.
+    pub fn set_peers(&self, peers: HashMap<NodeId, String>) {
+        tracing::info!(node = self.id, peers = ?peers, "raft peer addresses updated");
+        *self.peers.write().expect("peer map lock poisoned") = peers;
     }
 }
 
 impl Transport for HttpTransport {
     async fn send(&self, to: NodeId, req: RpcRequest) -> Result<RpcResponse, TransportError> {
-        let Some(addr) = self.peers.get(&to) else {
+        // Resolve the address up front; the lock is never held across await.
+        let addr = self
+            .peers
+            .read()
+            .expect("peer map lock poisoned")
+            .get(&to)
+            .cloned();
+        let Some(addr) = addr else {
             return Err(TransportError::Unreachable(to));
         };
+        let addr = addr.as_str();
         let body = serde_json::to_vec(&Envelope {
             from: self.id,
             request: req,

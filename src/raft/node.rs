@@ -75,8 +75,30 @@
 //! suppressed (a leader deaf to all acks used to stall the cluster forever:
 //! followers kept hearing heartbeats, so nobody ever campaigned).
 //! Deliberately basic Raft still: no batching cap on AppendEntries payloads.
+//!
+//! Phase 15: dynamic membership, single-server changes (thesis §4.1–4.2).
+//! Membership is log-derived: a [`Command::ConfigChange`] carries the
+//! COMPLETE new configuration and takes effect the moment it is APPENDED —
+//! never waiting for commit — with precedence latest-ConfigChange-in-log >
+//! snapshot's membership > bootstrap from [`RaftConfig`]. Truncating the
+//! in-effect entry forces a rescan from the snapshot base (forgetting that
+//! would leave a phantom member in quorum math). One `majority()` over the
+//! current members drives vote counting, commit advancement, ReadIndex
+//! confirmation and CheckQuorum alike; every peer fan-out iterates
+//! members − self, and the leader counts itself only while it IS a member —
+//! so a self-removing leader (§4.2.2) stops counting itself on append,
+//! keeps replicating, and steps down once the entry commits. Two safety
+//! rules close the known single-server-change bug: at most one uncommitted
+//! ConfigChange in flight, and none at all until this term's no-op has
+//! committed. A joining node starts with EMPTY membership (`join: true`)
+//! and the campaign gate "self ∈ members" keeps it silent until a
+//! configuration that includes it arrives; its catch-up rides
+//! InstallSnapshot (or plain AppendEntries backfill when nothing was
+//! compacted). Membership (with addresses) is published on its own `watch`
+//! channel so the transport/API layers can follow along without the core
+//! ever touching the network.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot, watch};
@@ -89,13 +111,16 @@ use super::rpc::{
 };
 use super::storage::Storage;
 use super::transport::{Inbound, Transport, TransportError};
-use super::types::{Command, HardState, LogEntry, LogIndex, NodeId, Term};
+use super::types::{Command, HardState, LogEntry, LogIndex, MemberAddr, Membership, NodeId, Term};
 use crate::rng::SplitMix64;
 
 #[derive(Debug, Clone)]
 pub struct RaftConfig {
     pub id: NodeId,
-    /// The other cluster members. Fixed membership, from config (phase 7).
+    /// The other cluster members at bootstrap. Only consulted (together with
+    /// `bootstrap_addrs` and `join`) when neither the log nor a snapshot
+    /// carries a configuration — from the first committed ConfigChange on,
+    /// membership is log-derived (phase 15).
     pub peers: Vec<NodeId>,
     pub election_timeout_min: Duration,
     pub election_timeout_max: Duration,
@@ -115,6 +140,16 @@ pub struct RaftConfig {
     /// at `last_applied` immediately — the original phase-14 behavior,
     /// bit-for-bit. Only meaningful with `snapshot_threshold` set.
     pub snapshot_trailing: u64,
+    /// Addresses for the bootstrap membership (phase 15): raft + client
+    /// endpoints for `peers` and self. Ids missing from it bootstrap with
+    /// empty addresses (fine for the sim transport, which routes by id).
+    /// Ignored once membership is log-derived.
+    pub bootstrap_addrs: Membership,
+    /// Join mode (phase 15): start with EMPTY membership instead of
+    /// bootstrapping from `peers`. The node stays silent — no campaigns, no
+    /// term movement — until a ConfigChange that includes it arrives from
+    /// the leader; catch-up rides InstallSnapshot/AppendEntries as usual.
+    pub join: bool,
 }
 
 impl RaftConfig {
@@ -128,6 +163,8 @@ impl RaftConfig {
             timeout_seed: id,
             snapshot_threshold: None,
             snapshot_trailing: 0,
+            bootstrap_addrs: BTreeMap::new(),
+            join: false,
         }
     }
 }
@@ -159,6 +196,10 @@ pub struct Status {
 pub enum ProposeError {
     /// This node is not the leader; retry against `leader_hint` if present.
     NotLeader { leader_hint: Option<NodeId> },
+    /// A ConfigChange proposal failed validation (phase 15): not a
+    /// single-server delta, another change still in flight, or this term's
+    /// no-op not yet committed. Nothing was appended.
+    InvalidConfigChange { reason: &'static str },
     /// The node has shut down.
     Shutdown,
 }
@@ -173,6 +214,9 @@ impl std::fmt::Display for ProposeError {
             }
             ProposeError::NotLeader { leader_hint: None } => {
                 write!(f, "not the leader, and no leader is known")
+            }
+            ProposeError::InvalidConfigChange { reason } => {
+                write!(f, "invalid configuration change: {reason}")
             }
             ProposeError::Shutdown => write!(f, "raft node has shut down"),
         }
@@ -230,6 +274,7 @@ pub struct ReadTicket {
 /// Handle to a running node.
 pub struct RaftHandle {
     status: watch::Receiver<Status>,
+    membership: watch::Receiver<Membership>,
     control: mpsc::UnboundedSender<Control>,
     task: JoinHandle<()>,
 }
@@ -241,6 +286,18 @@ impl RaftHandle {
 
     pub fn watch(&self) -> watch::Receiver<Status> {
         self.status.clone()
+    }
+
+    /// The in-effect cluster membership (phase 15) as this node knows it.
+    pub fn membership(&self) -> Membership {
+        self.membership.borrow().clone()
+    }
+
+    /// Watch channel of membership changes — how the transport and API
+    /// layers learn about added/removed peers and their addresses without
+    /// the Raft core ever touching the network.
+    pub fn membership_watch(&self) -> watch::Receiver<Membership> {
+        self.membership.clone()
     }
 
     /// Submits a command to the replicated log. On success the entry is
@@ -405,9 +462,22 @@ pub struct RaftNode<T: Transport + Clone> {
     /// trailing window): the snapshot boundary must carry the state at
     /// EXACTLY that index, so with `snapshot_trailing > 0` the state is
     /// captured when the trigger fires and compacted to only once it is
-    /// `trailing` applies old. Volatile — losing it to a crash just means
-    /// the next trigger re-stages (the boundary lags a little longer).
-    staged_snapshot: Option<(LogIndex, serde_json::Value)>,
+    /// `trailing` applies old. The membership as of the staged index rides
+    /// along (phase 15): a ConfigChange appended between stage and compact
+    /// must not leak into an older boundary. Volatile — losing it to a
+    /// crash just means the next trigger re-stages (the boundary lags a
+    /// little longer).
+    staged_snapshot: Option<(LogIndex, serde_json::Value, Option<Membership>)>,
+    /// The in-effect cluster configuration (phase 15): latest ConfigChange
+    /// in the log (effective on APPEND, §4.1), else the snapshot's, else
+    /// bootstrap from `config` (empty in join mode).
+    members: Membership,
+    /// Log index of the entry that put `members` in effect (the snapshot
+    /// boundary if it came from a snapshot, 0 if bootstrap-derived).
+    /// Truncation at or below it forces a rescan; a ConfigChange is "in
+    /// flight" while this exceeds `commit_index`.
+    members_index: LogIndex,
+    membership_tx: watch::Sender<Membership>,
     /// When the last valid AppendEntries (current-or-higher term) arrived.
     /// Leader stickiness: pre-votes are denied while this is fresher than
     /// `election_timeout_min`. Volatile — a restarted node grants again.
@@ -458,11 +528,18 @@ impl<T: Transport + Clone> RaftNode<T> {
             commit_index: snapshot_index,
             last_log_index: storage.last_index(),
         });
+        // Membership boots by the same §4.1 precedence the running node
+        // maintains, so a restart re-derives exactly what it knew: latest
+        // ConfigChange in the retained log > snapshot > bootstrap config.
+        let (members, members_index) = derive_membership(&storage, &config);
+        let (membership_tx, membership_rx) = watch::channel(members.clone());
         tracing::info!(
             node = config.id,
             term = hard_state.current_term,
             voted_for = ?hard_state.voted_for,
             last_log_index = storage.last_index(),
+            members = ?members.keys().collect::<Vec<_>>(),
+            members_index,
             "raft node starting"
         );
         let rng = SplitMix64::new(config.timeout_seed);
@@ -478,6 +555,9 @@ impl<T: Transport + Clone> RaftNode<T> {
             last_applied: snapshot_index,
             pending: Vec::new(),
             staged_snapshot: None,
+            members,
+            members_index,
+            membership_tx,
             last_leader_contact: None,
             election_deadline: Instant::now(),
             next_heartbeat: Instant::now(),
@@ -490,6 +570,7 @@ impl<T: Transport + Clone> RaftNode<T> {
         let task = tokio::spawn(node.run());
         RaftHandle {
             status: status_rx,
+            membership: membership_rx,
             control: control_tx,
             task,
         }
@@ -552,6 +633,24 @@ impl<T: Transport + Clone> RaftNode<T> {
             }));
             return;
         }
+        // ConfigChange proposals are validated (phase 15) and take effect the
+        // moment they are appended (§4.1) — the fan-out below already runs
+        // under the new configuration.
+        let new_membership = if let Command::ConfigChange { members } = &command {
+            if let Err(reason) = self.validate_config_change(members) {
+                tracing::warn!(
+                    node = self.config.id,
+                    term = self.current_term(),
+                    reason,
+                    "configuration change rejected"
+                );
+                let _ = reply.send(Err(ProposeError::InvalidConfigChange { reason }));
+                return;
+            }
+            Some(members.clone())
+        } else {
+            None
+        };
         let term = self.current_term();
         let index = self.storage.last_index() + 1;
         self.storage
@@ -562,6 +661,9 @@ impl<T: Transport + Clone> RaftNode<T> {
             }])
             .expect("cannot persist proposal; fail-stop");
         tracing::info!(node = self.config.id, term, index, "proposal appended");
+        if let Some(members) = new_membership {
+            self.adopt_membership(members, index);
+        }
         let (committed_tx, committed_rx) = oneshot::channel();
         self.pending.push(PendingProposal {
             term,
@@ -575,9 +677,48 @@ impl<T: Transport + Clone> RaftNode<T> {
         }));
         // A single-node cluster commits immediately; otherwise replicate now.
         self.maybe_advance_commit();
-        for &peer in &self.config.peers {
+        for peer in self.peer_ids() {
             self.send_append(peer);
         }
+    }
+
+    /// The phase-15 admission rules for a ConfigChange (thesis §4.1/§4.2):
+    /// leader-only (checked by the caller), no change until this term's
+    /// no-op committed (a leader that doesn't know the committed prefix
+    /// could otherwise stack a second change on an invisible first — the
+    /// known single-server-change bug), at most one change in flight, and
+    /// the new configuration must differ from the active one by EXACTLY one
+    /// added or removed member (the single-server overlap argument is what
+    /// makes joint consensus unnecessary).
+    fn validate_config_change(&self, new: &Membership) -> Result<(), &'static str> {
+        let Role::Leader {
+            term_start_index, ..
+        } = &self.role
+        else {
+            unreachable!("validated only on the leader");
+        };
+        if self.commit_index < *term_start_index {
+            return Err("this term's no-op is not yet committed; retry shortly");
+        }
+        if self.members_index > self.commit_index {
+            return Err("a configuration change is already in flight");
+        }
+        if new.is_empty() {
+            return Err("the new configuration must keep at least one member");
+        }
+        let added = new
+            .keys()
+            .filter(|id| !self.members.contains_key(id))
+            .count();
+        let removed = self
+            .members
+            .keys()
+            .filter(|id| !new.contains_key(id))
+            .count();
+        if added + removed != 1 {
+            return Err("exactly one member must be added or removed");
+        }
+        Ok(())
     }
 
     /// Registers a linearizable read (§6.4 ReadIndex).
@@ -617,7 +758,7 @@ impl<T: Transport + Clone> RaftNode<T> {
             needed_seq,
             "linearizable read registered"
         );
-        for &peer in &self.config.peers {
+        for peer in self.peer_ids() {
             self.send_append(peer);
         }
         // A single-node cluster is its own majority; grant immediately.
@@ -783,6 +924,13 @@ impl<T: Transport + Clone> RaftNode<T> {
         self.state_machine.restore(&args.snapshot.state);
         self.commit_index = boundary;
         self.last_applied = boundary;
+        // Adopt the snapshot's membership under the §4.1 precedence: a
+        // later ConfigChange in the retained suffix still wins; with the
+        // log cleared (or membership-free below the boundary) the
+        // snapshot's own field — populated for exactly this moment since
+        // phase 14 reserved it — takes over. This is how a joiner first
+        // learns the configuration that includes it.
+        self.rescan_membership();
         // Local proposals at or below the boundary are now unverifiable: the
         // compacted history may or may not hold them (their terms are gone).
         // Drop their senders — waiters get the retryable "unknown" error,
@@ -860,6 +1008,7 @@ impl<T: Transport + Clone> RaftNode<T> {
         // the rest. Committed entries can never conflict (§5.3 + §5.4) —
         // enforced fail-stop below.
         let mut append_from = None;
+        let mut truncated_in_effect_config = false;
         for entry in &args.entries {
             if entry.index <= self.storage.snapshot_index() {
                 // Compacted ⇒ committed ⇒ identical to what we applied; the
@@ -874,6 +1023,10 @@ impl<T: Transport + Clone> RaftNode<T> {
                         "SAFETY VIOLATION: asked to truncate committed entry {}",
                         entry.index
                     );
+                    // Truncating the entry that put the current config in
+                    // effect (or anything below it) invalidates `members` —
+                    // rescan after the walk (phase 15's phantom-member trap).
+                    truncated_in_effect_config = entry.index <= self.members_index;
                     self.storage
                         .truncate_from(entry.index)
                         .expect("cannot truncate conflicting entries; fail-stop");
@@ -895,6 +1048,9 @@ impl<T: Transport + Clone> RaftNode<T> {
                 }
             }
         }
+        if truncated_in_effect_config {
+            self.rescan_membership();
+        }
         if let Some(first) = append_from {
             let offset = usize::try_from(first - args.prev_log_index - 1)
                 .expect("entry offset fits in usize");
@@ -908,6 +1064,19 @@ impl<T: Transport + Clone> RaftNode<T> {
                 count = args.entries.len() - offset,
                 "appended entries from leader"
             );
+            // Config takes effect on APPEND (§4.1): adopt the newest
+            // ConfigChange the batch carried, after any rescan above so the
+            // higher index wins.
+            let adopted = args.entries[offset..].iter().rev().find_map(|e| {
+                if let Command::ConfigChange { members } = &e.command {
+                    Some((members.clone(), e.index))
+                } else {
+                    None
+                }
+            });
+            if let Some((members, index)) = adopted {
+                self.adopt_membership(members, index);
+            }
         }
 
         // Commit only up to what this RPC verified matches the leader.
@@ -984,6 +1153,11 @@ impl<T: Transport + Clone> RaftNode<T> {
     fn resolve_reads(&mut self) {
         let majority = self.majority();
         let last_applied = self.last_applied;
+        // Quorum over the CURRENT members only (phase 15): acks from removed
+        // peers no longer confirm anything, and a self-removing leader stops
+        // counting itself — the same counting rule as commit advancement.
+        let self_is_member = self.members.contains_key(&self.config.id);
+        let member_peers = self.peer_ids();
         let Role::Leader {
             acked_seq,
             pending_reads,
@@ -997,11 +1171,11 @@ impl<T: Transport + Clone> RaftNode<T> {
         }
         let reads = std::mem::take(pending_reads);
         for read in reads {
-            // Count ourselves: the leader trivially acknowledges itself.
-            let acks = 1 + acked_seq
-                .values()
-                .filter(|&&seq| seq >= read.needed_seq)
-                .count();
+            let acks = usize::from(self_is_member)
+                + member_peers
+                    .iter()
+                    .filter(|id| acked_seq.get(id).is_some_and(|&seq| seq >= read.needed_seq))
+                    .count();
             if acks >= majority && last_applied >= read.read_index {
                 let _ = read.granted.send(());
             } else {
@@ -1293,6 +1467,19 @@ impl<T: Transport + Clone> RaftNode<T> {
     /// persisted and our own term does not move; only a majority of grants
     /// starts the real election.
     fn on_election_timeout(&mut self) {
+        // Campaign gate (phase 15): a node outside the current configuration
+        // — a joiner whose ConfigChange hasn't arrived, or a removed server —
+        // stays silent. No pre-campaign, no role change, no term movement;
+        // just re-arm and keep listening (the leader will catch a joiner up).
+        if !self.members.contains_key(&self.config.id) {
+            self.reset_election_timer();
+            tracing::debug!(
+                node = self.config.id,
+                term = self.current_term(),
+                "election timeout ignored: not in the current membership"
+            );
+            return;
+        }
         let prospective = self.current_term() + 1;
         self.role = Role::PreCandidate {
             votes: HashSet::from([self.config.id]),
@@ -1313,7 +1500,7 @@ impl<T: Transport + Clone> RaftNode<T> {
             last_log_index: self.storage.last_index(),
             last_log_term: self.storage.last_term(),
         };
-        for &peer in &self.config.peers {
+        for peer in self.peer_ids() {
             let transport = self.transport.clone();
             let events = self.events_tx.clone();
             let args = args.clone();
@@ -1334,12 +1521,22 @@ impl<T: Transport + Clone> RaftNode<T> {
     /// candidacy. No-op otherwise.
     fn maybe_start_election(&mut self) {
         let votes = match &self.role {
-            Role::PreCandidate { votes } => votes.len(),
+            Role::PreCandidate { votes } => self.count_member_votes(votes),
             _ => return,
         };
         if votes >= self.majority() {
             self.start_election();
         }
+    }
+
+    /// Votes counted toward a majority (phase 15): only current members'
+    /// grants matter — we only solicit members, but membership may have
+    /// moved between solicitation and reply.
+    fn count_member_votes(&self, votes: &HashSet<NodeId>) -> usize {
+        votes
+            .iter()
+            .filter(|id| self.members.contains_key(id))
+            .count()
     }
 
     /// The real election (§5.2): durably bump the term with a self-vote and
@@ -1369,7 +1566,7 @@ impl<T: Transport + Clone> RaftNode<T> {
             last_log_index: self.storage.last_index(),
             last_log_term: self.storage.last_term(),
         };
-        for &peer in &self.config.peers {
+        for peer in self.peer_ids() {
             let transport = self.transport.clone();
             let events = self.events_tx.clone();
             let args = args.clone();
@@ -1388,7 +1585,7 @@ impl<T: Transport + Clone> RaftNode<T> {
 
     fn maybe_become_leader(&mut self) {
         let votes = match &self.role {
-            Role::Candidate { votes } => votes.len(),
+            Role::Candidate { votes } => self.count_member_votes(votes),
             _ => return,
         };
         if votes < self.majority() {
@@ -1400,13 +1597,14 @@ impl<T: Transport + Clone> RaftNode<T> {
         // very first heartbeat without a backtracking round-trip.
         let next = self.storage.last_index() + 1;
         let now = Instant::now();
+        let peers = self.peer_ids();
         self.role = Role::Leader {
-            next_index: self.config.peers.iter().map(|&p| (p, next)).collect(),
-            match_index: self.config.peers.iter().map(|&p| (p, 0)).collect(),
+            next_index: peers.iter().map(|&p| (p, next)).collect(),
+            match_index: peers.iter().map(|&p| (p, 0)).collect(),
             term_start_index: next,
             heartbeat_seq: 0,
             acked_seq: HashMap::new(),
-            last_contact: self.config.peers.iter().map(|&p| (p, now)).collect(),
+            last_contact: peers.iter().map(|&p| (p, now)).collect(),
             pending_reads: Vec::new(),
         };
         self.leader_id = Some(self.config.id);
@@ -1435,12 +1633,18 @@ impl<T: Transport + Clone> RaftNode<T> {
         // (a bump would just re-elect us into the same silence) and goes
         // quiet, letting the reachable side's stickiness expire and elect.
         // Piggybacked on the heartbeat tick: no new timer, no RNG draws.
+        // The count runs over the CURRENT members (phase 15) — the same
+        // quorum rule as votes/commit/reads, so a self-removing leader
+        // stops counting itself here too, with no special case.
         if let Role::Leader { last_contact, .. } = &self.role {
             let window = self.config.election_timeout_max;
-            let heard = 1 + last_contact
-                .values()
-                .filter(|at| at.elapsed() < window)
-                .count();
+            let heard = usize::from(self.members.contains_key(&self.config.id))
+                + self
+                    .members
+                    .keys()
+                    .filter(|&&id| id != self.config.id)
+                    .filter(|id| last_contact.get(id).is_some_and(|at| at.elapsed() < window))
+                    .count();
             if heard < self.majority() {
                 let term = self.current_term();
                 tracing::info!(
@@ -1455,7 +1659,7 @@ impl<T: Transport + Clone> RaftNode<T> {
                 return;
             }
         }
-        for &peer in &self.config.peers {
+        for peer in self.peer_ids() {
             self.send_append(peer);
         }
         self.next_heartbeat = Instant::now() + self.config.heartbeat_interval;
@@ -1465,6 +1669,12 @@ impl<T: Transport + Clone> RaftNode<T> {
     /// as the heartbeat). TODO(batching): sends the whole tail in one RPC;
     /// fine while compaction is out of scope and logs stay small.
     fn send_append(&self, peer: NodeId) {
+        // §4.1: never replicate to a server outside the current config —
+        // the fan-outs already iterate members, but a reply-triggered
+        // resend can straggle in after a removal; this gate stops it.
+        if !self.members.contains_key(&peer) {
+            return;
+        }
         let Role::Leader {
             next_index,
             heartbeat_seq,
@@ -1574,7 +1784,7 @@ impl<T: Transport + Clone> RaftNode<T> {
         };
         // An installed snapshot may have overtaken a staged capture
         // (boundary moved past it); the capture is then stale — discard.
-        if let Some((staged_index, _)) = &self.staged_snapshot
+        if let Some((staged_index, ..)) = &self.staged_snapshot
             && *staged_index <= self.storage.snapshot_index()
         {
             self.staged_snapshot = None;
@@ -1582,22 +1792,30 @@ impl<T: Transport + Clone> RaftNode<T> {
         if self.staged_snapshot.is_none()
             && self.last_applied - self.storage.snapshot_index() >= threshold.max(1)
         {
-            self.staged_snapshot = Some((self.last_applied, self.state_machine.snapshot()));
+            // Capture the membership AS OF the staged index alongside the
+            // state (phase 15): a ConfigChange appended between stage and
+            // compact belongs to the log tail, not to this boundary.
+            self.staged_snapshot = Some((
+                self.last_applied,
+                self.state_machine.snapshot(),
+                self.membership_at(self.last_applied),
+            ));
             tracing::debug!(
                 node = self.config.id,
                 staged_index = self.last_applied,
                 "state captured for compaction"
             );
         }
-        if let Some((staged_index, _)) = &self.staged_snapshot
+        if let Some((staged_index, ..)) = &self.staged_snapshot
             && self.last_applied - *staged_index >= self.config.snapshot_trailing
         {
-            let (staged_index, state) = self.staged_snapshot.take().expect("just matched Some");
+            let (staged_index, state, membership) =
+                self.staged_snapshot.take().expect("just matched Some");
             // The staged entry is still in the log (the boundary never
             // passed it — see the guard above), so compact_to can capture
             // its term as usual.
             self.storage
-                .compact_to(staged_index, state)
+                .compact_to(staged_index, state, membership)
                 .expect("cannot write snapshot; fail-stop");
             tracing::info!(
                 node = self.config.id,
@@ -1609,23 +1827,32 @@ impl<T: Transport + Clone> RaftNode<T> {
         }
     }
 
-    /// Advances commit_index to the highest index replicated on a majority,
-    /// but only for entries of the current term (§5.4.2) — prior-term
-    /// entries commit transitively.
+    /// Advances commit_index to the highest index replicated on a majority
+    /// of the CURRENT members, but only for entries of the current term
+    /// (§5.4.2) — prior-term entries commit transitively.
     fn maybe_advance_commit(&mut self) {
         let Role::Leader { match_index, .. } = &self.role else {
             return;
         };
         let mut replicated: Vec<LogIndex> = self
-            .config
-            .peers
-            .iter()
-            .map(|p| match_index.get(p).copied().unwrap_or(0))
+            .members
+            .keys()
+            .filter(|&&id| id != self.config.id)
+            .map(|id| match_index.get(id).copied().unwrap_or(0))
             .collect();
-        // The leader trivially holds its own whole log.
-        replicated.push(self.storage.last_index());
+        // The leader trivially holds its own whole log — but it counts
+        // toward the quorum only while it IS a member (§4.2.2, the subtlest
+        // edit of phase 15): a self-removing leader keeps replicating but
+        // commits by the new configuration's majority alone.
+        if self.members.contains_key(&self.config.id) {
+            replicated.push(self.storage.last_index());
+        }
         replicated.sort_unstable();
-        let candidate = replicated[replicated.len() - self.majority()];
+        let majority = self.majority();
+        if replicated.len() < majority {
+            return;
+        }
+        let candidate = replicated[replicated.len() - majority];
 
         if candidate > self.commit_index
             && self.storage.term(candidate) == Some(self.current_term())
@@ -1638,6 +1865,21 @@ impl<T: Transport + Clone> RaftNode<T> {
                 "commit advanced"
             );
             self.apply_committed();
+        }
+        // §4.2.2, second half: a leader that removed itself steps down once
+        // the removal commits — it served exactly long enough to make the
+        // change durable, and its silence lets the remaining members elect.
+        if self.is_leader()
+            && !self.members.contains_key(&self.config.id)
+            && self.commit_index >= self.members_index
+        {
+            let term = self.current_term();
+            tracing::info!(
+                node = self.config.id,
+                term,
+                "removed from the cluster by a committed configuration change; stepping down"
+            );
+            self.become_follower(term, None);
         }
     }
 
@@ -1660,10 +1902,84 @@ impl<T: Transport + Clone> RaftNode<T> {
         }
     }
 
-    /// Votes needed to win: strict majority of the full cluster.
+    /// Quorum size: strict majority of the CURRENT membership (phase 15 —
+    /// log-derived, not config-derived). The one function behind vote
+    /// counting, commit advancement, ReadIndex confirmation and CheckQuorum;
+    /// making it membership-aware made all four follow.
     fn majority(&self) -> usize {
-        let cluster_size = self.config.peers.len() + 1;
-        cluster_size / 2 + 1
+        self.members.len() / 2 + 1
+    }
+
+    /// Every current member except this node — the peer set for all
+    /// fan-outs (heartbeats, elections, replication bookkeeping). Owned so
+    /// callers can hold it across mutable borrows of the role.
+    fn peer_ids(&self) -> Vec<NodeId> {
+        self.members
+            .keys()
+            .copied()
+            .filter(|&id| id != self.config.id)
+            .collect()
+    }
+
+    /// Puts a configuration in effect (phase 15, §4.1: on append). On a
+    /// leader, newly added peers start with fresh CheckQuorum contact —
+    /// the same grace a fresh leader gives everyone — so a joiner has a
+    /// full window to answer before it can count against the quorum.
+    fn adopt_membership(&mut self, members: Membership, index: LogIndex) {
+        if let Role::Leader { last_contact, .. } = &mut self.role {
+            let now = Instant::now();
+            for &id in members.keys().filter(|&&id| id != self.config.id) {
+                last_contact.entry(id).or_insert(now);
+            }
+        }
+        self.members = members;
+        self.members_index = index;
+        tracing::info!(
+            node = self.config.id,
+            term = self.current_term(),
+            members_index = index,
+            members = ?self.members.keys().collect::<Vec<_>>(),
+            "membership adopted"
+        );
+        self.publish_membership();
+    }
+
+    /// Re-derives the in-effect configuration from what the log and
+    /// snapshot NOW say — the recovery path after truncating the entry
+    /// that carried it (the phantom-member trap) and after installing a
+    /// snapshot.
+    fn rescan_membership(&mut self) {
+        let (members, index) = derive_membership(&self.storage, &self.config);
+        self.adopt_membership(members, index);
+    }
+
+    /// The configuration in effect AT `index`, for snapshot boundaries: the
+    /// latest ConfigChange at or below it in the retained log, else
+    /// whatever the current snapshot carries. `None` = bootstrap-derived —
+    /// deliberately NOT embedded, so a static cluster's snapshots stay
+    /// byte-identical to phase 14 and a restored node falls back to its own
+    /// config.
+    fn membership_at(&self, index: LogIndex) -> Option<Membership> {
+        for entry in self.storage.entries().iter().rev() {
+            if entry.index > index {
+                continue;
+            }
+            if let Command::ConfigChange { members } = &entry.command {
+                return Some(members.clone());
+            }
+        }
+        self.storage.snapshot().and_then(|s| s.membership.clone())
+    }
+
+    fn publish_membership(&self) {
+        self.membership_tx.send_if_modified(|current| {
+            if *current == self.members {
+                false
+            } else {
+                *current = self.members.clone();
+                true
+            }
+        });
     }
 
     fn reset_election_timer(&mut self) {
@@ -1694,4 +2010,38 @@ impl<T: Transport + Clone> RaftNode<T> {
             }
         });
     }
+}
+
+/// The §4.1 membership precedence, evaluated against durable state — used
+/// at boot and re-used by every rescan so the two can never disagree:
+/// latest ConfigChange in the retained log > the snapshot's membership >
+/// bootstrap from the node's own config (empty in join mode).
+fn derive_membership(storage: &Storage, config: &RaftConfig) -> (Membership, LogIndex) {
+    for entry in storage.entries().iter().rev() {
+        if let Command::ConfigChange { members } = &entry.command {
+            return (members.clone(), entry.index);
+        }
+    }
+    if let Some(members) = storage.snapshot().and_then(|s| s.membership.as_ref()) {
+        return (members.clone(), storage.snapshot_index());
+    }
+    if config.join {
+        return (Membership::new(), 0);
+    }
+    let members = config
+        .peers
+        .iter()
+        .chain(std::iter::once(&config.id))
+        .map(|&id| {
+            (
+                id,
+                config
+                    .bootstrap_addrs
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(MemberAddr::default),
+            )
+        })
+        .collect();
+    (members, 0)
 }

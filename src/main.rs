@@ -3,10 +3,18 @@
 //!
 //! Runs one cluster member. With no RUSTKV_PEERS it is a single-node
 //! cluster; with peers configured it forms a real multi-node cluster over
-//! the HTTP transport. See src/config.rs for all variables, and
-//! scripts/run-cluster.sh for a ready-made local 3-node setup.
+//! the HTTP transport; with RUSTKV_JOIN=1 it starts as a joiner waiting to
+//! be added via the admin API (phase 15). See src/config.rs for all
+//! variables, and scripts/run-cluster.sh for a ready-made local 3-node
+//! setup.
+//!
+//! Dynamic membership wiring (phase 15): the Raft core publishes the
+//! in-effect membership (with addresses) on a watch channel; a task here
+//! folds every change into the HTTP transport's peer address book and the
+//! API layer's redirect URLs. The core itself never touches the network.
 
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use rustkv::api::{self, ApiContext};
@@ -15,6 +23,7 @@ use rustkv::kv::KvNode;
 use rustkv::raft::node::{RaftConfig, RaftNode, StateMachine};
 use rustkv::raft::storage::Storage;
 use rustkv::raft::transport::http::HttpTransport;
+use rustkv::raft::types::{MemberAddr, NodeId};
 use rustkv::store::KvStore;
 use tracing_subscriber::EnvFilter;
 
@@ -42,17 +51,73 @@ async fn main() {
     let mut raft_config = RaftConfig::new(config.id, peer_ids);
     raft_config.snapshot_threshold = config.snapshot_threshold;
     raft_config.snapshot_trailing = config.snapshot_trailing;
+    raft_config.join = config.join;
+    // Address book for the bootstrap membership. Self advertises its
+    // listen addresses as-is — fine for host-per-node/local setups; a
+    // separate advertise address is a known gap (PLAN.md).
+    let mut bootstrap_addrs: BTreeMap<NodeId, MemberAddr> = config
+        .peers
+        .iter()
+        .map(|(&id, raft_addr)| {
+            (
+                id,
+                MemberAddr {
+                    raft: raft_addr.clone(),
+                    client: config
+                        .peer_client_urls
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_default(),
+                },
+            )
+        })
+        .collect();
+    bootstrap_addrs.insert(
+        config.id,
+        MemberAddr {
+            raft: config.raft_listen.clone(),
+            client: format!("http://{}", config.listen),
+        },
+    );
+    raft_config.bootstrap_addrs = bootstrap_addrs;
     let raft = RaftNode::spawn(
         raft_config,
         storage,
-        transport,
+        transport.clone(),
         inbound,
         store.clone() as Arc<dyn StateMachine>,
     );
+    let mut membership_rx = raft.membership_watch();
     let kv = KvNode::new(store, raft, WRITE_TIMEOUT);
+    let peer_urls = Arc::new(RwLock::new(config.peer_client_urls.clone()));
     let ctx = Arc::new(ApiContext {
         kv,
-        peer_urls: config.peer_client_urls.clone(),
+        peer_urls: peer_urls.clone(),
+    });
+
+    // Fold membership changes into the transport's address book and the
+    // API's redirect map (phase 15). Runs once immediately (idempotent for
+    // the bootstrap config), then on every change.
+    let self_id = config.id;
+    tokio::spawn(async move {
+        loop {
+            let members = membership_rx.borrow_and_update().clone();
+            let raft_addrs: HashMap<NodeId, String> = members
+                .iter()
+                .filter(|(id, addr)| **id != self_id && !addr.raft.is_empty())
+                .map(|(id, addr)| (*id, addr.raft.clone()))
+                .collect();
+            transport.set_peers(raft_addrs);
+            let client_urls: HashMap<NodeId, String> = members
+                .iter()
+                .filter(|(id, addr)| **id != self_id && !addr.client.is_empty())
+                .map(|(id, addr)| (*id, addr.client.clone()))
+                .collect();
+            *peer_urls.write().expect("peer_urls lock poisoned") = client_urls;
+            if membership_rx.changed().await.is_err() {
+                break; // raft node stopped
+            }
+        }
     });
 
     let raft_listener = tokio::net::TcpListener::bind(&config.raft_listen)

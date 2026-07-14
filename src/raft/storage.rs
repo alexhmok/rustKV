@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::types::{HardState, LogEntry, LogIndex, Snapshot, Term};
+use super::types::{HardState, LogEntry, LogIndex, Membership, Snapshot, Term};
 
 const HARD_STATE_FILE: &str = "hard_state.json";
 const LOG_FILE: &str = "log.jsonl";
@@ -229,7 +229,10 @@ impl Storage {
     /// replacing that prefix with a snapshot carrying `state` (the state
     /// machine's export at exactly that index — the caller must pass
     /// `last_applied`, never `commit_index`: committed-but-unapplied entries
-    /// are not in the state yet).
+    /// are not in the state yet) and `membership` (phase 15: the
+    /// configuration in effect AT that index — the caller derives it, since
+    /// only the Raft core knows the §4.1 precedence; `None` =
+    /// bootstrap-derived, serialized exactly as phase 14 did).
     ///
     /// Crash-safe ordering: snapshot written atomically first, then the log
     /// rewritten without the prefix; replay tolerates the in-between state
@@ -238,6 +241,7 @@ impl Storage {
         &mut self,
         last_included_index: LogIndex,
         state: Value,
+        membership: Option<Membership>,
     ) -> Result<(), StorageError> {
         // Capture the boundary entry's term while the entry still exists.
         let Some(last_included_term) = self
@@ -255,7 +259,7 @@ impl Storage {
         let snapshot = Snapshot {
             last_included_index,
             last_included_term,
-            membership: None,
+            membership,
             state,
         };
         // Compute the retained tail BEFORE the snapshot moves the boundary
@@ -697,7 +701,7 @@ mod tests {
                     entry(3, 5),
                 ])
                 .unwrap();
-            storage.compact_to(3, state(3)).unwrap();
+            storage.compact_to(3, state(3), None).unwrap();
 
             // In-memory arithmetic immediately after compaction...
             assert_eq!(storage.snapshot_index(), 3);
@@ -738,7 +742,7 @@ mod tests {
         {
             let mut storage = Storage::open(dir.path()).unwrap();
             storage.append(&[entry(1, 1), entry(2, 2)]).unwrap();
-            storage.compact_to(2, state(2)).unwrap();
+            storage.compact_to(2, state(2), None).unwrap();
             assert_eq!(storage.entries(), &[]);
             assert_eq!(storage.last_index(), 2);
             assert_eq!(storage.last_term(), 2, "falls back to the snapshot term");
@@ -757,7 +761,7 @@ mod tests {
         storage
             .append(&[entry(1, 1), entry(1, 2), entry(1, 3), entry(1, 4)])
             .unwrap();
-        storage.compact_to(3, state(3)).unwrap();
+        storage.compact_to(3, state(3), None).unwrap();
 
         for from in [0, 1, 3] {
             assert!(
@@ -776,13 +780,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut storage = Storage::open(dir.path()).unwrap();
         storage.append(&[entry(1, 1), entry(1, 2)]).unwrap();
-        storage.compact_to(1, state(1)).unwrap();
+        storage.compact_to(1, state(1), None).unwrap();
 
         // At/below the current boundary, at the 0 sentinel, and past the end.
         for index in [0, 1, 3] {
             assert!(
                 matches!(
-                    storage.compact_to(index, state(index)),
+                    storage.compact_to(index, state(index), None),
                     Err(StorageError::Corrupt(_))
                 ),
                 "compact_to({index}) must be rejected"
@@ -865,7 +869,7 @@ mod tests {
         {
             let mut storage = Storage::open(dir.path()).unwrap();
             storage.append(&[entry(1, 1), entry(1, 2)]).unwrap();
-            storage.compact_to(2, state(2)).unwrap();
+            storage.compact_to(2, state(2), None).unwrap();
             storage.append(&[entry(2, 3)]).unwrap();
         }
         // Forge a snapshot claiming a LOWER boundary than the log continues
@@ -939,6 +943,38 @@ mod tests {
         assert_eq!(storage.snapshot().unwrap().state, state(5));
     }
 
+    /// Phase 15: the membership handed to `compact_to` rides the snapshot to
+    /// disk and back; `None` keeps the phase-14 shape (pinned in types.rs).
+    #[test]
+    fn compact_to_persists_the_membership_across_reopen() {
+        use crate::raft::types::MemberAddr;
+        let members: Membership = std::collections::BTreeMap::from([
+            (1, MemberAddr::default()),
+            (
+                2,
+                MemberAddr {
+                    raft: "n2:9080".to_string(),
+                    client: "http://n2:8080".to_string(),
+                },
+            ),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut storage = Storage::open(dir.path()).unwrap();
+            storage.append(&[entry(1, 1), entry(1, 2)]).unwrap();
+            storage
+                .compact_to(2, state(2), Some(members.clone()))
+                .unwrap();
+            assert_eq!(
+                storage.snapshot().unwrap().membership,
+                Some(members.clone())
+            );
+        }
+        let storage = Storage::open(dir.path()).unwrap();
+        assert_eq!(storage.snapshot().unwrap().membership, Some(members));
+        assert_eq!(storage.snapshot_index(), 2);
+    }
+
     /// Old data dirs (no snapshot.json) must open byte-identically: same
     /// contents, same arithmetic, no snapshot file conjured into existence.
     #[test]
@@ -975,7 +1011,7 @@ mod tests {
             storage
                 .append(&[entry(1, 1), entry(1, 2), entry(1, 3)])
                 .unwrap();
-            storage.compact_to(2, state(2)).unwrap();
+            storage.compact_to(2, state(2), None).unwrap();
         }
         let path = dir.path().join(LOG_FILE);
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();

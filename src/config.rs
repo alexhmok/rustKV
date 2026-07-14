@@ -17,6 +17,10 @@
 //!   applied entries behind, so slightly-lagging peers catch up via
 //!   AppendEntries instead of InstallSnapshot (default 0 = compact
 //!   immediately; only meaningful with the threshold set)
+//! - `RUSTKV_JOIN`               — `1`/`true`: start as a JOINER (phase 15):
+//!   empty membership, no campaigning, waiting to be added to a running
+//!   cluster via `PUT /cluster/members/{id}` on its leader. RUSTKV_PEERS is
+//!   not needed — peer addresses arrive with the configuration.
 
 use std::collections::HashMap;
 
@@ -32,6 +36,7 @@ pub struct NodeConfig {
     pub peer_client_urls: HashMap<NodeId, String>,
     pub snapshot_threshold: Option<u64>,
     pub snapshot_trailing: u64,
+    pub join: bool,
 }
 
 impl NodeConfig {
@@ -74,6 +79,13 @@ impl NodeConfig {
                     format!("RUSTKV_SNAPSHOT_TRAILING must be a number, got {raw:?}")
                 })?,
                 None => 0,
+            },
+            join: match get("RUSTKV_JOIN").as_deref() {
+                None | Some("") | Some("0") | Some("false") => false,
+                Some("1") | Some("true") => true,
+                Some(other) => {
+                    return Err(format!("RUSTKV_JOIN must be 0/1/true/false, got {other:?}"));
+                }
             },
         };
         if config.peers.contains_key(&config.id) {
@@ -126,6 +138,16 @@ mod tests {
         assert!(config.peers.is_empty());
         assert!(config.peer_client_urls.is_empty());
         assert_eq!(config.snapshot_threshold, None, "snapshotting is opt-in");
+        assert!(!config.join, "join mode is opt-in");
+    }
+
+    #[test]
+    fn parses_the_join_flag() {
+        for (value, expected) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            let config = NodeConfig::from_vars(vars(&[("RUSTKV_JOIN", value)])).unwrap();
+            assert_eq!(config.join, expected, "RUSTKV_JOIN={value}");
+        }
+        assert!(NodeConfig::from_vars(vars(&[("RUSTKV_JOIN", "yes")])).is_err());
     }
 
     #[test]

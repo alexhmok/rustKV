@@ -998,15 +998,176 @@ Untested / known gaps (delta):
   left as a deployment decision.
 - The payload-vs-RPC_TIMEOUT issue above is recorded, not fixed.
 
-## Project complete (phases 0-14)
-Remaining ideas beyond the original scope, in planned order: dynamic
-membership (incl. re-evaluating vote stickiness for removed servers;
-the snapshot file's `membership` field and InstallSnapshot joiner
-catch-up are already in place), connection pooling, scripted Docker
-partition test. (TLS on the raft port: dropped — blocked on the
-dependency whitelist.)
+## Phase 15 — Dynamic membership (single-server changes) ✅
+
+Membership went log-derived (thesis §4.1–4.2): quorum math is a function
+of the log, not the config, and the seeded static-membership suites were
+the drift detector for that refactor — they passed with ZERO edits and
+ZERO re-pins.
+
+Done:
+- `src/raft/types.rs`: `MemberAddr { raft, client }`, `Membership =
+  BTreeMap<NodeId, MemberAddr>` (deterministic order), and
+  `Command::ConfigChange { members }` carrying the COMPLETE new
+  configuration incl. addresses. `Snapshot.membership` graduated from the
+  phase-14 `Option<Value>` placeholder to `Option<Membership>` — `None`
+  serializes as `null`, byte-identical to phase-14 output, and phase-14
+  snapshot.json files deserialize unchanged (both pinned verbatim, as is
+  the ConfigChange log-entry encoding). Existing Command variants'
+  encodings untouched (external tagging; existing pins unchanged).
+- Effect on APPEND, never commit (§4.1), precedence latest-ConfigChange-
+  in-log > snapshot.membership > bootstrap from RaftConfig: one
+  `derive_membership` runs at boot and at every rescan so the two can
+  never disagree. The in-effect config's index is tracked; truncating at
+  or below it forces a rescan from the snapshot base (the phantom-member
+  trap), and installing a snapshot rescans under the same precedence (a
+  later ConfigChange in the retained suffix wins over the snapshot's
+  field). `storage.compact_to` now takes the membership as an argument;
+  the trailing-window interaction is handled by capturing the membership
+  AS OF the staged index at stage time, so a ConfigChange appended
+  between stage and compact never leaks into an older boundary.
+  Bootstrap-derived membership is deliberately NOT embedded in snapshots
+  (`None`), keeping static clusters' snapshot bytes phase-14-identical.
+- Quorum went log-derived through the ONE `majority()` (phase 12's
+  consolidation paying off): vote counting (votes ∩ members), commit
+  advancement (members − self, plus self only if self ∈ members — the
+  subtlest edit), ReadIndex confirmation (same counting), and CheckQuorum
+  (same, so it needed no special cases) all follow. Every peer fan-out
+  iterates members − self; `send_append` itself is gated on membership so
+  a reply-triggered resend can't straggle to a removed server.
+- Safety rules for the known single-server-change bug: at most one
+  uncommitted ConfigChange in flight, and none until this term's no-op
+  has committed (phase 9's `term_start_index` reused as the gate).
+  Validation at proposal time: exactly one member added or removed vs the
+  active config, never down to empty. Rejections are a new
+  `ProposeError::InvalidConfigChange { reason }` →
+  `WriteError::InvalidConfig` → HTTP 409.
+- Leader self-removal (§4.2.2): allowed; the leader stops counting itself
+  the moment the entry is appended, keeps replicating, and steps down
+  once it commits (checked after commit advancement — the proposal's
+  waiter resolves `true` first).
+- Join mode: `RUSTKV_JOIN=1` / `RaftConfig.join` starts a node with EMPTY
+  membership; the campaign gate (self ∈ members, checked at election
+  timeout) keeps it fully silent — Follower, term 0, no pre-campaigns —
+  until a committed ConfigChange includes it. Catch-up rides
+  InstallSnapshot when the leader compacted (the phase-14 payoff) or
+  plain AppendEntries backfill otherwise.
+- Address propagation without core networking: `Status` stays `Copy`;
+  membership gets its own watch channel (`RaftHandle::membership_watch`).
+  main.rs follows it and folds changes into `HttpTransport` (peer map now
+  behind `Arc<RwLock>`, `set_peers`) and `ApiContext.peer_urls` (same).
+  Admin API: `GET /cluster/members` (local view, any node),
+  `PUT/DELETE /cluster/members/{id}` (leader ops; non-leaders 307 via the
+  shared redirect helper, which now takes a path; malformed body 400,
+  unknown member 404, invalid delta / in-flight / already-member 409).
+- Harness: `TestCluster.dirs` behind a mutex; `add_node`/`add_node_with`
+  spawn joiners (join mode, per-joiner snapshot settings preserved across
+  `restart`, bootstrap-n frozen at spawn so restarts never widen it);
+  `remove_node` tears a removed node out of the harness.
+  `spawn_cluster(n)` unchanged — zero edits to existing tests beyond the
+  two mechanical `ApiContext.peer_urls` constructor sites.
+
+Vote-stickiness decision for REMOVED servers (deferred here from phases
+11/12; thesis §4.2.3): **option (a) — real votes stay non-sticky; no
+lease check, no force flag; accepted and evidenced.** The named scenario
+(`removed_follower_cannot_disrupt_the_members`) runs both halves: with
+the leader alive, a removed-but-running follower probes through 5 virtual
+seconds of timeouts and moves nobody's term (leader stickiness); then the
+leader is crashed and, in exactly the stickiness-lapsed window the thesis
+warns about, the survivors elect while the removed server still never
+reaches a candidacy. The reason the etcd-style machinery isn't needed
+here is structural, not lucky timing: config-on-append means every
+member's log contains the committed removal entry, so the removed
+server's log is strictly shorter at an equal-or-lower last term — the
+§5.4.1 pre-vote log check denies it, and a pre-vote majority in its own
+stale view needs grants only members-with-the-entry could give. A
+disruptive REAL vote is unreachable without a pre-vote majority (phase
+11), so the etcd deadlock class (lease + higher-term wedge needing a
+leadership-transfer escape hatch) is never entered. Residual, accepted:
+an UNCOMMITTED removal rolls back like any uncommitted entry (that's
+correctness, not disruption — pinned by the phantom-member test), and a
+removed server left running probes forever (liveness noise on its own
+box; operators should stop the process).
+
+Tested (160 total; 19 new):
+- tests/membership.rs (12, sim, paused time): grow 3→4 and shrink 4→3
+  UNDER LIVE WRITES with the WGL checker over the whole history (tokened
+  retrying writers + linearizable readers; the membership change is the
+  nemesis; final reads pin unknowns); removing the LEADER (commits by the
+  new majority, steps down, survivors elect, event-level election-safety
+  observer clean at teardown); the self-removal quorum discriminator —
+  4 nodes, two followers severed, so the removal can only commit inside
+  the window if the leader wrongly counts itself (mutation-checked:
+  forcing self-counting fails exactly that assertion; reverted); joiner
+  catch-up BOTH ways — purely via InstallSnapshot (the joiner is spawned
+  with snapshotting OFF, so the snapshot on its disk can only have
+  arrived over the wire, and its log provably never held the compacted
+  prefix) and via AE backfill (byte-identical logs from index 1, no
+  snapshot file); the phantom-member trap — leader crashes out of an
+  uncommitted ConfigChange via CheckQuorum, heal truncates it, and the
+  once-phantomed node then WINS an election and commits under the
+  rescanned 2-of-3 quorum, impossible under a phantom 3-of-4 (mutation-
+  checked: disabling the truncation rescan fails; reverted; seed-pinned
+  leader race, noted in the test); validation matrix (two-at-once,
+  zero-delta, in-flight, follower NotLeader, remove-last-member) and the
+  no-op gate caught in its real window (fixed 10ms delays; precondition
+  asserts the no-op was still uncommitted); joiner never campaigns
+  pre-adoption (5 virtual seconds: Follower, term 0, cluster untouched)
+  then counts after adoption (leader crash → remaining three elect);
+  the removed-server scenario above.
+- tests/cluster_http.rs (+1): admin CRUD end-to-end — GET on every node,
+  raw 307 with exact Location from a follower, add through a follower
+  redirect (committing 3-of-4 with no fourth process running), 400/404/
+  409 arms, remove through a redirect, ordinary writes still fine after.
+- Serde pins (types.rs +3, storage.rs +1, store.rs +1): ConfigChange
+  entry encoding pinned verbatim; phase-14 snapshot JSON readable AND
+  membership-less snapshots byte-identical; membership rides compact_to
+  across reopen; ConfigChange invisible to the KV state machine (map and
+  sessions untouched). config.rs: RUSTKV_JOIN parsing.
+- Full regression: election, replication, read_index, faults, jepsen,
+  dedup, snapshot, http_api, http_transport, three_process all pass with
+  ZERO behavioral edits and ZERO re-pins (the quorum refactor adds no RNG
+  draws and no messages when membership never changes — verified, as
+  planned, by the seeded suites themselves). cluster_http's known
+  real-time CPU-starvation flake surfaced once during parallel full-suite
+  runs and reproduces identically on the pristine phase-14 commit under
+  the same load; 5/5 green in isolation. Mechanical edits only: the two
+  `ApiContext { peer_urls }` constructor sites.
+- Manual binary smoke (scripted): real 3-process cluster, real joiner
+  with RUSTKV_JOIN=1 and NO RUSTKV_PEERS, admin add through a follower
+  redirect → joiner adopts the 4-member config and replicates old + live
+  writes over real HTTP (transport peer book updated from the membership
+  watch), admin remove → config back to 3, writes fine throughout.
+
+Untested / known gaps (documented, not fixed):
+- The joiner catch-up path inherits phase 14's pre-production blocker:
+  the single-shot InstallSnapshot payload rides one HTTP RPC against
+  main.rs's 150ms RPC_TIMEOUT, so a joiner behind a LARGE state degrades
+  toward a resend loop. Sim tests are unaffected; fix (size-aware timeout
+  → streaming → §7 chunking) before real-data use with snapshotting on.
+- Address changes for an existing member are rejected (409) rather than
+  supported — remove-then-re-add is the workaround.
+- The binary advertises its own bind addresses (`RUSTKV_LISTEN`/
+  `RUSTKV_RAFT_LISTEN`) in bootstrap membership; behind NAT or 0.0.0.0
+  binds a future ConfigChange would carry unreachable self-addresses —
+  a separate advertise-address variable is the known fix.
+- A removed server is never told (leaders don't replicate outside the
+  config, by design): it parks probing forever until its process is
+  stopped; its data dir is not cleaned up.
+- Membership changes are not exposed through the dedup-token machinery
+  (admin ops are idempotence-checked by validation, not sessions): a
+  retried add/remove after an ambiguous 504 may 409 as "zero delta" —
+  harmless, but the client must treat 409 as "already done, verify".
+- No joint consensus: only single-server deltas, serialized one at a
+  time — a deliberate scope choice, same as the thesis's recommendation.
+
+## Project complete (phases 0-15)
+Remaining ideas beyond the original scope, in planned order: connection
+pooling, scripted Docker partition test. (TLS on the raft port: dropped —
+blocked on the dependency whitelist.)
 
 ## Out of scope (deliberate)
-Dynamic membership changes — clean TODOs remain (`TODO(membership)` on
-the snapshot's reserved field). Snapshotting graduated from this list in
-phase 14.
+Joint-consensus (multi-server) membership changes and a snapshot
+chunking/streaming path for large joiner catch-up. Dynamic single-server
+membership graduated from this list in phase 15 (as snapshotting did in
+phase 14); no `TODO(membership)` markers remain.

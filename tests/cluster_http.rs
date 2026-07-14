@@ -88,7 +88,7 @@ async fn spawn_http_cluster(n: u64, seed: u64) -> HttpCluster {
         let kv = KvNode::new(store, raft, WRITE_TIMEOUT);
         let ctx = Arc::new(ApiContext {
             kv: kv.clone(),
-            peer_urls: urls.clone(),
+            peer_urls: Arc::new(std::sync::RwLock::new(urls.clone())),
         });
         tokio::spawn(async move {
             axum::serve(listener, router(ctx))
@@ -320,6 +320,120 @@ async fn delete_through_a_follower_redirect() {
     for node in &cluster.nodes {
         wait_for_local_get(&client, &node.url, "gone", None).await;
     }
+}
+
+/// Phase 15: the cluster admin API. GET is served locally by any node;
+/// PUT/DELETE are leader operations (307 from followers, like writes);
+/// malformed bodies 400, unknown members 404, invalid deltas 409.
+#[tokio::test]
+async fn admin_membership_endpoints_crud_and_redirect() {
+    let _serial = SERIAL.lock().await;
+    let cluster = spawn_http_cluster(3, 36).await;
+    let leader = cluster.wait_for_leader().await;
+    let follower = cluster.followers(leader.id)[0];
+    let client = reqwest::Client::new();
+
+    // GET: any node answers with its own view of the bootstrap membership.
+    for node in &cluster.nodes {
+        let resp = client
+            .get(format!("{}/cluster/members", node.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.json::<Value>().await.unwrap();
+        let members = body.as_object().unwrap();
+        assert_eq!(members.len(), 3, "bootstrap membership");
+        for id in ["1", "2", "3"] {
+            assert!(members.contains_key(id), "missing member {id}");
+        }
+    }
+
+    // Raw PUT on a follower: 307 with a Location on the leader.
+    let raw = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let addr = json!({"raft": "127.0.0.1:1", "client": "http://127.0.0.1:1"});
+    let resp = raw
+        .put(format!("{}/cluster/members/4", follower.url))
+        .json(&addr)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 307);
+    assert_eq!(
+        resp.headers()["location"].to_str().unwrap(),
+        format!("{}/cluster/members/4", leader.url)
+    );
+
+    // Malformed body: 400, nothing proposed.
+    let resp = client
+        .put(format!("{}/cluster/members/4", leader.url))
+        .body("not json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    // Add member 4 (no such process runs — the change itself commits with
+    // 3 of the new 4 acking). A follower with redirects lands it too.
+    let resp = client
+        .put(format!("{}/cluster/members/4", follower.url))
+        .json(&addr)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let resp = client
+        .get(format!("{}/cluster/members", leader.url))
+        .send()
+        .await
+        .unwrap();
+    let body = resp.json::<Value>().await.unwrap();
+    assert_eq!(body.as_object().unwrap().len(), 4);
+    assert_eq!(body["4"]["raft"], json!("127.0.0.1:1"));
+
+    // Re-adding an existing member (an address change) is refused: 409.
+    let resp = client
+        .put(format!("{}/cluster/members/4", leader.url))
+        .json(&addr)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+
+    // Removing an unknown member: 404.
+    let resp = client
+        .delete(format!("{}/cluster/members/9", leader.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // Remove member 4 through a follower redirect: 204, view back to 3.
+    let resp = client
+        .delete(format!("{}/cluster/members/4", follower.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    let resp = client
+        .get(format!("{}/cluster/members", leader.url))
+        .send()
+        .await
+        .unwrap();
+    let body = resp.json::<Value>().await.unwrap();
+    assert_eq!(body.as_object().unwrap().len(), 3);
+
+    // The cluster still serves ordinary writes after the round trip.
+    let put = client
+        .put(format!("{}/still-works", leader.url))
+        .json(&json!(true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 201);
 }
 
 #[tokio::test]

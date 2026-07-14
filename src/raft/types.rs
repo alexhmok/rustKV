@@ -1,10 +1,13 @@
 //! Core Raft data types, shared by the consensus core, persistence, and (in
 //! later phases) the transport RPCs.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Identifies a cluster member. Fixed membership comes from config (phase 7).
+/// Identifies a cluster member. Bootstrap membership comes from config
+/// (phase 7); from phase 15 on it is log-derived (`Command::ConfigChange`).
 pub type NodeId = u64;
 
 /// Raft term. Starts at 0 on a fresh node; term 0 never has a leader.
@@ -25,6 +28,22 @@ pub struct Session {
     pub seq: u64,
 }
 
+/// How to reach one cluster member (phase 15): its raft RPC address
+/// (`host:port`) and its client-facing base URL (for write/read redirects).
+/// Opaque to the consensus core — it only carries them; the transport and
+/// API layers consume them. May be empty where addresses are meaningless
+/// (the in-memory simulator routes by id).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberAddr {
+    pub raft: String,
+    pub client: String,
+}
+
+/// A complete cluster configuration (phase 15): every member with its
+/// addresses. `BTreeMap` so iteration order — and therefore serialization
+/// and peer fan-out order — is deterministic.
+pub type Membership = BTreeMap<NodeId, MemberAddr>;
+
 /// A state-machine command carried by a log entry. Put/Delete mirror the
 /// client API's write operations; Noop is appended by a fresh leader (§8) to
 /// commit prior-term entries promptly and is skipped by the state machine.
@@ -34,6 +53,13 @@ pub struct Session {
 /// token-less commands serialize byte-identical to pre-phase-13 output
 /// (protecting both old data dirs and the RPC wire format) — pinned by
 /// unit tests below.
+///
+/// `ConfigChange` (phase 15) is Raft-internal: it carries the COMPLETE new
+/// membership (single-server delta vs the active config, validated at
+/// proposal time) and is ignored by the KV state machine — membership is
+/// consensus bookkeeping, not user data. Serde's external tagging keys
+/// variants by name, so adding it changes nothing about the other variants'
+/// encoding (pinned below).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Command {
     Put {
@@ -48,6 +74,9 @@ pub enum Command {
         session: Option<Session>,
     },
     Noop,
+    ConfigChange {
+        members: Membership,
+    },
 }
 
 /// One entry in the replicated log.
@@ -69,16 +98,19 @@ pub struct LogEntry {
 ///
 /// `state` is opaque to Raft (the state machine's `snapshot()`/`restore()`
 /// pair owns its meaning — for the KV store, a [`KvSnapshot`] of map +
-/// dedup sessions). `membership` is reserved for dynamic membership
-/// (phase 15) and is always `None` today.
+/// dedup sessions). `membership` (phase 15) is the configuration in effect
+/// AT the boundary: the latest `ConfigChange` at or below
+/// `last_included_index`, or `None` if membership was still
+/// bootstrap-derived there — `None` serializes as `null`, byte-identical to
+/// phase-14 output, and phase-14 snapshot files deserialize unchanged
+/// (both pinned below).
 ///
 /// [`KvSnapshot`]: crate::store::KvSnapshot
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub last_included_index: LogIndex,
     pub last_included_term: Term,
-    /// TODO(membership): populated by phase 15's dynamic membership.
-    pub membership: Option<Value>,
+    pub membership: Option<Membership>,
     pub state: Value,
 }
 
@@ -175,5 +207,77 @@ mod tests {
             r#"{"Delete":{"key":"k","session":{"client":4,"seq":10}}}"#
         );
         assert_eq!(serde_json::from_str::<Command>(&encoded).unwrap(), delete);
+    }
+
+    fn two_member_map() -> Membership {
+        BTreeMap::from([
+            (
+                1,
+                MemberAddr {
+                    raft: "n1:9080".to_string(),
+                    client: "http://n1:8080".to_string(),
+                },
+            ),
+            (
+                2,
+                MemberAddr {
+                    raft: "n2:9080".to_string(),
+                    client: "http://n2:8080".to_string(),
+                },
+            ),
+        ])
+    }
+
+    /// ConfigChange entries (phase 15) have a pinned encoding of their own —
+    /// this is what lands in log.jsonl and inside AppendEntries — and the
+    /// BTreeMap keeps member order deterministic.
+    #[test]
+    fn config_change_serialization_is_pinned_and_roundtrips() {
+        let entry = LogEntry {
+            term: 4,
+            index: 9,
+            command: Command::ConfigChange {
+                members: two_member_map(),
+            },
+        };
+        let encoded = serde_json::to_string(&entry).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"term":4,"index":9,"command":{"ConfigChange":{"members":{"1":{"raft":"n1:9080","client":"http://n1:8080"},"2":{"raft":"n2:9080","client":"http://n2:8080"}}}}}"#
+        );
+        assert_eq!(serde_json::from_str::<LogEntry>(&encoded).unwrap(), entry);
+    }
+
+    /// The 14→15 thread, pinned both ways: a phase-14 `snapshot.json` (its
+    /// `membership` always `null`) must deserialize to `None` under the now-
+    /// typed field, and a membership-less snapshot must serialize
+    /// byte-identical to phase-14 output — old data dirs and mixed-version
+    /// InstallSnapshot payloads both depend on it.
+    #[test]
+    fn phase_14_snapshots_stay_readable_and_byte_identical() {
+        let phase_14 = r#"{"last_included_index":8,"last_included_term":3,"membership":null,"state":{"map":{"k":1},"sessions":{}}}"#;
+        let snapshot: Snapshot = serde_json::from_str(phase_14).unwrap();
+        assert_eq!(snapshot.membership, None);
+        assert_eq!(snapshot.last_included_index, 8);
+        assert_eq!(
+            serde_json::to_string(&snapshot).unwrap(),
+            phase_14,
+            "membership-less snapshots must serialize exactly as phase 14 did"
+        );
+    }
+
+    #[test]
+    fn snapshot_with_membership_roundtrips() {
+        let snapshot = Snapshot {
+            last_included_index: 12,
+            last_included_term: 5,
+            membership: Some(two_member_map()),
+            state: json!({"map": {}, "sessions": {}}),
+        };
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Snapshot>(&encoded).unwrap(),
+            snapshot
+        );
     }
 }

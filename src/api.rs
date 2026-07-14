@@ -24,6 +24,17 @@
 //! [`crate::store::SESSION_WINDOW`] ops outstanding at a time (ops may be
 //! pipelined; dedup matches exact seqs over that sliding window).
 //!
+//! Cluster admin (phase 15, dynamic membership):
+//! - `GET /cluster/members`         -> 200 with the in-effect membership
+//!   (this node's view; served locally, like `/cluster/status`).
+//! - `PUT /cluster/members/{id}`    -> 201 once the ConfigChange adding the
+//!   member is committed; body `{"raft": "host:port", "client": "http://…"}`.
+//! - `DELETE /cluster/members/{id}` -> 204 once the removal is committed;
+//!   404 if the id is not a member.
+//!   Invalid changes (not a single-server delta, another change in flight,
+//!   the leader's no-op not yet committed) -> `409` with the reason.
+//!   Non-leaders redirect both, like writes.
+//!
 //! Non-leaders answer writes and linearizable reads with `307 Temporary
 //! Redirect` to the leader's client URL when it is known (the brief allows
 //! forward-or-redirect; redirect keeps this layer stateless), else `503`.
@@ -33,7 +44,7 @@
 //! happen. `503` responses are always safe to retry.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use axum::Router;
 use axum::body::Bytes;
@@ -45,20 +56,27 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::kv::{KvNode, ReadError, WriteError};
-use crate::raft::types::{Command, NodeId, Session};
+use crate::raft::types::{Command, MemberAddr, NodeId, Session};
 
 /// Everything a handler needs: the local KV service and, for redirects, the
 /// client-facing base URL of each peer (empty for a single-node deployment;
-/// populated from cluster config in phase 7).
+/// bootstrapped from cluster config in phase 7). Behind a lock since
+/// phase 15: membership changes update it at runtime (main.rs follows the
+/// Raft core's membership watch). Never held across an `.await`.
 pub struct ApiContext {
     pub kv: Arc<KvNode>,
-    pub peer_urls: HashMap<NodeId, String>,
+    pub peer_urls: Arc<RwLock<HashMap<NodeId, String>>>,
 }
 
 pub fn router(ctx: Arc<ApiContext>) -> Router {
     Router::new()
         .route("/{key}", get(get_key).put(put_key).delete(delete_key))
         .route("/cluster/status", get(get_status))
+        .route("/cluster/members", get(list_members))
+        .route(
+            "/cluster/members/{id}",
+            axum::routing::put(put_member).delete(delete_member),
+        )
         .with_state(ctx)
 }
 
@@ -209,17 +227,24 @@ async fn delete_key(
     }
 }
 
-/// 307 to the leader's client URL, if we know who and where it is.
+/// 307 to the leader's client URL, if we know who and where it is. `path`
+/// is the request path without the leading slash (a key, or an admin path
+/// like `cluster/members/4`).
 fn redirect_to_leader(
     ctx: &ApiContext,
-    key: &str,
+    path: &str,
     leader_hint: Option<NodeId>,
 ) -> Option<Response> {
     let leader = leader_hint?;
-    let base = ctx.peer_urls.get(&leader)?;
-    // NOTE: the key is embedded as-is; exotic characters that need
+    let base = ctx
+        .peer_urls
+        .read()
+        .expect("peer_urls lock poisoned")
+        .get(&leader)
+        .cloned()?;
+    // NOTE: the path is embedded as-is; exotic characters that need
     // re-encoding are out of scope for now.
-    let location = format!("{base}/{key}");
+    let location = format!("{base}/{path}");
     Some(
         (
             StatusCode::TEMPORARY_REDIRECT,
@@ -229,10 +254,10 @@ fn redirect_to_leader(
     )
 }
 
-fn write_error_response(ctx: &ApiContext, key: &str, error: WriteError) -> Response {
-    tracing::debug!(key, %error, "write not served locally");
+fn write_error_response(ctx: &ApiContext, path: &str, error: WriteError) -> Response {
+    tracing::debug!(path, %error, "write not served locally");
     match error {
-        WriteError::NotLeader { leader_hint } => match redirect_to_leader(ctx, key, leader_hint) {
+        WriteError::NotLeader { leader_hint } => match redirect_to_leader(ctx, path, leader_hint) {
             Some(redirect) => redirect,
             None => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -251,6 +276,9 @@ fn write_error_response(ctx: &ApiContext, key: &str, error: WriteError) -> Respo
             "leadership changed before the write committed; safe to retry\n",
         )
             .into_response(),
+        WriteError::InvalidConfig { reason } => {
+            (StatusCode::CONFLICT, format!("{reason}\n")).into_response()
+        }
         WriteError::Shutdown => {
             (StatusCode::SERVICE_UNAVAILABLE, "node shutting down\n").into_response()
         }
@@ -282,5 +310,70 @@ fn read_error_response(ctx: &ApiContext, key: &str, error: ReadError) -> Respons
         ReadError::Shutdown => {
             (StatusCode::SERVICE_UNAVAILABLE, "node shutting down\n").into_response()
         }
+    }
+}
+
+// ---- cluster admin (phase 15) ----
+
+/// This node's view of the in-effect membership. Local, like `/cluster/
+/// status`: any node answers, no leadership confirmation — operators asking
+/// "who do YOU think is in the cluster" is the point.
+async fn list_members(State(ctx): State<Arc<ApiContext>>) -> Response {
+    Json(ctx.kv.membership()).into_response()
+}
+
+/// Adds (or re-adds) member `id` with the given addresses: proposes a
+/// ConfigChange carrying the complete new configuration and answers 201
+/// once it is committed. The new node should already be running in join
+/// mode (`RUSTKV_JOIN=1`) so the leader can catch it up.
+async fn put_member(
+    State(ctx): State<Arc<ApiContext>>,
+    Path(id): Path<NodeId>,
+    body: Bytes,
+) -> Response {
+    let addr = match serde_json::from_slice::<MemberAddr>(&body) {
+        Ok(addr) => addr,
+        Err(error) => {
+            tracing::warn!(id, %error, "add-member rejected: bad body");
+            return (
+                StatusCode::BAD_REQUEST,
+                "body must be {\"raft\": \"host:port\", \"client\": \"http://host:port\"}\n",
+            )
+                .into_response();
+        }
+    };
+    let mut members = ctx.kv.membership();
+    if members.contains_key(&id) {
+        return (
+            StatusCode::CONFLICT,
+            "already a member (address changes are not supported)\n",
+        )
+            .into_response();
+    }
+    members.insert(id, addr);
+    let path = format!("cluster/members/{id}");
+    match ctx.kv.write(Command::ConfigChange { members }).await {
+        Ok(()) => {
+            tracing::info!(id, "member added");
+            StatusCode::CREATED.into_response()
+        }
+        Err(error) => write_error_response(&ctx, &path, error),
+    }
+}
+
+/// Removes member `id` (the current leader included — it steps down once
+/// the removal commits). 404 if `id` is not in this node's view.
+async fn delete_member(State(ctx): State<Arc<ApiContext>>, Path(id): Path<NodeId>) -> Response {
+    let mut members = ctx.kv.membership();
+    if members.remove(&id).is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let path = format!("cluster/members/{id}");
+    match ctx.kv.write(Command::ConfigChange { members }).await {
+        Ok(()) => {
+            tracing::info!(id, "member removed");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => write_error_response(&ctx, &path, error),
     }
 }

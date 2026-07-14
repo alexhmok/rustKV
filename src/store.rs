@@ -208,6 +208,10 @@ impl StateMachine for KvStore {
                 self.record_applied(*session);
             }
             Command::Noop => {}
+            // Raft-internal (phase 15): membership rides the log and the
+            // snapshot's own membership field, never the KV state — a
+            // ConfigChange is invisible to the state machine.
+            Command::ConfigChange { .. } => {}
         }
     }
 
@@ -379,6 +383,31 @@ mod tests {
             },
         );
         assert_eq!(store.get("k"), Some(json!(9)));
+    }
+
+    /// ConfigChange is Raft-internal (phase 15): applying one must leave
+    /// the map AND the sessions table untouched — membership never lives in
+    /// KvSnapshot.
+    #[test]
+    fn config_changes_are_invisible_to_the_state_machine() {
+        let store = KvStore::new();
+        apply(&store, 1, tokened_put("k", 1, 7, 1));
+        let before = store.export();
+        apply(
+            &store,
+            2,
+            Command::ConfigChange {
+                members: std::collections::BTreeMap::from([(1, rustkv_member_addr())]),
+            },
+        );
+        assert_eq!(store.export(), before);
+    }
+
+    fn rustkv_member_addr() -> crate::raft::types::MemberAddr {
+        crate::raft::types::MemberAddr {
+            raft: "n1:9080".to_string(),
+            client: "http://n1:8080".to_string(),
+        }
     }
 
     #[test]

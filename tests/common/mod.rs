@@ -5,7 +5,7 @@
 
 pub mod lin;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,7 +13,9 @@ use std::time::Duration;
 use rustkv::raft::Storage;
 use rustkv::raft::node::{RaftConfig, RaftHandle, RaftNode, RoleKind, StateMachine, Status};
 use rustkv::raft::transport::sim::{FaultConfig, SimNetwork};
-use rustkv::raft::types::{Command, LogEntry, LogIndex, NodeId, Session, Snapshot, Term};
+use rustkv::raft::types::{
+    Command, LogEntry, LogIndex, MemberAddr, NodeId, Session, Snapshot, Term,
+};
 use rustkv::store::KvStore;
 use serde_json::json;
 use tempfile::TempDir;
@@ -83,19 +85,31 @@ pub fn passive_config(id: NodeId, peers: Vec<NodeId>) -> RaftConfig {
 
 /// A simulated cluster. Everything mutable lives behind interior
 /// mutability so that concurrent workload/nemesis tasks can share the
-/// cluster via `Arc` and crash/restart nodes mid-run (phase 10).
+/// cluster via `Arc` and crash/restart nodes mid-run (phase 10), and so
+/// membership tests can add/remove nodes mid-run (phase 15).
 pub struct TestCluster {
     pub net: SimNetwork,
     nodes: Mutex<Vec<(NodeId, Arc<RaftHandle>)>>,
     stores: Mutex<Vec<(NodeId, Arc<KvStore>)>>,
-    dirs: Vec<(NodeId, TempDir)>,
+    dirs: Mutex<Vec<(NodeId, TempDir)>>,
     seed: u64,
+    /// Cluster size at spawn: the size of the BOOTSTRAP membership. Restarts
+    /// derive their bootstrap config from this, never from the current node
+    /// count — a node added later must not silently widen what a restarted
+    /// original would bootstrap with (its log/snapshot carries the real
+    /// membership anyway).
+    initial_n: u64,
     /// Bumped on every restart so a reborn node gets fresh timeout jitter.
     incarnation: AtomicU64,
     /// Nodes crashed via [`Self::crash`] and not yet restarted. Their status
     /// watch freezes at the last published value, so workloads must exclude
     /// them from leader sampling.
     crashed: Mutex<HashSet<NodeId>>,
+    /// Nodes spawned via [`Self::add_node`] (phase 15), with the snapshot
+    /// settings they were given: a restart must rebuild them in join mode
+    /// with the SAME settings (same reborn-node-divergence reasoning as the
+    /// thresholds below).
+    joined: Mutex<HashMap<NodeId, (Option<u64>, u64)>>,
     /// Every node's `RaftConfig.snapshot_threshold` (phase 14). Stored so
     /// [`Self::restart`] rebuilds the node with the SAME threshold — a
     /// reborn node silently reverting to `None` would diverge from the
@@ -148,12 +162,23 @@ pub fn spawn_cluster_full(
         net,
         nodes: Mutex::new(nodes),
         stores: Mutex::new(stores),
-        dirs,
+        dirs: Mutex::new(dirs),
         seed,
+        initial_n: n,
         incarnation: AtomicU64::new(0),
         crashed: Mutex::new(HashSet::new()),
+        joined: Mutex::new(HashMap::new()),
         snapshot_threshold,
         snapshot_trailing,
+    }
+}
+
+/// A placeholder address-book entry for sim-transport members: the sim
+/// routes by id, so the addresses are only ever carried, never dialed.
+pub fn member_addr(id: NodeId) -> MemberAddr {
+    MemberAddr {
+        raft: format!("node{id}:9080"),
+        client: format!("http://node{id}:8080"),
     }
 }
 
@@ -233,7 +258,7 @@ impl TestCluster {
     }
 
     pub fn all_ids(&self) -> Vec<NodeId> {
-        self.dirs.iter().map(|(id, _)| *id).collect()
+        self.lock_dirs().iter().map(|(id, _)| *id).collect()
     }
 
     /// All nodes not currently crashed. Workloads sample leaders from these:
@@ -256,6 +281,14 @@ impl TestCluster {
 
     fn lock_crashed(&self) -> std::sync::MutexGuard<'_, HashSet<NodeId>> {
         self.crashed.lock().expect("crashed lock poisoned")
+    }
+
+    fn lock_dirs(&self) -> std::sync::MutexGuard<'_, Vec<(NodeId, TempDir)>> {
+        self.dirs.lock().expect("dirs lock poisoned")
+    }
+
+    fn lock_joined(&self) -> std::sync::MutexGuard<'_, HashMap<NodeId, (Option<u64>, u64)>> {
+        self.joined.lock().expect("joined lock poisoned")
     }
 
     /// Waits (virtual time) until exactly one of `ids` reports Leader.
@@ -308,23 +341,32 @@ impl TestCluster {
     /// state machine — the KV state is rebuilt by re-applying the log once
     /// the commit index is re-learned. Sleeps briefly first so the aborted
     /// task has definitely been dropped and released its file handles.
+    /// A node originally spawned via [`Self::add_node`] is rebuilt in join
+    /// mode with its original snapshot settings.
     pub async fn restart(&self, id: NodeId) {
         tokio::time::sleep(ms(20)).await;
         let incarnation = self.incarnation.fetch_add(1, Ordering::SeqCst) + 1;
-        let n = self.dirs.len() as u64;
-        let dir = &self
-            .dirs
-            .iter()
-            .find(|(nid, _)| *nid == id)
-            .expect("no such node")
-            .1;
-        let storage = Storage::open(dir.path()).expect("reopen storage");
+        let storage = {
+            let dirs = self.lock_dirs();
+            let dir = &dirs
+                .iter()
+                .find(|(nid, _)| *nid == id)
+                .expect("no such node")
+                .1;
+            Storage::open(dir.path()).expect("reopen storage")
+        };
         let (transport, inbound) = self.net.register(id);
         let store = Arc::new(KvStore::new());
-        let mut config = node_config(id, n, self.seed);
+        let mut config = node_config(id, self.initial_n, self.seed);
         config.timeout_seed ^= incarnation << 32;
-        config.snapshot_threshold = self.snapshot_threshold;
-        config.snapshot_trailing = self.snapshot_trailing;
+        if let Some(&(threshold, trailing)) = self.lock_joined().get(&id) {
+            config.join = true;
+            config.snapshot_threshold = threshold;
+            config.snapshot_trailing = trailing;
+        } else {
+            config.snapshot_threshold = self.snapshot_threshold;
+            config.snapshot_trailing = self.snapshot_trailing;
+        }
         let handle = Arc::new(RaftNode::spawn(
             config,
             storage,
@@ -345,12 +387,63 @@ impl TestCluster {
         self.lock_crashed().remove(&id);
     }
 
+    /// Spawns a brand-new node in JOIN mode (phase 15): empty bootstrap
+    /// membership, so it stays completely silent until a committed
+    /// ConfigChange includes it — the caller proposes that change
+    /// separately (the complete new membership, e.g. via
+    /// [`RaftHandle::membership`] + insert). `snapshot_threshold`/`trailing`
+    /// are per-joiner so tests can pick catch-up discriminators (a joiner
+    /// that never self-compacts can only own a snapshot via
+    /// InstallSnapshot).
+    pub fn add_node_with(&self, id: NodeId, threshold: Option<u64>, trailing: u64) {
+        assert!(
+            !self.all_ids().contains(&id),
+            "node {id} already exists in the harness"
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::open(dir.path()).expect("storage");
+        let (transport, inbound) = self.net.register(id);
+        let store = Arc::new(KvStore::new());
+        let mut config = node_config(id, self.initial_n, self.seed);
+        config.join = true;
+        config.snapshot_threshold = threshold;
+        config.snapshot_trailing = trailing;
+        let handle = Arc::new(RaftNode::spawn(
+            config,
+            storage,
+            transport,
+            inbound,
+            store.clone() as Arc<dyn StateMachine>,
+        ));
+        self.lock_nodes().push((id, handle));
+        self.lock_stores().push((id, store));
+        self.lock_dirs().push((id, dir));
+        self.lock_joined().insert(id, (threshold, trailing));
+    }
+
+    /// [`Self::add_node_with`] inheriting the cluster's snapshot settings.
+    pub fn add_node(&self, id: NodeId) {
+        self.add_node_with(id, self.snapshot_threshold, self.snapshot_trailing);
+    }
+
+    /// Tears a node out of the harness: shuts it down and forgets it (its
+    /// temp dir is dropped). Call AFTER the ConfigChange removing it has
+    /// committed — this is harness bookkeeping, not the removal itself.
+    pub fn remove_node(&self, id: NodeId) {
+        self.handle(id).shutdown();
+        self.lock_nodes().retain(|(nid, _)| *nid != id);
+        self.lock_stores().retain(|(nid, _)| *nid != id);
+        self.lock_dirs().retain(|(nid, _)| *nid != id);
+        self.lock_crashed().remove(&id);
+        self.lock_joined().remove(&id);
+    }
+
     /// Reads a node's log back from disk. Only call after the node has been
     /// shut down or crashed — a live node owns append handles to these files
     /// and replay-repair could race its writes.
     pub fn disk_log(&self, id: NodeId) -> Vec<LogEntry> {
-        let dir = &self
-            .dirs
+        let dirs = self.lock_dirs();
+        let dir = &dirs
             .iter()
             .find(|(nid, _)| *nid == id)
             .expect("no such node")
@@ -365,8 +458,8 @@ impl TestCluster {
     /// compacted). Same caveat as [`Self::disk_log`]: only after the node
     /// has been shut down or crashed.
     pub fn disk_snapshot(&self, id: NodeId) -> Option<Snapshot> {
-        let dir = &self
-            .dirs
+        let dirs = self.lock_dirs();
+        let dir = &dirs
             .iter()
             .find(|(nid, _)| *nid == id)
             .expect("no such node")

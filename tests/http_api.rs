@@ -61,7 +61,7 @@ async fn spawn_server_in(data_dir: &Path) -> TestServer {
     let kv = KvNode::new(store, raft, Duration::from_secs(5));
     let ctx = Arc::new(ApiContext {
         kv: kv.clone(),
-        peer_urls: HashMap::new(),
+        peer_urls: Arc::new(std::sync::RwLock::new(HashMap::new())),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
