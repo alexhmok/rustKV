@@ -644,9 +644,9 @@ Done:
   output (both pinned by unit tests with verbatim JSON strings; the
   three_process interop test confirms the wire format end-to-end).
 - `src/store.rs`: dedup table IN the state machine —
-  `sessions: RwLock<HashMap<u64, u64>>` (client → highest applied seq).
-  `apply()` skips the mutation of a tokened command with
-  `seq <= sessions[client]`, else mutates and records. Dedup is at APPLY,
+  `sessions: RwLock<HashMap<u64, u64>>` (client → highest applied seq;
+  superseded by the windowed amendment below). `apply()` skips the
+  mutation of an already-applied tokened command. Dedup is at APPLY,
   never at propose: the first copy may be committed-but-not-yet-applied,
   so a propose-time check against the table would race it; the duplicate
   entry still commits and occupies a log index. apply() stays a pure fold
@@ -710,15 +710,51 @@ Tested (112 total; 16 new, plus faults/jepsen reworks):
 Untested / known gaps (documented, not fixed):
 - The sessions table never expires entries: unbounded growth with the
   number of distinct clients (a per-node TTL would diverge replicas —
-  rejected by design). Stated assumption: one outstanding op per client,
-  seqs strictly increasing; a client running two concurrent ops can lose
-  the lower-seq one silently.
+  rejected by design).
 - No result caching: Put/Delete return unit, so a deduped retry can't
   report the original's result — fine today, a real gap if commands ever
   return values.
 - Dedup is exactly-once APPLICATION, not exactly-once log occupancy:
   duplicates still consume log indexes (and, in phase 14, snapshot
   work).
+
+### Phase 13 amendment — windowed dedup (post-checkpoint)
+
+The original table (client → highest applied seq, skip on `seq <= max`)
+made "one outstanding op per client" a silent-failure trap: a client
+pipelining two independent ops (the natural reading of the headers as
+per-op idempotency keys) could get the lower seq skipped as a
+"duplicate" yet still acked when the higher seq won the race to the log
+— a 201 for a write that never happened and never will, i.e. a
+linearizability violation reachable through the public API. Amended
+before phase 14 freezes `KvSnapshot`, so the sessions representation
+never needs an on-disk migration.
+
+Done: sessions became `client → SessionState { max_seq, recent: u64 }`
+— exact-match dedup over a sliding 64-seq window (`SESSION_WINDOW`).
+An op arriving after a higher seq still applies (concurrent same-client
+ops may linearize in either order); only a seq that exactly applied
+before — or fell below the window, sound under the ≤64-outstanding
+contract — is skipped. Still a pure fold of the log; wire and log
+formats untouched (only the in-memory/snapshot representation changed).
+
+Tested (114 total; red→green): tests/dedup.rs
+`pipelined_ops_from_one_client_both_apply_regardless_of_order` was
+written first and demonstrated the false ack (op acked Ok, key never
+appears) against the original table, then inverted: both pipelined
+writes apply on every node, genuine retries of either seq still skip.
+Store unit tests: `lower_seq_skips_the_mutation` INVERTED to
+`out_of_order_pipelined_op_applies` (including the seq-gap case);
+window-slide test (below-window retry still deduped, oldest in-window
+seq still applies). Full regression green with faults/jepsen unchanged
+— their retries reuse exact seqs monotonically, so the semantics change
+is invisible to them.
+
+Remaining contract (documented, enforced by construction not by
+rejection): seqs strictly increasing per client, at most 64 outstanding;
+a client exceeding the window can have a below-window op wrongly
+skipped-and-acked — the same failure class, now requiring >64 pipelined
+ops instead of 2.
 
 ## Project complete (phases 0-13)
 Remaining ideas beyond the original scope, in planned order:

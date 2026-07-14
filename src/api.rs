@@ -19,8 +19,10 @@
 //! `400`. With a token, retrying the byte-same request after a `504` is
 //! safe: the retry may commit a second log entry, but the state machine
 //! applies each (client, seq) at most once. Without them, writes keep the
-//! at-least-once semantics below, byte-identical to before. Sequs must be
-//! strictly increasing per client with one outstanding op at a time.
+//! at-least-once semantics below, byte-identical to before. Seqs must be
+//! strictly increasing per client, with at most
+//! [`crate::store::SESSION_WINDOW`] ops outstanding at a time (ops may be
+//! pipelined; dedup matches exact seqs over that sliding window).
 //!
 //! Non-leaders answer writes and linearizable reads with `307 Temporary
 //! Redirect` to the leader's client URL when it is known (the brief allows

@@ -4,16 +4,23 @@
 //! [`StateMachine`] impl); the HTTP layer only reads it directly.
 //!
 //! Dedup (phase 13): commands carrying a [`Session`] token are applied
-//! exactly once — a `sessions` table maps each client to its highest
-//! applied `seq`, and a command at or below that seq skips the mutation
-//! (the duplicate log entry still committed; only its application is a
-//! no-op). The table lives IN the state machine so it is rebuilt by log
-//! replay after a restart and will ride along in phase 14's snapshot
-//! ([`KvSnapshot`]). There is deliberately NO expiry: a per-node TTL would
-//! diverge replicas (apply must stay a pure fold of the log). The table
-//! therefore grows unboundedly with the number of distinct clients — a
-//! documented gap, under the stated assumption of one outstanding op per
-//! client. No results are cached (Put/Delete return unit).
+//! exactly once — a `sessions` table tracks, per client, which seqs have
+//! applied, and a command whose exact seq already applied skips the
+//! mutation (the duplicate log entry still committed; only its
+//! application is a no-op). Matching is EXACT over a sliding window of
+//! the most recent [`SESSION_WINDOW`] seqs, not `seq <= max`: a client
+//! may pipeline up to that many independent ops, and an op arriving
+//! after a higher-seq one still applies (concurrent ops from one client
+//! may linearize in either order — what must never happen is acking a
+//! write that was silently skipped). Below the window a seq is treated
+//! as a duplicate, which is only sound under the documented contract:
+//! at most [`SESSION_WINDOW`] outstanding ops per client, seqs strictly
+//! increasing. The table lives IN the state machine so it is rebuilt by
+//! log replay after a restart and will ride along in phase 14's snapshot
+//! ([`KvSnapshot`]). There is deliberately NO expiry: a per-node TTL
+//! would diverge replicas (apply must stay a pure fold of the log). The
+//! table therefore grows unboundedly with the number of distinct clients
+//! — a documented gap. No results are cached (Put/Delete return unit).
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -24,17 +31,65 @@ use serde_json::Value;
 use crate::raft::node::StateMachine;
 use crate::raft::types::{Command, LogEntry, Session};
 
+/// How many recent seqs per client the dedup window covers (the size of
+/// [`SessionState::recent`]): a client may have at most this many ops
+/// outstanding at once.
+pub const SESSION_WINDOW: u64 = 64;
+
+/// One client's dedup state: which of its last [`SESSION_WINDOW`] seqs
+/// have applied. Bit `i` of `recent` set means seq `max_seq - i` applied
+/// (bit 0 is `max_seq` itself); anything below the window is assumed
+/// already applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionState {
+    pub max_seq: u64,
+    pub recent: u64,
+}
+
+impl SessionState {
+    fn new(seq: u64) -> Self {
+        Self {
+            max_seq: seq,
+            recent: 1,
+        }
+    }
+
+    fn contains(&self, seq: u64) -> bool {
+        if seq > self.max_seq {
+            return false;
+        }
+        let offset = self.max_seq - seq;
+        // Below the window: assumed a duplicate (sound only under the
+        // <= SESSION_WINDOW outstanding-ops contract).
+        offset >= SESSION_WINDOW || self.recent & (1 << offset) != 0
+    }
+
+    fn record(&mut self, seq: u64) {
+        if seq > self.max_seq {
+            let shift = seq - self.max_seq;
+            self.recent = self
+                .recent
+                .checked_shl(u32::try_from(shift).unwrap_or(u32::MAX))
+                .unwrap_or(0)
+                | 1;
+            self.max_seq = seq;
+        } else if self.max_seq - seq < SESSION_WINDOW {
+            self.recent |= 1 << (self.max_seq - seq);
+        }
+    }
+}
+
 /// The full state a snapshot must capture (phase 14's payload, shaped now):
 /// the KV map AND the dedup sessions — forgetting the latter would resurrect
 /// skipped duplicates on a snapshot-restored node.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KvSnapshot {
     pub map: HashMap<String, Value>,
-    pub sessions: HashMap<u64, u64>,
+    pub sessions: HashMap<u64, SessionState>,
 }
 
 /// Thread-safe map of string keys to arbitrary JSON values, plus the dedup
-/// sessions table (client → highest applied seq).
+/// sessions table (client → applied-seq window).
 ///
 /// Uses std (not tokio) `RwLock`s: guards are never held across an `.await`,
 /// and the two locks are never held at the same time (apply touches them
@@ -42,7 +97,7 @@ pub struct KvSnapshot {
 #[derive(Debug, Default)]
 pub struct KvStore {
     map: RwLock<HashMap<String, Value>>,
-    sessions: RwLock<HashMap<u64, u64>>,
+    sessions: RwLock<HashMap<u64, SessionState>>,
 }
 
 impl KvStore {
@@ -95,9 +150,9 @@ impl KvStore {
         *self.sessions.write().expect("sessions lock poisoned") = snapshot.sessions;
     }
 
-    /// True if a tokened command was already applied: its seq is at or
-    /// below the client's highest applied one. Token-less commands are
-    /// never duplicates.
+    /// True if a tokened command was already applied: its exact seq is in
+    /// the client's applied window (or below it — see [`SessionState`]).
+    /// Token-less commands are never duplicates.
     fn already_applied(&self, session: Option<Session>) -> bool {
         let Some(Session { client, seq }) = session else {
             return false;
@@ -106,18 +161,18 @@ impl KvStore {
             .read()
             .expect("sessions lock poisoned")
             .get(&client)
-            .is_some_and(|&applied| seq <= applied)
+            .is_some_and(|state| state.contains(seq))
     }
 
-    /// Records a tokened command as applied. Only called after
-    /// [`Self::already_applied`] returned false, so a plain insert is a
-    /// max-update.
+    /// Records a tokened command's seq in the client's applied window.
     fn record_applied(&self, session: Option<Session>) {
         if let Some(Session { client, seq }) = session {
             self.sessions
                 .write()
                 .expect("sessions lock poisoned")
-                .insert(client, seq);
+                .entry(client)
+                .and_modify(|state| state.record(seq))
+                .or_insert_with(|| SessionState::new(seq));
         }
     }
 }
@@ -194,6 +249,10 @@ mod tests {
         }
     }
 
+    fn state(max_seq: u64, recent: u64) -> SessionState {
+        SessionState { max_seq, recent }
+    }
+
     #[test]
     fn duplicate_seq_skips_the_mutation() {
         let store = KvStore::new();
@@ -203,16 +262,37 @@ mod tests {
         apply(&store, 2, tokened_put("k", 2, 8, 1));
         apply(&store, 3, tokened_put("k", 1, 7, 1));
         assert_eq!(store.get("k"), Some(json!(2)));
-        assert_eq!(store.export().sessions, HashMap::from([(7, 1), (8, 1)]));
+        assert_eq!(
+            store.export().sessions,
+            HashMap::from([(7, state(1, 0b1)), (8, state(1, 0b1))])
+        );
     }
 
+    /// The inversion of the original `lower_seq_skips_the_mutation`: a
+    /// lower seq that never applied is a pipelined op that lost the race
+    /// to the log, not a duplicate — skipping-yet-acking it was the false
+    /// ack bug. It applies; only its exact retry is then skipped.
     #[test]
-    fn lower_seq_skips_the_mutation() {
+    fn out_of_order_pipelined_op_applies() {
         let store = KvStore::new();
-        apply(&store, 1, tokened_put("k", 3, 7, 3));
-        apply(&store, 2, tokened_put("k", 1, 7, 1));
-        assert_eq!(store.get("k"), Some(json!(3)));
-        assert_eq!(store.export().sessions, HashMap::from([(7, 3)]));
+        apply(&store, 1, tokened_put("b", 3, 7, 3));
+        apply(&store, 2, tokened_put("a", 1, 7, 1));
+        assert_eq!(store.get("a"), Some(json!(1)));
+        assert_eq!(
+            store.export().sessions,
+            HashMap::from([(7, state(3, 0b101))])
+        );
+        // Retries of both seqs are duplicates now; the gap (seq 2) is not.
+        apply(&store, 3, tokened_put("a", 99, 7, 1));
+        apply(&store, 4, tokened_put("b", 99, 7, 3));
+        assert_eq!(store.get("a"), Some(json!(1)));
+        assert_eq!(store.get("b"), Some(json!(3)));
+        apply(&store, 5, tokened_put("c", 2, 7, 2));
+        assert_eq!(store.get("c"), Some(json!(2)));
+        assert_eq!(
+            store.export().sessions,
+            HashMap::from([(7, state(3, 0b111))])
+        );
     }
 
     #[test]
@@ -221,7 +301,10 @@ mod tests {
         apply(&store, 1, tokened_put("k", 1, 7, 1));
         apply(&store, 2, tokened_put("k", 2, 7, 2));
         assert_eq!(store.get("k"), Some(json!(2)));
-        assert_eq!(store.export().sessions, HashMap::from([(7, 2)]));
+        assert_eq!(
+            store.export().sessions,
+            HashMap::from([(7, state(2, 0b11))])
+        );
     }
 
     #[test]
@@ -231,7 +314,32 @@ mod tests {
         // Same seq, different client: applies.
         apply(&store, 2, tokened_put("k", 2, 8, 5));
         assert_eq!(store.get("k"), Some(json!(2)));
-        assert_eq!(store.export().sessions, HashMap::from([(7, 5), (8, 5)]));
+        assert_eq!(
+            store.export().sessions,
+            HashMap::from([(7, state(5, 0b1)), (8, state(5, 0b1))])
+        );
+    }
+
+    /// The window slides: seqs that fall more than SESSION_WINDOW behind
+    /// the max are assumed duplicates (the <= 64-outstanding contract), so
+    /// dedup keeps working for arbitrarily old retries.
+    #[test]
+    fn below_window_seqs_are_assumed_duplicates() {
+        let store = KvStore::new();
+        apply(&store, 1, tokened_put("k", 1, 7, 1));
+        // Jump far ahead: the window slides past seq 1 entirely.
+        apply(&store, 2, tokened_put("k", 2, 7, 1 + SESSION_WINDOW));
+        assert_eq!(
+            store.export().sessions,
+            HashMap::from([(7, state(1 + SESSION_WINDOW, 0b1))])
+        );
+        // A retry of seq 1 (offset 64, below the window) is still skipped...
+        apply(&store, 3, tokened_put("k", 99, 7, 1));
+        assert_eq!(store.get("k"), Some(json!(2)));
+        // ...while the oldest seq INSIDE the window (offset 63), never
+        // applied, still applies.
+        apply(&store, 4, tokened_put("k", 3, 7, 2));
+        assert_eq!(store.get("k"), Some(json!(3)));
     }
 
     #[test]

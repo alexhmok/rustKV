@@ -34,6 +34,7 @@ use std::collections::HashMap;
 
 use common::*;
 use rustkv::raft::types::{Command, NodeId, Session};
+use rustkv::store::SessionState;
 use serde_json::json;
 
 /// Waits until all nodes report the same last index, fully committed.
@@ -147,7 +148,13 @@ async fn tokened_retry_commits_twice_but_applies_once() {
         put_with_token("k", 1, 1, 1),
     )
     .await;
-    let expected_sessions = HashMap::from([(1u64, 1u64)]);
+    let expected_sessions = HashMap::from([(
+        1u64,
+        SessionState {
+            max_seq: 1,
+            recent: 0b1,
+        },
+    )]);
     for id in cluster.all_ids() {
         assert_eq!(
             cluster.store(id).get("k"),
@@ -195,4 +202,67 @@ async fn tokened_retry_commits_twice_but_applies_once() {
         same_token_entries, 2,
         "both the ambiguous original and the retry must occupy log indexes"
     );
+}
+
+/// A client that pipelines two INDEPENDENT ops with their own seqs (the
+/// natural reading of the token headers as per-op idempotency keys) must
+/// not lose one to arrival order. With the original client→max-seq table
+/// this was a silent linearizability violation: if seq 6 applied first,
+/// seq 5 was skipped as a "duplicate" yet still acked — a 201 for a write
+/// that never happened and never will. The windowed exact-match table
+/// applies both (concurrent ops from one client may linearize in either
+/// order); only a true retry of an already-applied seq is skipped.
+#[tokio::test(start_paused = true)]
+async fn pipelined_ops_from_one_client_both_apply_regardless_of_order() {
+    let cluster = spawn_cluster(3, 83, low_loss_faults());
+    let leader = cluster.wait_for_leader().await;
+
+    // Log order 6-then-5, forced by awaiting the first commit — the
+    // arrival order a pipelining client cannot control.
+    let p6 = cluster
+        .handle(leader.id)
+        .propose(put_with_token("b", 6, 9, 6))
+        .await
+        .unwrap();
+    assert_eq!(p6.committed.await, Ok(true));
+    let p5 = cluster
+        .handle(leader.id)
+        .propose(put_with_token("a", 5, 9, 5))
+        .await
+        .unwrap();
+    assert_eq!(p5.committed.await, Ok(true), "op 5 is positively acked");
+
+    // The ack must be honest: both writes really applied.
+    wait_until("both pipelined writes apply everywhere", || {
+        cluster.all_ids().iter().all(|&id| {
+            cluster.store(id).get("a") == Some(json!(5))
+                && cluster.store(id).get("b") == Some(json!(6))
+        })
+    })
+    .await;
+
+    // And dedup still works for genuine retries of either seq.
+    let retry = cluster
+        .handle(leader.id)
+        .propose(put_with_token("a", 99, 9, 5))
+        .await
+        .unwrap();
+    assert_eq!(retry.committed.await, Ok(true));
+    let p7 = cluster
+        .handle(leader.id)
+        .propose(put_with_token("c", 7, 9, 7))
+        .await
+        .unwrap();
+    assert_eq!(p7.committed.await, Ok(true));
+    wait_until("post-retry write applies", || {
+        cluster.store(leader.id).get("c") == Some(json!(7))
+    })
+    .await;
+    assert_eq!(
+        cluster.store(leader.id).get("a"),
+        Some(json!(5)),
+        "the retried seq 5 must be skipped, not re-applied"
+    );
+
+    cluster.shutdown();
 }
