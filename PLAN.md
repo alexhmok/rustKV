@@ -267,8 +267,9 @@ Tested:
   (doomed truncated, partition-era write everywhere); `docker restart` persistence.
 
 Untested / known gaps:
-- Docker verification was manual (this machine, daemon 24.0.5) — not automated in
-  `make test`; a scripted compose partition test would need the daemon in CI.
+- Docker verification was manual (this machine, daemon 24.0.5) — scripted in
+  phase 17 as `make partition-test`; still outside `make test`/CI (needs the
+  daemon).
 - Compose healing requires re-adding the `--alias nodeN-raft` (documented in README);
   omitting it leaves the node unresolvable by peers.
 - No TLS/auth on the raft port and no connection pooling (out of scope; TODOs —
@@ -1415,10 +1416,77 @@ phase-15 cluster_http flake note above (within-binary, not cross-binary).
   touch only the pool. No other nesting exists, so no ordering inversion
   is possible — keep it that way if another lock ever appears.
 
-## Project complete (phases 0-16)
-Remaining ideas beyond the original scope: scripted Docker partition
-test. (TLS on the raft port: dropped — blocked on the dependency
-whitelist. Connection pooling graduated in phase 16.)
+## Phase 17 — scripted Docker compose partition test ✅
+
+Done:
+- `scripts/partition-test.sh`: automates the README's manual partition
+  walkthrough end-to-end against the compose cluster. bash + curl only
+  (no jq — `/cluster/status` is fixed-shape, parsed with grep/cut);
+  `set -euo pipefail`; `trap` cleanup running `docker compose down -v`;
+  every assertion a bounded retry loop over real time (30-90s deadlines,
+  no bare sleeps as synchronization) that dumps the failing node's
+  `docker compose logs` before exiting nonzero. Refuses to start if
+  rustkv containers are already running, so cleanup's `down -v` can
+  never destroy a cluster brought up on purpose.
+- Scenario: up --build → find the leader via `/cluster/status` → baseline
+  PUT through node1 with `curl -L` (follows the 307 preserving method) +
+  linearizable GET on all three → `docker network disconnect rustkv-raft`
+  on the leader (raft net only; client port stays reachable) → isolated
+  node: PUT and default GET fail 503-or-504 (either is correct — 504
+  while it still thinks it leads and write_timeout expires, 503 after
+  CheckQuorum deposes it and clears leader_id; which you get is a race),
+  `?stale=true` GET still 200 with the old value → survivors elect (poll
+  role == "Leader" on the other two) and a new PUT commits → heal with
+  `docker network connect --alias node<N>-raft` (the alias is required —
+  without it peers cannot resolve the node) → convergence: old leader no
+  longer Leader, equal commit_index on all three, both read modes on all
+  nodes see the new value, and the doomed isolated write reads 404.
+- `make partition-test`; README section describing it. Deliberately NOT
+  wired into `cargo test` (needs the Docker daemon); the deterministic
+  equivalents of these assertions live in the sim/jepsen suites.
+- No Rust changes (script + Makefile + docs only). README doc-drift fixed
+  while it was open: the CP-semantics bullet still claimed reads are
+  served locally / linearizable reads out of scope (stale since phase 9),
+  the status paragraph likewise (and said "phases 0-8"); `/cluster/status`
+  added to the HTTP API table (the script depends on it); "membership is
+  fixed" updated for phase 15; stale test count dropped.
+
+Tested:
+- `make lint` green; full `cargo test` green — 170 tests, unchanged, as
+  expected with no Rust edits (one within-binary cluster_http flake on
+  the first suite run, the documented phase-15/16 one; clean on rerun).
+- Script ran clean 3 consecutive times (this machine, daemon 24.0.5),
+  volumes wiped between runs so each run re-forms the cluster from
+  scratch. Both 503 and 504 arms of the isolated-node race are accepted;
+  runs are free to differ in which they hit.
+- First real-network exercise of the phase-16 pooling recovery paths:
+  during the partition the old leader's pooled peer connections go
+  half-open (docker disconnect sends no RST) and each raft RPC burns the
+  full 150ms rpc_timeout — expected, per the phase-16 concern review, and
+  visible in the logs as quiet per-RPC timeouts, not a hang. On heal the
+  node can come back with a new container IP; pool keys are hostnames
+  (nodeN-raft:9080), so survivors' stale pooled conns die on first use
+  and recover via one fresh-connection retry each.
+
+Untested / known gaps:
+- Single scenario only: leader partitioned, one partition per run. No
+  follower-partition variant, no asymmetric/split-brain schedules, no
+  restart-under-partition, no double partition — those live (deterministically)
+  in the sim and jepsen suites; the script's job is the real-network
+  end-to-end path, not coverage.
+- Not wired into CI (needs the Docker daemon on the runner) — optional
+  follow-up if CI ever gets one.
+- Real-time bounded polling, not determinism: a pathologically slow
+  machine could exceed a deadline and fail spuriously (deadlines are
+  generous — 30-90s per assertion — and the failure dumps logs, so a
+  timing miss is distinguishable from a correctness miss).
+- The 503-vs-504 race means the script never pins WHICH rejection the
+  isolated node serves, only that it is one of the two.
+
+## Project complete (phases 0-17)
+Remaining ideas beyond the original scope: none — the scripted Docker
+partition test shipped in phase 17. (TLS on the raft port: dropped —
+blocked on the dependency whitelist.)
 
 ## Out of scope (deliberate)
 Joint-consensus (multi-server) membership changes and a snapshot

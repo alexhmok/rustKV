@@ -1,6 +1,6 @@
 # Task runner for rustkv. GNU Make (ships with macOS; `just` is not assumed installed).
 
-.PHONY: build test fmt lint run clean
+.PHONY: build test fmt lint run cluster compose-up compose-down partition-test clean
 
 build:
 	cargo build
@@ -32,6 +32,12 @@ compose-up:
 
 compose-down:
 	docker compose down
+
+# Scripted end-to-end partition test against the compose cluster (phase 17).
+# Requires the Docker daemon; wipes the compose volumes; refuses to run if
+# rustkv containers are already up. Not part of `cargo test`.
+partition-test:
+	./scripts/partition-test.sh
 
 clean:
 	cargo clean
