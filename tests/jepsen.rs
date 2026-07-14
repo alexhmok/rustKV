@@ -168,6 +168,100 @@ fn checker_rejects_invalid_histories() {
     assert!(check_linearizable(&h).is_err());
 }
 
+// ---- T2 checker sensitivity: the white-box log witness must also have
+// teeth. `check_write_witness` is the linearization claim for writes (the
+// committed log IS the order), so each way an acknowledged write can be
+// betrayed by the log — missing, replaced, rewritten, out of real-time
+// order — must be REJECTED when fed to it directly. ----
+
+/// An Ok write claiming (term, index) in the log — witness-probe input.
+fn confirmed_put(
+    process: u64,
+    key: &str,
+    value: u64,
+    term: u64,
+    index: u64,
+    invoked_us: u64,
+    returned_us: u64,
+) -> Recorded {
+    Recorded {
+        process,
+        key: key.to_string(),
+        op: OpKind::Write {
+            kind: WriteKind::Put(value),
+            outcome: WriteOutcome::Ok,
+            log_pos: Some((term, index)),
+        },
+        invoked_us,
+        returned_us,
+    }
+}
+
+fn log_put(term: u64, index: u64, key: &str, value: u64) -> LogEntry {
+    LogEntry {
+        term,
+        index,
+        command: put(key, value),
+    }
+}
+
+/// Positive control: a faithful log passes, so the rejections below mean
+/// something.
+#[test]
+fn witness_accepts_a_faithful_log() {
+    let history = vec![
+        confirmed_put(0, "a", 1, 1, 1, 0, 10),
+        confirmed_put(1, "b", 2, 1, 2, 20, 30),
+    ];
+    let log = vec![log_put(1, 1, "a", 1), log_put(1, 2, "b", 2)];
+    check_write_witness(&history, &log).unwrap();
+}
+
+/// A lost acknowledged write: confirmed at index 2, but the log ends at 1.
+#[test]
+#[should_panic(expected = "missing from log")]
+fn witness_rejects_a_confirmed_write_missing_from_the_log() {
+    let history = vec![confirmed_put(0, "a", 1, 1, 2, 0, 10)];
+    let log = vec![log_put(1, 1, "a", 1)];
+    let _ = check_write_witness(&history, &log);
+}
+
+/// A replaced acknowledged write: the index survived but under a different
+/// term — some other leader's entry sits where the confirmed write was.
+#[test]
+#[should_panic(expected = "confirmed write replaced")]
+fn witness_rejects_a_confirmed_write_replaced_by_another_term() {
+    let history = vec![confirmed_put(0, "a", 1, 1, 1, 0, 10)];
+    let log = vec![log_put(2, 1, "a", 1)];
+    let _ = check_write_witness(&history, &log);
+}
+
+/// A rewritten acknowledged write: right (term, index), wrong command.
+#[test]
+#[should_panic(expected = "wrong command")]
+fn witness_rejects_a_confirmed_write_with_the_wrong_command() {
+    let history = vec![confirmed_put(0, "a", 1, 1, 1, 0, 10)];
+    let log = vec![log_put(1, 1, "a", 99)];
+    let _ = check_write_witness(&history, &log);
+}
+
+/// A real-time inversion: write A returned before write B was even invoked,
+/// yet A sits AFTER B in the log — the linearization contradicts real time
+/// even though both entries are present and intact.
+#[test]
+fn witness_rejects_a_log_order_that_violates_real_time() {
+    let history = vec![
+        confirmed_put(0, "a", 1, 1, 2, 0, 10),
+        confirmed_put(1, "b", 2, 1, 1, 20, 30),
+    ];
+    let log = vec![log_put(1, 1, "b", 2), log_put(1, 2, "a", 1)];
+    let reason = check_write_witness(&history, &log).unwrap_err();
+    assert!(
+        reason.contains("log order violates real time"),
+        "unexpected reason: {reason}"
+    );
+}
+
 // ---- the workload driver ----
 
 const KEYS: [&str; 3] = ["a", "b", "c"];
@@ -224,7 +318,13 @@ async fn run_workload(
     writes: WriteMode,
     duplicate_probability: f64,
     snapshot_threshold: Option<u64>,
-) -> (Vec<Recorded>, Vec<Vec<LogEntry>>, u64, u64) {
+) -> (
+    Vec<Recorded>,
+    Vec<Vec<LogEntry>>,
+    u64,
+    u64,
+    rustkv::raft::transport::sim::FaultStats,
+) {
     let faults = rustkv::raft::transport::sim::FaultConfig {
         min_delay: ms(1),
         max_delay: ms(15),
@@ -235,7 +335,7 @@ async fn run_workload(
     let cluster = Arc::new(spawn_cluster_with_threshold(
         3,
         seed,
-        faults,
+        faults.clone(),
         snapshot_threshold,
     ));
     let start = Instant::now();
@@ -538,6 +638,10 @@ async fn run_workload(
         });
     }
 
+    // Vacuity (T2): the loss/duplication this workload scheduled must have
+    // actually occurred, or the run proved nothing about surviving it.
+    let stats = assert_scheduled_faults_fired(&cluster, &faults, &format!("seed {seed}"));
+
     cluster.shutdown();
     tokio::time::sleep(ms(100)).await;
     let logs = cluster
@@ -545,7 +649,7 @@ async fn run_workload(
         .into_iter()
         .map(|id| cluster.disk_log(id))
         .collect();
-    (history, logs, crashes, retried_acks)
+    (history, logs, crashes, retried_acks, stats)
 }
 
 // ---- checked claims ----
@@ -608,7 +712,7 @@ fn check_write_witness(history: &[Recorded], log: &[LogEntry]) -> Result<(), Str
 #[tokio::test(start_paused = true)]
 async fn confirmed_writes_are_linearizable_via_the_log_witness() {
     for seed in 0..6 {
-        let (history, logs, _, _) =
+        let (history, logs, _, _, _) =
             run_workload(seed, ReadMode::Stale, WriteMode::FireOnce, 0.0, None).await;
         for log in &logs[1..] {
             assert_eq!(*log, logs[0], "seed {seed}: logs diverge");
@@ -623,9 +727,9 @@ async fn confirmed_writes_are_linearizable_via_the_log_witness() {
 async fn same_seed_reproduces_the_same_history() {
     // With duplication on, so the determinism claim covers the full phase-10
     // fault mix: partitions, crashes/restarts, and duplicated messages.
-    let (history_a, logs_a, crashes, _) =
+    let (history_a, logs_a, crashes, _, stats_a) =
         run_workload(3, ReadMode::Linearizable, WriteMode::TokenRetry, 0.10, None).await;
-    let (history_b, logs_b, _, _) =
+    let (history_b, logs_b, _, _, stats_b) =
         run_workload(3, ReadMode::Linearizable, WriteMode::TokenRetry, 0.10, None).await;
     assert!(crashes > 0, "seed 3 must exercise a crash round");
     let refs_a: Vec<&Recorded> = history_a.iter().collect();
@@ -636,6 +740,89 @@ async fn same_seed_reproduces_the_same_history() {
         "histories must be identical"
     );
     assert_eq!(logs_a, logs_b);
+    assert_eq!(
+        stats_a, stats_b,
+        "fault-event counts must be identical too — a diverging count means \
+         nondeterminism the history comparison happened not to see"
+    );
+}
+
+/// T2 determinism audit: the strongest workload configuration — duplication
+/// AND snapshots together — never had a repeated-run determinism check
+/// (compaction adds disk truncation, snapshot capture and InstallSnapshot
+/// to the replayed surface). Same seed must reproduce the identical
+/// history, retained logs, and fault-event counts, byte for byte.
+#[tokio::test(start_paused = true)]
+async fn same_seed_reproduces_the_same_history_with_snapshots_on() {
+    for seed in 0..2 {
+        let (history_a, logs_a, _, _, stats_a) = run_workload(
+            seed,
+            ReadMode::Linearizable,
+            WriteMode::TokenRetry,
+            0.10,
+            Some(16),
+        )
+        .await;
+        let (history_b, logs_b, _, _, stats_b) = run_workload(
+            seed,
+            ReadMode::Linearizable,
+            WriteMode::TokenRetry,
+            0.10,
+            Some(16),
+        )
+        .await;
+        let refs_a: Vec<&Recorded> = history_a.iter().collect();
+        let refs_b: Vec<&Recorded> = history_b.iter().collect();
+        assert_eq!(
+            render(&refs_a),
+            render(&refs_b),
+            "seed {seed}: histories diverge"
+        );
+        assert_eq!(logs_a, logs_b, "seed {seed}: retained logs diverge");
+        assert_eq!(stats_a, stats_b, "seed {seed}: fault counts diverge");
+    }
+}
+
+/// Extended determinism soak, excluded from the default run (wired into
+/// `make soak` via the extended_soak name filter): every seed is run TWICE
+/// under duplication + snapshots and the recorded history must reproduce
+/// byte-identically — the wide-N hunt for HashMap iteration order, real
+/// time leaking into paused time, or unseeded randomness in the workload
+/// and history-recording path itself.
+#[tokio::test(start_paused = true)]
+#[ignore = "extended soak; run explicitly with --ignored"]
+async fn extended_soak_same_seed_history_determinism() {
+    let seeds: u64 = std::env::var("RUSTKV_SOAK_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24);
+    for seed in 0..seeds {
+        let (history_a, logs_a, _, _, stats_a) = run_workload(
+            seed,
+            ReadMode::Linearizable,
+            WriteMode::TokenRetry,
+            0.10,
+            Some(16),
+        )
+        .await;
+        let (history_b, logs_b, _, _, stats_b) = run_workload(
+            seed,
+            ReadMode::Linearizable,
+            WriteMode::TokenRetry,
+            0.10,
+            Some(16),
+        )
+        .await;
+        let refs_a: Vec<&Recorded> = history_a.iter().collect();
+        let refs_b: Vec<&Recorded> = history_b.iter().collect();
+        assert_eq!(
+            render(&refs_a),
+            render(&refs_b),
+            "seed {seed}: histories diverge"
+        );
+        assert_eq!(logs_a, logs_b, "seed {seed}: retained logs diverge");
+        assert_eq!(stats_a, stats_b, "seed {seed}: fault counts diverge");
+    }
 }
 
 /// Full histories with local (any-node) reads: the checker runs for real,
@@ -648,7 +835,7 @@ async fn same_seed_reproduces_the_same_history() {
 async fn local_reads_expose_documented_staleness_under_partitions() {
     let mut violations = Vec::new();
     for seed in 0..6 {
-        let (history, _, _, _) =
+        let (history, _, _, _, _) =
             run_workload(seed, ReadMode::Stale, WriteMode::FireOnce, 0.0, None).await;
         if let Err(reason) = check_linearizable(&history) {
             violations.push((seed, reason));
@@ -676,8 +863,10 @@ async fn local_reads_expose_documented_staleness_under_partitions() {
 async fn linearizable_reads_pass_the_checker() {
     let mut total_crashes = 0;
     let mut total_retried_acks = 0;
+    let mut total_reorders = 0;
+    let mut total_blocked = 0;
     for seed in 0..6 {
-        let (history, _, crashes, retried_acks) = run_workload(
+        let (history, _, crashes, retried_acks, stats) = run_workload(
             seed,
             ReadMode::Linearizable,
             WriteMode::TokenRetry,
@@ -687,6 +876,8 @@ async fn linearizable_reads_pass_the_checker() {
         .await;
         total_crashes += crashes;
         total_retried_acks += retried_acks;
+        total_reorders += stats.reorders;
+        total_blocked += stats.legs_blocked;
         let reads = history
             .iter()
             .filter(|r| matches!(r.op, OpKind::Read { .. }))
@@ -727,6 +918,11 @@ async fn linearizable_reads_pass_the_checker() {
         "no seed exercised an ambiguous-then-acked retry — the dedup claim \
          was never actually stressed"
     );
+    // Cross-set vacuity (T2): the linearizability claim is made under
+    // reordering and partitions — both must actually have occurred
+    // somewhere in the seed set.
+    assert!(total_reorders > 0, "no seed ever reordered a message");
+    assert!(total_blocked > 0, "no partition ever suppressed a message");
 }
 
 /// Phase 14: the identical linearizable workload with an aggressively low
@@ -740,7 +936,7 @@ async fn linearizable_reads_pass_the_checker() {
 async fn linearizable_reads_pass_the_checker_with_snapshots_on() {
     let mut total_crashes = 0;
     for seed in 0..6 {
-        let (history, logs, crashes, _) = run_workload(
+        let (history, logs, crashes, _, _) = run_workload(
             seed,
             ReadMode::Linearizable,
             WriteMode::TokenRetry,
@@ -771,7 +967,7 @@ async fn linearizable_reads_pass_the_checker_with_snapshots_on() {
 async fn linearizable_reads_survive_message_duplication() {
     let mut total_crashes = 0;
     for seed in 0..6 {
-        let (history, logs, crashes, _) = run_workload(
+        let (history, logs, crashes, _, _) = run_workload(
             seed,
             ReadMode::Linearizable,
             WriteMode::TokenRetry,
@@ -808,7 +1004,7 @@ async fn extended_soak_linearizable_under_duplication_and_snapshots() {
     let mut total_crashes = 0;
     let mut seeds_with_compaction = 0u64;
     for seed in 0..seeds {
-        let (history, logs, crashes, _) = run_workload(
+        let (history, logs, crashes, _, _) = run_workload(
             seed,
             ReadMode::Linearizable,
             WriteMode::TokenRetry,

@@ -146,7 +146,7 @@ async fn single_node_restarts_from_its_own_snapshot() {
 async fn run_install_snapshot_catch_up(seed: u64, duplicate_probability: f64) {
     let mut faults = low_loss_faults();
     faults.duplicate_probability = duplicate_probability;
-    let cluster = spawn_cluster_with_threshold(3, seed, faults, Some(8));
+    let cluster = spawn_cluster_with_threshold(3, seed, faults.clone(), Some(8));
     let all = cluster.all_ids();
 
     let leader = cluster.wait_for_leader().await;
@@ -175,6 +175,9 @@ async fn run_install_snapshot_catch_up(seed: u64, duplicate_probability: f64) {
         );
     }
 
+    // Vacuity (T2): when the duplication variant runs, duplicates must
+    // actually have been delivered.
+    assert_scheduled_faults_fired(&cluster, &faults, &format!("seed {seed}"));
     cluster.shutdown();
     tokio::time::sleep(ms(100)).await;
     // Construction guard: the survivors really compacted past the victim's

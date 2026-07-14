@@ -83,6 +83,31 @@ impl Default for FaultConfig {
     }
 }
 
+/// Counters of fault events that actually OCCURRED on this network, for
+/// test vacuity guards (testing-regime T2): a test that schedules a fault
+/// must be able to assert the fault really fired — a checker guarding a
+/// fault that never happens is indistinguishable from one that works.
+/// Pure observation: maintaining these consumes no RNG draws and adds no
+/// delays, so pinned seeded schedules are unaffected.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FaultStats {
+    /// Primary sends that entered the network (one per [`Transport::send`]).
+    pub sends: u64,
+    /// Request legs lost to the drop dice (a leg both blocked and dropped
+    /// counts as blocked — the block is what suppressed it).
+    pub requests_dropped: u64,
+    /// Reply legs lost to the drop dice (same tie-break as requests).
+    pub replies_dropped: u64,
+    /// Legs (either direction) suppressed by a blocked link.
+    pub legs_blocked: u64,
+    /// Duplicate request copies actually delivered into an inbox.
+    pub duplicates_delivered: u64,
+    /// Primary requests delivered before an earlier-sent primary request on
+    /// the same directed link (the emergent reordering the module docs
+    /// describe, observed rather than assumed).
+    pub reorders: u64,
+}
+
 struct State {
     rng: SplitMix64,
     config: FaultConfig,
@@ -96,6 +121,13 @@ struct State {
     entries_seen: HashMap<(Term, LogIndex), Command>,
     /// Safety violations observed on the send path.
     violations: Vec<String>,
+    /// Fault-event counters (see [`FaultStats`]).
+    stats: FaultStats,
+    /// Per directed link: sequence number for the next primary send, and the
+    /// highest sequence delivered so far — a delivery below the high-water
+    /// mark overtook an earlier send (a reorder).
+    link_send_seq: HashMap<(NodeId, NodeId), u64>,
+    link_delivered_seq: HashMap<(NodeId, NodeId), u64>,
 }
 
 /// The shared fabric. Cheap to clone; all clones drive the same network.
@@ -115,6 +147,9 @@ impl SimNetwork {
                 leaders_per_term: HashMap::new(),
                 entries_seen: HashMap::new(),
                 violations: Vec::new(),
+                stats: FaultStats::default(),
+                link_send_seq: HashMap::new(),
+                link_delivered_seq: HashMap::new(),
             })),
         }
     }
@@ -167,6 +202,13 @@ impl SimNetwork {
         self.lock().violations.clone()
     }
 
+    /// Fault events that actually occurred so far (vacuity guards). On the
+    /// paused-time current-thread runtime the counters are as deterministic
+    /// as everything else — a pinned schedule pins its stats too.
+    pub fn fault_stats(&self) -> FaultStats {
+        self.lock().stats
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().expect("sim network lock poisoned")
     }
@@ -190,6 +232,8 @@ struct SendPlan {
     req_duplicated: bool,
     dup_delay: Duration,
     rpc_timeout: Duration,
+    /// Per-link send sequence of this primary request, for reorder counting.
+    seq: u64,
 }
 
 impl Transport for SimTransport {
@@ -199,6 +243,12 @@ impl Transport for SimTransport {
             let mut st = self.state.lock().expect("sim network lock poisoned");
             inspect_append_entries(&mut st, &req);
             let cfg = st.config.clone();
+            st.stats.sends += 1;
+            let seq = {
+                let counter = st.link_send_seq.entry((from, to)).or_insert(0);
+                *counter += 1;
+                *counter
+            };
             // Determinism contract: a fixed number of draws per send, all in
             // this critical section — the duplication draws are unconditional
             // even when duplicate_probability is 0.
@@ -212,6 +262,7 @@ impl Transport for SimTransport {
                 req_duplicated: st.rng.next_bool(cfg.duplicate_probability),
                 dup_delay: draw_delay(&mut st.rng, &cfg),
                 rpc_timeout: cfg.rpc_timeout,
+                seq,
             }
         };
         let Some(target) = plan.target else {
@@ -226,6 +277,7 @@ impl Transport for SimTransport {
             let dup_target = target.clone();
             let dup_req = req.clone();
             let dup_delay = plan.dup_delay;
+            let dup_state = Arc::clone(&self.state);
             tokio::spawn(async move {
                 tokio::time::sleep(dup_delay).await;
                 let (reply_tx, _discarded) = oneshot::channel();
@@ -237,6 +289,8 @@ impl Transport for SimTransport {
                     })
                     .is_ok()
                 {
+                    let mut st = dup_state.lock().expect("sim network lock poisoned");
+                    st.stats.duplicates_delivered += 1;
                     tracing::trace!(from, to, "sim: duplicate request delivered");
                 }
             });
@@ -246,6 +300,14 @@ impl Transport for SimTransport {
         let exchange = async move {
             tokio::time::sleep(plan.req_delay).await;
             if plan.req_blocked || plan.req_dropped {
+                {
+                    let mut st = state.lock().expect("sim network lock poisoned");
+                    if plan.req_blocked {
+                        st.stats.legs_blocked += 1;
+                    } else {
+                        st.stats.requests_dropped += 1;
+                    }
+                }
                 tracing::trace!(from, to, "sim: request leg dropped");
                 return std::future::pending::<RpcResponse>().await;
             }
@@ -262,6 +324,17 @@ impl Transport for SimTransport {
                 tracing::trace!(from, to, "sim: peer inbox closed");
                 return std::future::pending::<RpcResponse>().await;
             }
+            {
+                // Delivered: a primary request landing below the link's
+                // high-water sequence overtook an earlier send (reorder).
+                let mut st = state.lock().expect("sim network lock poisoned");
+                let delivered = st.link_delivered_seq.entry((from, to)).or_insert(0);
+                if plan.seq < *delivered {
+                    st.stats.reorders += 1;
+                } else {
+                    *delivered = plan.seq;
+                }
+            }
             let Ok(resp) = reply_rx.await else {
                 // Node dropped the reply sender (crashed mid-handling).
                 tracing::trace!(from, to, "sim: peer dropped reply");
@@ -273,6 +346,14 @@ impl Transport for SimTransport {
                 st.blocked.contains(&(to, from))
             };
             if plan.resp_dropped || reply_blocked {
+                {
+                    let mut st = state.lock().expect("sim network lock poisoned");
+                    if reply_blocked {
+                        st.stats.legs_blocked += 1;
+                    } else {
+                        st.stats.replies_dropped += 1;
+                    }
+                }
                 tracing::trace!(from, to, "sim: reply leg dropped");
                 return std::future::pending::<RpcResponse>().await;
             }
@@ -587,8 +668,9 @@ mod tests {
     }
 
     /// Arrival order at the receiver of two messages sent concurrently in a
-    /// fixed order (terms 1 then 2).
-    async fn arrival_order(seed: u64) -> Vec<Term> {
+    /// fixed order (terms 1 then 2), plus the network's fault stats — the
+    /// reorder counter must agree with the observed order.
+    async fn arrival_order_with_stats(seed: u64) -> (Vec<Term>, FaultStats) {
         let cfg = FaultConfig {
             min_delay: ms(1),
             max_delay: ms(20),
@@ -620,7 +702,11 @@ mod tests {
         }
         h1.await.unwrap().unwrap();
         h2.await.unwrap().unwrap();
-        order
+        (order, net.fault_stats())
+    }
+
+    async fn arrival_order(seed: u64) -> Vec<Term> {
+        arrival_order_with_stats(seed).await.0
     }
 
     #[tokio::test(start_paused = true)]
@@ -936,5 +1022,153 @@ mod tests {
             reordering_seed.expect("some seed in 0..64 must reorder two concurrent messages");
         // And the reordering is reproducible, not a fluke of scheduling.
         assert_eq!(arrival_order(seed).await, [2, 1]);
+    }
+
+    // ---- fault stats (testing-regime T2): the vacuity counters must count
+    // exactly the events that occurred — no phantom events, no missed ones,
+    // and reading them must not perturb pinned schedules. ----
+
+    /// The reorder counter must agree with directly observed arrival order,
+    /// in both directions: zero on an in-order seed, nonzero (and exact) on
+    /// a reordering one.
+    #[tokio::test(start_paused = true)]
+    async fn reorder_counter_matches_observed_arrival_order() {
+        let mut saw_in_order = false;
+        let mut saw_reordered = false;
+        for seed in 0..64 {
+            let (order, stats) = arrival_order_with_stats(seed).await;
+            assert_eq!(stats.sends, 2);
+            match order[..] {
+                [1, 2] => {
+                    assert_eq!(stats.reorders, 0, "seed {seed}: phantom reorder");
+                    saw_in_order = true;
+                }
+                [2, 1] => {
+                    assert_eq!(stats.reorders, 1, "seed {seed}: missed reorder");
+                    saw_reordered = true;
+                }
+                _ => unreachable!(),
+            }
+            if saw_in_order && saw_reordered {
+                return;
+            }
+        }
+        panic!("seeds 0..64 must exercise both orderings");
+    }
+
+    /// Certain drops count exactly; a faultless exchange counts nothing.
+    #[tokio::test(start_paused = true)]
+    async fn drop_counters_count_exactly_the_dropped_legs() {
+        // drop_probability 1.0: the one request leg is dropped, nothing else.
+        let net = SimNetwork::new(
+            7,
+            FaultConfig {
+                drop_probability: 1.0,
+                ..fixed_delay_config(ms(5))
+            },
+        );
+        let (t1, _rx1) = net.register(1);
+        let (_t2, rx2) = net.register(2);
+        spawn_echo(rx2);
+        assert_eq!(t1.send(2, vote_req(1)).await, Err(TransportError::Timeout));
+        let stats = net.fault_stats();
+        assert_eq!(
+            (stats.sends, stats.requests_dropped, stats.replies_dropped),
+            (1, 1, 0)
+        );
+        assert_eq!((stats.duplicates_delivered, stats.legs_blocked), (0, 0));
+
+        // No faults at all: only the send counts.
+        let net = SimNetwork::new(7, fixed_delay_config(ms(5)));
+        let (t1, _rx1) = net.register(1);
+        let (_t2, rx2) = net.register(2);
+        spawn_echo(rx2);
+        t1.send(2, vote_req(1)).await.unwrap();
+        assert_eq!(
+            net.fault_stats(),
+            FaultStats {
+                sends: 1,
+                ..FaultStats::default()
+            }
+        );
+    }
+
+    /// A blocked link counts as blocked (not dropped), and a duplicate
+    /// delivery counts once.
+    #[tokio::test(start_paused = true)]
+    async fn blocked_and_duplicate_events_are_counted() {
+        let net = SimNetwork::new(3, fixed_delay_config(ms(1)));
+        let (t1, _rx1) = net.register(1);
+        let (_t2, rx2) = net.register(2);
+        spawn_echo(rx2);
+        net.set_pair_blocked(1, 2, true);
+        assert_eq!(t1.send(2, vote_req(1)).await, Err(TransportError::Timeout));
+        let stats = net.fault_stats();
+        assert_eq!(stats.legs_blocked, 1, "one suppressed request leg");
+        assert_eq!(stats.requests_dropped, 0, "blocked is not dropped");
+
+        let net = SimNetwork::new(
+            11,
+            FaultConfig {
+                duplicate_probability: 1.0,
+                ..fixed_delay_config(ms(2))
+            },
+        );
+        let (t1, _rx1) = net.register(1);
+        let (_t2, mut rx2) = net.register(2);
+        let sender = tokio::spawn(async move { t1.send(2, vote_req(7)).await });
+        for _ in 0..2 {
+            let inbound = rx2.recv().await.unwrap();
+            let RpcRequest::RequestVote(args) = &inbound.request else {
+                panic!("unexpected rpc");
+            };
+            let _ = inbound
+                .reply
+                .send(RpcResponse::RequestVote(RequestVoteReply {
+                    term: args.term,
+                    vote_granted: true,
+                }));
+        }
+        sender.await.unwrap().unwrap();
+        let stats = net.fault_stats();
+        assert_eq!((stats.sends, stats.duplicates_delivered), (1, 1));
+    }
+
+    /// The counters are part of the deterministic surface: same seed, same
+    /// stats — byte for byte.
+    #[tokio::test(start_paused = true)]
+    async fn fault_stats_are_reproducible_per_seed() {
+        async fn run(seed: u64) -> FaultStats {
+            let cfg = FaultConfig {
+                min_delay: ms(1),
+                max_delay: ms(20),
+                drop_probability: 0.2,
+                duplicate_probability: 0.5,
+                rpc_timeout: ms(50),
+            };
+            let net = SimNetwork::new(seed, cfg);
+            let (t1, _rx1) = net.register(1);
+            let (_t2, rx2) = net.register(2);
+            spawn_echo(rx2);
+            let handles: Vec<_> = (0..20u64)
+                .map(|i| {
+                    let t1 = t1.clone();
+                    tokio::spawn(async move { t1.send(2, vote_req(i)).await.is_ok() })
+                })
+                .collect();
+            for h in handles {
+                h.await.unwrap();
+            }
+            // Let fire-and-forget duplicates land before reading.
+            tokio::time::sleep(ms(200)).await;
+            net.fault_stats()
+        }
+        let a = run(77).await;
+        let b = run(77).await;
+        assert_eq!(a, b);
+        assert_eq!(a.sends, 20);
+        // The mix must actually exercise every probabilistic counter.
+        assert!(a.requests_dropped + a.replies_dropped > 0);
+        assert!(a.duplicates_delivered > 0);
     }
 }
