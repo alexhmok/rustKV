@@ -370,9 +370,11 @@ async fn minority_partitioned_leader_times_out_writes_and_never_applies_them() {
         );
     }
 
-    // Reads are CP too (phase 9): the partitioned leader cannot confirm its
-    // leadership, so a linearizable GET times out (504) instead of serving —
-    // even for a key it holds — while a stale read still answers locally.
+    // Reads are CP too (phase 9): the old leader must never serve the key it
+    // holds. By now CheckQuorum (phase 12) has long deposed it — the doomed
+    // PUT's 2s wait dwarfs the ~400ms step-down window — so instead of
+    // hanging into a 504 it answers 503 immediately (deposed, no leader
+    // known, retryable) while a stale read still answers locally.
     let get = client
         .get(format!("{}/alive", leader.url))
         .send()
@@ -380,8 +382,8 @@ async fn minority_partitioned_leader_times_out_writes_and_never_applies_them() {
         .unwrap();
     assert_eq!(
         get.status(),
-        504,
-        "partitioned leader must not confirm a linearizable read"
+        503,
+        "the self-deposed leader must refuse the linearizable read, not serve it"
     );
     let stale = client
         .get(format!("{}/alive?stale=true", leader.url))

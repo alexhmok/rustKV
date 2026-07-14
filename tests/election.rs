@@ -9,7 +9,10 @@
 //! healed node (term never moves, leadership never churns), the RPC-level
 //! grant rule (log check, no term adoption, leader stickiness), that
 //! granting a pre-vote never suppresses the grantor's own elections, and
-//! that cold starts still elect.
+//! that cold starts still elect. CheckQuorum (phase 12): the two
+//! asymmetric-partition stalls it exists to fix — both documented as
+//! infinite stalls against phase-11 code first, then inverted — plus the
+//! single-node guard (a leader that IS its own majority never steps down).
 //! NOT covered here: log replication (tests/replication.rs) and durable-write
 //! invariants under crashes mid-replication (phase 6). The
 //! one-leader-per-term check here samples every 10ms of virtual time (kept
@@ -127,10 +130,14 @@ async fn partitioned_leader_is_deposed_and_rejoins_as_follower() {
     }
     let new = cluster.wait_for_leader_among(&others).await;
     assert!(new.term > old.term, "majority side moves to a newer term");
-    // Basic Raft: an isolated leader keeps believing it leads its old term
-    // (harmless — phase 5 guarantees its writes can never commit).
+    // CheckQuorum (phase 12, the second inversion of this comment after
+    // phase 11's): the isolated leader steps down on its own — WITHOUT
+    // waiting for heal — once it hasn't heard a majority for one
+    // election_timeout_max. It then parks in a pre-campaign at its old
+    // term (it can reach nobody), staying non-disruptive.
+    wait_for_step_down(&cluster, old.id, ms(600)).await;
     let isolated = cluster.handle(old.id).status();
-    assert!(isolated.term <= new.term);
+    assert_eq!(isolated.term, old.term, "no term bump on step-down");
 
     // Heal: the old leader must step down; the cluster converges.
     for &id in &others {
@@ -556,6 +563,214 @@ async fn granting_pre_votes_does_not_suppress_own_elections() {
     assert_eq!(node.status().role, RoleKind::PreCandidate);
     assert_eq!(node.status().term, 0, "pre-campaign: term still unmoved");
     node.shutdown();
+}
+
+// ---- CheckQuorum (phase 12) ----
+
+/// Waits until `id` stops reporting Leader, requiring it to happen within
+/// `within` — the CheckQuorum step-down bound (~election_timeout_max plus
+/// heartbeat-cadence and delivery slack).
+async fn wait_for_step_down(cluster: &TestCluster, id: NodeId, within: Duration) {
+    tokio::time::timeout(within, async {
+        while cluster.handle(id).status().role == RoleKind::Leader {
+            tokio::time::sleep(ms(5)).await;
+        }
+    })
+    .await
+    .expect("check-quorum must depose the leader within the window");
+}
+
+/// The phase-12 headline, variant (a) — inverting the documented stall this
+/// test demonstrated against phase-11 code: with both followers' reply legs
+/// to the leader severed (directional — heartbeats still flow out, every
+/// ack dies coming back), the cluster used to stall FOREVER: the followers'
+/// election timers kept resetting, nobody campaigned, no term ever changed,
+/// and nothing committed. With CheckQuorum the deaf leader notices it can't
+/// hear a majority and steps down within ~election_timeout_max; its
+/// heartbeats stop, a follower's timer finally fires, and the reachable
+/// majority elects and commits again.
+#[tokio::test(start_paused = true)]
+async fn check_quorum_deposes_a_leader_deaf_to_all_acks_and_the_cluster_recovers() {
+    let cluster = spawn_cluster(3, 12, low_loss_faults());
+    let leader = cluster.wait_for_leader().await;
+    let followers: Vec<NodeId> = cluster
+        .all_ids()
+        .into_iter()
+        .filter(|&id| id != leader.id)
+        .collect();
+
+    // Baseline: a healthy write commits.
+    let base = cluster
+        .handle(leader.id)
+        .propose(put("base", 0))
+        .await
+        .expect("leader accepts");
+    assert_eq!(base.committed.await, Ok(true));
+
+    // Sever both followers' legs TO the leader. The sim checks the reply
+    // leg of leader→follower RPCs as (follower, leader), so this kills the
+    // acks while the heartbeats keep flowing.
+    for &f in &followers {
+        cluster.net.set_link_blocked(f, leader.id, true);
+    }
+
+    // The not-yet-deposed leader accepts a write. Its AppendEntries still
+    // REACH both followers (only the acks are lost), so the entry is fully
+    // replicated — CheckQuorum must not lose it.
+    let mut stalled = cluster
+        .handle(leader.id)
+        .propose(put("stalled", 1))
+        .await
+        .expect("the leader still accepts writes");
+
+    // The leader steps down without hearing a single ack — well inside
+    // 2× election_timeout_max (the check window is one election_timeout_max,
+    // evaluated at 50ms heartbeat ticks).
+    wait_for_step_down(&cluster, leader.id, ms(600)).await;
+
+    // Its heartbeats stop, so a follower now times out, pre-campaigns
+    // (the other follower's stickiness has expired with the silence), wins,
+    // and a NEW write commits — the liveness the stall denied forever.
+    let new = cluster.wait_for_leader_among(&followers).await;
+    assert!(new.term > leader.term, "a real election happened");
+    let fresh = cluster
+        .handle(new.id)
+        .propose(put("fresh", 2))
+        .await
+        .expect("new leader accepts");
+    assert_eq!(fresh.committed.await, Ok(true), "writes flow again");
+
+    // No data loss: the stalled entry was on both followers' disks, so the
+    // new leader's log carries it and its commit is transitive. After heal
+    // the old leader learns this and the surviving pending proposal (they
+    // outlive step-down by design) resolves true.
+    for &f in &followers {
+        cluster.net.set_link_blocked(f, leader.id, false);
+    }
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), &mut stalled.committed).await,
+        Ok(Ok(true)),
+        "the stalled-but-replicated write commits after heal"
+    );
+    wait_until("everyone applies the stalled write", || {
+        cluster
+            .all_ids()
+            .iter()
+            .all(|&id| cluster.store(id).get("stalled").is_some())
+    })
+    .await;
+    assert_eq!(cluster.handle(leader.id).status().role, RoleKind::Follower);
+    cluster.shutdown();
+}
+
+/// The phase-12 headline, variant (b) — the stall PreVote (phase 11)
+/// introduced, inverted. Follower B is deaf to the leader entirely and
+/// follower A's acks are lost: B parks in PreCandidate (A sticky-denies —
+/// it still hears the leader — and the leader denies as leader), so the
+/// disruptive term bump that used to rescue basic Raft never happens, and
+/// phase-11 code stalled forever. With CheckQuorum the leader (hearing
+/// neither peer) steps down; A times out once the heartbeats stop, B grants
+/// its pre-vote, A elects, and writes resume. The old leader stays parked
+/// at its old term until heal — harmless.
+#[tokio::test(start_paused = true)]
+async fn check_quorum_unsticks_the_pre_vote_parked_partition() {
+    let cluster = spawn_cluster(3, 13, low_loss_faults());
+    let leader = cluster.wait_for_leader().await;
+    let followers: Vec<NodeId> = cluster
+        .all_ids()
+        .into_iter()
+        .filter(|&id| id != leader.id)
+        .collect();
+    let (a, b) = (followers[0], followers[1]);
+
+    let base = cluster
+        .handle(leader.id)
+        .propose(put("base", 0))
+        .await
+        .expect("leader accepts");
+    assert_eq!(base.committed.await, Ok(true));
+
+    // B goes deaf: leader→B blocked (this also kills the leader's replies
+    // to B's own probes). A still hears heartbeats but A→leader is blocked,
+    // so its acks are lost.
+    cluster.net.set_link_blocked(leader.id, b, true);
+    cluster.net.set_link_blocked(a, leader.id, true);
+
+    // Accepted and replicated to A only (B is deaf) — never committable by
+    // this leader, but A's copy makes it win the election below.
+    let mut stalled = cluster
+        .handle(leader.id)
+        .propose(put("stalled", 1))
+        .await
+        .expect("the leader still accepts writes");
+
+    // The leader hears neither peer and steps down.
+    wait_for_step_down(&cluster, leader.id, ms(600)).await;
+
+    // A is the only possible successor (B's log is missing the stalled
+    // entry, so A and the old leader both deny B's pre-votes); B grants A's
+    // pre-vote and its real vote once the old leader's heartbeats stop.
+    let new = cluster.wait_for_leader_among(&followers).await;
+    assert_eq!(
+        new.id, a,
+        "the ack-severed follower wins with the longer log"
+    );
+    assert!(new.term > leader.term);
+    let fresh = cluster
+        .handle(a)
+        .propose(put("fresh", 2))
+        .await
+        .expect("new leader accepts");
+    assert_eq!(fresh.committed.await, Ok(true), "writes flow again");
+
+    // The old leader can't hear the new one (A→old is blocked), so it parks
+    // in a pre-campaign at its OLD term — PreVote keeps it non-disruptive.
+    let parked = cluster.handle(leader.id).status();
+    assert_ne!(parked.role, RoleKind::Leader);
+    assert_eq!(
+        parked.term, leader.term,
+        "parked at its old term until heal"
+    );
+
+    // Heal: the old leader folds in, and the stalled entry — carried by A
+    // into its term — has committed everywhere; the surviving pending
+    // proposal resolves true.
+    cluster.net.set_link_blocked(leader.id, b, false);
+    cluster.net.set_link_blocked(a, leader.id, false);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), &mut stalled.committed).await,
+        Ok(Ok(true)),
+        "the stalled write commits after heal"
+    );
+    wait_until("everyone applies the stalled write", || {
+        cluster
+            .all_ids()
+            .iter()
+            .all(|&id| cluster.store(id).get("stalled").is_some())
+    })
+    .await;
+    assert_eq!(cluster.handle(leader.id).status().role, RoleKind::Follower);
+    cluster.shutdown();
+}
+
+/// A single-node cluster is its own majority (majority() == 1 counts self),
+/// so CheckQuorum must never fire — this is the binary's default mode.
+#[tokio::test(start_paused = true)]
+async fn single_node_leader_never_steps_down() {
+    let cluster = spawn_cluster(1, 14, low_loss_faults());
+    let leader = cluster.wait_for_leader().await;
+    // 5 virtual seconds ≈ 16+ check-quorum windows with zero peer contact.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let status = cluster.handle(leader.id).status();
+    assert_eq!(status.role, RoleKind::Leader, "single node keeps leading");
+    assert_eq!(status.term, leader.term, "term never moves");
+    let p = cluster
+        .handle(leader.id)
+        .propose(put("solo", 1))
+        .await
+        .expect("still accepts writes");
+    assert_eq!(p.committed.await, Ok(true), "still commits alone");
+    cluster.shutdown();
 }
 
 /// Cold start: no leader has ever existed, so last_leader_contact is unset

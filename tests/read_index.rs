@@ -4,8 +4,9 @@
 //! writes; the NotLeader rejection with a hint; the §6.4 no-op gate (a
 //! fresh leader grants nothing until its term-start no-op commits and
 //! applies); and the money test — a minority-partitioned leader whose state
-//! is provably stale can never confirm a read, and stepping down on heal
-//! resolves the hung ticket with an error instead of a stale value.
+//! is provably stale can never confirm a read, and (since phase 12's
+//! CheckQuorum) its own step-down resolves the pending ticket with a
+//! retryable error while the partition is still up — never a stale value.
 
 mod common;
 
@@ -150,16 +151,19 @@ async fn reads_wait_for_the_term_start_noop() {
 }
 
 /// The money test: a leader partitioned into a minority holds a provably
-/// stale value. Its linearizable read must hang (it cannot confirm
-/// leadership), never serving the stale state — and healing resolves the
-/// ticket with an error (step-down), not a grant.
+/// stale value. It must never confirm the read — and since CheckQuorum
+/// (phase 12) it doesn't even hang until heal: the leader notices on its
+/// own that it cannot hear a majority, steps down, and the pending ticket
+/// resolves with a retryable error while the partition is still up.
 #[tokio::test(start_paused = true)]
 async fn partitioned_leader_never_serves_a_stale_read() {
     let cluster = spawn_cluster(3, 75, low_loss_faults());
     let old_leader = cluster.wait_for_leader().await.id;
     confirmed_write(&cluster, old_leader, "k", 1).await;
 
-    // Cut the leader off from both followers.
+    // Cut the leader off from both followers, then register the read while
+    // it still believes it leads (CheckQuorum needs a full silent window
+    // before it fires) and still holds the soon-to-be-stale k=1.
     let followers: Vec<u64> = cluster
         .all_ids()
         .into_iter()
@@ -168,38 +172,34 @@ async fn partitioned_leader_never_serves_a_stale_read() {
     for &f in &followers {
         cluster.net.set_pair_blocked(old_leader, f, true);
     }
-
-    // The majority elects a successor and commits a newer value.
-    let new_leader = cluster.wait_for_leader_among(&followers).await.id;
-    confirmed_write(&cluster, new_leader, "k", 2).await;
-
-    // The deposed-but-unaware leader still calls itself leader and still
-    // holds k=1. It accepts the read (it can't know better) but must never
-    // confirm it.
     assert_eq!(
         cluster.handle(old_leader).status().role,
         rustkv::raft::node::RoleKind::Leader,
-        "old leader must not have learned of its deposition yet"
+        "old leader must not have stepped down yet"
     );
     assert_eq!(cluster.store(old_leader).get("k"), Some(json!(1)));
-    let mut ticket = cluster
+    let ticket = cluster
         .handle(old_leader)
         .read()
         .await
         .expect("still believes it leads");
-    tokio::time::timeout(Duration::from_secs(3), &mut ticket.granted)
-        .await
-        .expect_err("a minority leader must never confirm a linearizable read");
 
-    // Heal: the old leader sees the higher term, steps down, and the pending
-    // ticket resolves with an error — promptly, and never with a grant.
-    for &f in &followers {
-        cluster.net.set_pair_blocked(old_leader, f, false);
-    }
-    tokio::time::timeout(Duration::from_secs(5), ticket.granted)
+    // The majority elects a successor and commits a newer value: the
+    // pending read's local k=1 is now provably stale.
+    let new_leader = cluster.wait_for_leader_among(&followers).await.id;
+    confirmed_write(&cluster, new_leader, "k", 2).await;
+
+    // No heal in sight — yet the ticket resolves, as an error, because the
+    // old leader deposed ITSELF (CheckQuorum). Never a grant.
+    tokio::time::timeout(Duration::from_secs(2), ticket.granted)
         .await
-        .expect("step-down must resolve the ticket promptly")
+        .expect("the leader's own step-down must resolve the ticket without a heal")
         .expect_err("ticket must resolve as an error, not a grant");
+    assert_ne!(
+        cluster.handle(old_leader).status().role,
+        rustkv::raft::node::RoleKind::Leader,
+        "the minority leader stepped down mid-partition"
+    );
 
     // A retry against the new leader sees the new value.
     let ticket = cluster
@@ -212,5 +212,11 @@ async fn partitioned_leader_never_serves_a_stale_read() {
         .expect("read confirmed")
         .expect("ticket resolves");
     assert_eq!(cluster.store(new_leader).get("k"), Some(json!(2)));
+
+    // Heal for a clean converged teardown.
+    for &f in &followers {
+        cluster.net.set_pair_blocked(old_leader, f, false);
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
     cluster.shutdown();
 }

@@ -19,8 +19,10 @@
 //! cycles (including partitioning the leader), a seeded randomized schedule
 //! mixing writes, partitions, heals, crashes and restarts under 10% message
 //! loss (run both with and without message duplication), write stall
-//! without a majority + resumption after restart, and a same-seed
-//! determinism check over the randomized schedule.
+//! without a majority — where CheckQuorum (phase 12) now deposes the
+//! stalled leader, whose surviving pending proposal still commits after a
+//! restart restores the majority — and a same-seed determinism check over
+//! the randomized schedule.
 //!
 //! Honest limits: each value is proposed at most once, so client-level
 //! retry duplication is out of scope (see PLAN.md) — transport-level
@@ -423,7 +425,8 @@ async fn forged_leadership_conflict_fails_the_run_at_teardown() {
     cluster.shutdown();
 }
 
-// ---- majority loss stalls writes; restart restores liveness ----
+// ---- majority loss: writes stall, CheckQuorum deposes the survivor, and a
+// restart restores liveness (with the stalled proposal still committing) ----
 
 #[tokio::test(start_paused = true)]
 async fn writes_stall_without_majority_and_resume_after_restart() {
@@ -445,23 +448,48 @@ async fn writes_stall_without_majority_and_resume_after_restart() {
     cluster.crash(followers[1]);
     tokio::time::sleep(ms(50)).await;
 
-    // The lone survivor accepts the proposal but must not confirm it.
-    let p2 = cluster
+    // The lone survivor — still leader, the silence being younger than the
+    // check-quorum window — accepts the proposal but must not confirm it.
+    let mut p2 = cluster
         .handle(leader.id)
         .propose(put("v2", 2))
         .await
         .unwrap();
-    let stalled = tokio::time::timeout(Duration::from_secs(3), p2.committed).await;
+    let stalled = tokio::time::timeout(Duration::from_secs(3), &mut p2.committed).await;
     assert!(stalled.is_err(), "no commit without a majority");
     assert_eq!(
         cluster.store(leader.id).get("v2"),
         None,
         "never applied either"
     );
+    // CheckQuorum (phase 12): inside that window the survivor noticed it
+    // can't hear a majority and stepped down — at its own term, with the
+    // pending proposal deliberately kept alive across the step-down.
+    let deposed = cluster.handle(leader.id).status();
+    assert_ne!(
+        deposed.role,
+        RoleKind::Leader,
+        "check-quorum deposes the lone survivor"
+    );
+    assert_eq!(deposed.term, leader.term, "step-down never bumps the term");
 
-    // One follower back = majority of 2/3: the stalled write must land.
+    // One follower back = a majority of 2/3. The old leader's LONGER log —
+    // it still holds v2 — denies the restarted follower's pre-votes and
+    // wins the election itself, and the write that stalled under its old
+    // leadership finally commits: the payoff of pending proposals
+    // surviving step-down (the phase 5 design decision).
     cluster.restart(followers[0]).await;
-    wait_until("stalled write commits once a majority exists", || {
+    let new = cluster
+        .wait_for_leader_among(&[leader.id, followers[0]])
+        .await;
+    assert_eq!(new.id, leader.id, "the longer log wins the re-election");
+    assert!(new.term > leader.term);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), &mut p2.committed).await,
+        Ok(Ok(true)),
+        "the stalled proposal commits once a majority exists"
+    );
+    wait_until("stalled write applies on the restored majority", || {
         cluster.store(leader.id).get("v2").is_some()
             && cluster.store(followers[0]).get("v2").is_some()
     })

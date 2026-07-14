@@ -48,8 +48,17 @@
 //! `election_timeout_min`, denies the probe. Together these stop a healed
 //! or partitioned node from ever disrupting a healthy leader — the term
 //! churn phase 3 documented as expected is gone.
-//! Deliberately basic Raft: no CheckQuorum, no batching cap on
-//! AppendEntries payloads.
+//!
+//! Phase 12: CheckQuorum (§6.2 leases, minus the read-lease half), PreVote's
+//! matched pair. A leader that hasn't heard from a majority (itself plus
+//! peers answering AppendEntries, tracked at the same site as `acked_seq`)
+//! within `election_timeout_max` steps down at its CURRENT term — no bump —
+//! at the next heartbeat tick, before sending. Its silence lets the
+//! reachable side's stickiness expire and elect normally, restoring the
+//! liveness under asymmetric partitions that PreVote's stickiness had
+//! suppressed (a leader deaf to all acks used to stall the cluster forever:
+//! followers kept hearing heartbeats, so nobody ever campaigned).
+//! Deliberately basic Raft still: no batching cap on AppendEntries payloads.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -312,6 +321,11 @@ enum Role {
         heartbeat_seq: u64,
         /// Highest sent_seq each peer has answered (at our term).
         acked_seq: HashMap<NodeId, u64>,
+        /// When each peer last answered an AppendEntries at our term —
+        /// success or rejection, either is contact (CheckQuorum, phase 12).
+        /// Initialized to leadership start so a fresh leader isn't deposed
+        /// before its first acks can possibly arrive.
+        last_contact: HashMap<NodeId, Instant>,
         /// Reads awaiting confirmation. Deliberately inside the role: losing
         /// leadership drops them, resolving every ticket with an error —
         /// unlike `pending` proposals, which survive step-down.
@@ -960,15 +974,19 @@ impl<T: Transport + Clone> RaftNode<T> {
                     next_index,
                     match_index,
                     acked_seq,
+                    last_contact,
                     ..
                 } = &mut self.role
                 else {
                     return;
                 };
                 // Any reply at our term — success or log-mismatch rejection —
-                // acknowledges our authority as of this RPC's send (§6.4).
+                // acknowledges our authority as of this RPC's send (§6.4),
+                // and is contact for CheckQuorum (never derived from
+                // match_index: a rejecting peer is still reachable).
                 let acked = acked_seq.entry(from).or_insert(0);
                 *acked = (*acked).max(sent_seq);
+                last_contact.insert(from, Instant::now());
                 let mut resend = false;
                 if reply.success {
                     // The peer confirmed it matches us up to prev + sent.
@@ -1155,12 +1173,14 @@ impl<T: Transport + Clone> RaftNode<T> {
         // next_index points at the pre-no-op tail so the no-op ships in the
         // very first heartbeat without a backtracking round-trip.
         let next = self.storage.last_index() + 1;
+        let now = Instant::now();
         self.role = Role::Leader {
             next_index: self.config.peers.iter().map(|&p| (p, next)).collect(),
             match_index: self.config.peers.iter().map(|&p| (p, 0)).collect(),
             term_start_index: next,
             heartbeat_seq: 0,
             acked_seq: HashMap::new(),
+            last_contact: self.config.peers.iter().map(|&p| (p, now)).collect(),
             pending_reads: Vec::new(),
         };
         self.leader_id = Some(self.config.id);
@@ -1183,6 +1203,32 @@ impl<T: Transport + Clone> RaftNode<T> {
     // ---- leader replication ----
 
     fn on_heartbeat_tick(&mut self) {
+        // CheckQuorum (phase 12), before sending: a leader that hasn't heard
+        // from a majority — itself plus peers whose last AppendEntries reply
+        // is within election_timeout_max — steps down at its CURRENT term
+        // (a bump would just re-elect us into the same silence) and goes
+        // quiet, letting the reachable side's stickiness expire and elect.
+        // Piggybacked on the heartbeat tick: no new timer, no RNG draws.
+        if let Role::Leader { last_contact, .. } = &self.role {
+            let window = self.config.election_timeout_max;
+            let heard = 1 + last_contact
+                .values()
+                .filter(|at| at.elapsed() < window)
+                .count();
+            if heard < self.majority() {
+                let term = self.current_term();
+                tracing::info!(
+                    node = self.config.id,
+                    term,
+                    heard,
+                    majority = self.majority(),
+                    "check-quorum failed: no majority heard within election_timeout_max; \
+                     stepping down"
+                );
+                self.become_follower(term, None);
+                return;
+            }
+        }
         for &peer in &self.config.peers {
             self.send_append(peer);
         }

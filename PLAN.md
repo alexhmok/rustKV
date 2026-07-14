@@ -532,11 +532,106 @@ Untested / known gaps:
   later round with the same prospective term (grants are non-binding, so
   this affects nothing safety-relevant; noted for precision).
 
-## Project complete (phases 0-11)
+## Phase 12 — CheckQuorum ✅
+
+PreVote's matched pair: phase 11's stickiness suppressed the disruptive
+term churn that used to rescue basic Raft from some asymmetric partitions;
+CheckQuorum restores that liveness without re-admitting the disruption.
+This closes the phase-11 "no CheckQuorum" gap (left in phase 11's list
+above as the historical record).
+
+Done (`src/raft/node.rs` only):
+- `Role::Leader` gains `last_contact: HashMap<NodeId, Instant>`, updated
+  at exactly the site where `acked_seq` updates (any AppendEntries reply
+  at our term — success or log-mismatch rejection — is contact; never
+  derived from match_index, since a rejecting peer is still reachable),
+  and initialized to leadership start so a fresh leader can't be deposed
+  before its first acks could possibly arrive. The quorum signal IS phase
+  9's ReadIndex ack stream, so the check cannot diverge from commit
+  ability.
+- At each heartbeat tick, BEFORE sending: count self + peers heard within
+  `election_timeout_max`; below `majority()` (the same function used by
+  vote counting and commit advancement) → `become_follower(current_term,
+  None)` and return without sending. No term bump (bumping would loop; the
+  equal-term step-down also skips the hard-state fsync). Piggybacked on
+  the existing tick: no new timer, no new RNG draws — seed churn comes
+  from behavior changes only. Step-down semantics were settled in phase 9:
+  pending reads resolve as retryable errors, pending proposals survive.
+- A single-node cluster counts itself as its own majority and never steps
+  down (the binary's default mode).
+
+Tested (96 total; 3 new, 4 reworked/inverted):
+- The headline, test-first as planned: both asymmetric-partition stalls
+  were written as documented-behavior tests against phase-11 code and
+  demonstrated (3+ virtual seconds: nothing commits, no election starts,
+  no term ever moves — stalled forever), then implemented against and
+  inverted. Variant (a): both followers' reply legs to the leader severed
+  (directional `set_link_blocked` — heartbeats keep flowing out, every ack
+  dies) → the deaf leader now steps down within ~election_timeout_max, its
+  silence lets a follower campaign and win, a new write commits; and since
+  the stalled entry WAS replicated (only its acks were lost), it commits
+  everywhere after heal via the surviving pending proposal — no data loss.
+  Variant (b), the phase-11 regression: one follower deaf to the leader,
+  the other's acks lost — the deaf node parks in PreCandidate (stickiness
+  + leader-denial) and phase-11 code stalls forever; now the leader steps
+  down, the ack-severed follower (holding the longer log) elects, writes
+  resume, and the old leader parks non-disruptively at its OLD term until
+  heal.
+- Single-node guard: 5 virtual seconds with zero peer contact — still
+  leader, term unmoved, still commits (explicit sim test; http_api's
+  single-node suite exercises it implicitly).
+- Documented-behavior inversions/reworks: election.rs
+  `partitioned_leader_is_deposed_and_rejoins_as_follower` — the isolated
+  leader now steps down WITHOUT waiting for heal, at its own term (the
+  second inversion of that test's inline comment, after phase 11's);
+  read_index.rs money test — the pending linearizable read on the
+  partitioned leader now resolves as a retryable error via the leader's
+  OWN step-down while the partition is still up (still never a stale
+  value); replication.rs `minority_leader_accepts_but_never_commits` — the
+  minority leader deposes itself mid-window, post-step-down proposals get
+  NotLeader, and the doomed entry still never commits anywhere (safety
+  claim unchanged); faults.rs majority-loss — the stalled survivor steps
+  down, and after one follower restarts, its longer log wins pre-vote +
+  election and the stalled proposal STILL commits: the payoff test for
+  "pending proposals survive step-down" (phase 5 design). cluster_http's
+  partitioned-leader test: the linearizable GET on the deposed leader now
+  answers 503 (retryable) promptly instead of hanging into a 504.
+- No spurious step-downs: `heartbeats_prevent_spurious_reelections` (10
+  virtual seconds, term never moves) passes unchanged, as does the
+  no-fault convergence suite — no tight step-down/re-elect loop.
+- Full regression green with ZERO seed re-pins (phase 12 changes behavior
+  schedules only, no RNG draw counts): faults + jepsen + both duplication
+  soaks + the linearizable checker. The jepsen nemesis's partition rounds
+  (150–400ms against a 300ms check window) now depose partitioned leaders
+  mid-workload and the WGL checker still finds zero violations across all
+  seeds.
+
+Churn / window-tuning datum: under 25% uniform message loss (40ms rpc
+timeout, 50ms heartbeats), the observed leader-term sets across seeds 0–4
+are byte-identical with and without CheckQuorum — zero loss-induced
+step-downs. The window (election_timeout_max ≈ 6 heartbeats per peer) is
+comfortably conservative: random loss never trips it; only real
+connectivity loss (nemesis partitions, crashes) does. The loss suites
+assert safety, not leadership stability, so legitimate step-downs pass.
+
+Untested / known gaps (documented, not fixed):
+- Residual liveness gap: a follower that can't hear a HEALTHY leader parks
+  in PreCandidate indefinitely while the cluster commits without it —
+  CheckQuorum correctly never fires (the leader still hears a majority).
+  Variant (b) covers the flip side only.
+- Per the liveness literature, even PreVote+CheckQuorum does not close
+  every partial-partition schedule; we claim only the schedules the sim
+  constructs.
+- Real votes stay non-sticky (deliberate — no etcd-style lease/wedge or
+  leadership-transfer machinery); re-evaluated in the dynamic-membership
+  phase for removed servers.
+
+## Project complete (phases 0-12)
 Remaining ideas beyond the original scope, in planned order: client dedup
 tokens for 504 retries, snapshotting/compaction + InstallSnapshot, dynamic
-membership, connection pooling, scripted Docker partition test. (TLS on
-the raft port: dropped — blocked on the dependency whitelist.)
+membership (incl. re-evaluating vote stickiness for removed servers),
+connection pooling, scripted Docker partition test. (TLS on the raft
+port: dropped — blocked on the dependency whitelist.)
 
 ## Out of scope (deliberate)
 Snapshotting/log compaction, dynamic membership changes — leave clean TODOs.

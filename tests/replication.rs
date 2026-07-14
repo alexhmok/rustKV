@@ -7,8 +7,9 @@
 //! leader hint); lagging-follower catch-up; Figure-7-style divergence with
 //! conflicting uncommitted entries truncated and replaced (leader
 //! backtracking); a minority-partitioned leader accepting but never
-//! committing (CP); seed determinism; confirmed writes surviving 15% loss;
-//! RPC-level AppendEntries conformance.
+//! committing (CP), then deposing itself via CheckQuorum and refusing
+//! further proposals; seed determinism; confirmed writes surviving 15%
+//! loss; RPC-level AppendEntries conformance.
 //! Log shape note: every election win appends a §8 no-op entry, so client
 //! entries never sit at index 1 and index math below accounts for it.
 //! NOT covered here: HTTP semantics (tests/http_api.rs, tests/cluster_http.rs),
@@ -20,7 +21,7 @@ mod common;
 
 use common::*;
 use rustkv::raft::Storage;
-use rustkv::raft::node::{ProposeError, RaftNode};
+use rustkv::raft::node::{ProposeError, RaftNode, RoleKind};
 use rustkv::raft::rpc::{AppendEntriesArgs, AppendEntriesReply, RpcRequest, RpcResponse};
 use rustkv::raft::transport::Transport;
 use rustkv::raft::transport::sim::{FaultConfig, SimNetwork, SimTransport};
@@ -334,14 +335,30 @@ async fn minority_leader_accepts_but_never_commits() {
         .await
         .unwrap();
 
-    // Its commit index must stay pinned for 3 virtual seconds of trying, and
-    // the doomed write must never reach its state machine.
+    // CheckQuorum (phase 12): instead of leading uselessly until heal, the
+    // minority leader steps down mid-window on its own...
+    wait_until("the isolated leader steps down", || {
+        cluster.handle(leader.id).status().role != RoleKind::Leader
+    })
+    .await;
+    // ...after which it refuses proposals outright (no more silent
+    // accept-and-stall — clients get a retryable NotLeader immediately).
+    let refused = cluster
+        .handle(leader.id)
+        .propose(put("refused", 0))
+        .await
+        .expect_err("a deposed leader must not accept proposals");
+    assert!(matches!(refused, ProposeError::NotLeader { .. }));
+
+    // The safety claim is unchanged by the step-down: the doomed entry
+    // never commits or applies anywhere — its acceptor's commit index stays
+    // pinned across 3 virtual seconds.
     for _ in 0..60 {
         tokio::time::sleep(ms(50)).await;
         assert_eq!(
             cluster.handle(leader.id).status().commit_index,
             2,
-            "a minority leader must never commit"
+            "a minority node must never commit"
         );
     }
     assert_eq!(cluster.store(leader.id).get("doomed"), None);
