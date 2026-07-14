@@ -49,6 +49,22 @@
 //! or partitioned node from ever disrupting a healthy leader — the term
 //! churn phase 3 documented as expected is gone.
 //!
+//! Phase 14: snapshotting/log compaction + InstallSnapshot (§7, single-shot
+//! — no chunking). After applying, once `last_applied` runs
+//! `snapshot_threshold` entries past the snapshot boundary, the node
+//! captures the state machine ([`StateMachine::snapshot`]) and compacts the
+//! applied prefix — always at `last_applied`, never `commit_index`
+//! (committed-but-unapplied entries are not in the state yet). The trigger
+//! counts applied entries, so with a fixed threshold it is deterministic by
+//! construction; `None` (the default) turns the feature off entirely. A
+//! leader whose peer needs compacted entries (`next_index` at or below the
+//! boundary) sends InstallSnapshot instead of AppendEntries; the follower
+//! persists it (fsync before replying), restores its state machine, and
+//! no-ops duplicates whose boundary it already committed. An InstallSnapshot
+//! reply counts as CheckQuorum contact (it IS a reply at our term) but never
+//! as a ReadIndex ack — leadership confirmation stays AppendEntries-seq-
+//! tagged only.
+//!
 //! Phase 12: CheckQuorum (§6.2 leases, minus the read-lease half), PreVote's
 //! matched pair. A leader that hasn't heard from a majority (itself plus
 //! peers answering AppendEntries, tracked at the same site as `acked_seq`)
@@ -68,8 +84,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, sleep_until};
 
 use super::rpc::{
-    AppendEntriesArgs, AppendEntriesReply, RequestVoteArgs, RequestVoteReply, RpcRequest,
-    RpcResponse,
+    AppendEntriesArgs, AppendEntriesReply, InstallSnapshotArgs, InstallSnapshotReply,
+    RequestVoteArgs, RequestVoteReply, RpcRequest, RpcResponse,
 };
 use super::storage::Storage;
 use super::transport::{Inbound, Transport, TransportError};
@@ -87,6 +103,11 @@ pub struct RaftConfig {
     /// Seeds this node's election-timeout jitter; part of what makes a
     /// simulated scenario reproducible.
     pub timeout_seed: u64,
+    /// Compact the log once `last_applied` runs this many entries past the
+    /// snapshot boundary (phase 14); must be >= 1. `None` (the default)
+    /// disables snapshotting entirely — nothing is written, nothing changes
+    /// on the wire.
+    pub snapshot_threshold: Option<u64>,
 }
 
 impl RaftConfig {
@@ -98,6 +119,7 @@ impl RaftConfig {
             election_timeout_max: Duration::from_millis(300),
             heartbeat_interval: Duration::from_millis(50),
             timeout_seed: id,
+            snapshot_threshold: None,
         }
     }
 }
@@ -155,6 +177,21 @@ impl std::error::Error for ProposeError {}
 /// log order, on every node (leaders and followers alike).
 pub trait StateMachine: Send + Sync + 'static {
     fn apply(&self, entry: &LogEntry);
+
+    /// The complete current state as an opaque JSON value (phase 14): the
+    /// snapshot payload for compaction. Must capture everything a replay of
+    /// the applied prefix would have produced — including bookkeeping like
+    /// the dedup sessions table, not just user data.
+    ///
+    /// NOTE: `KvStore` also has an *inherent* map-only `snapshot()` used by
+    /// tests; concrete calls resolve to that one, `dyn StateMachine` calls
+    /// to this one (pinned by a unit test in store.rs).
+    fn snapshot(&self) -> serde_json::Value;
+
+    /// Replaces the entire state with a previously captured [`Self::snapshot`]
+    /// (restore-at-boot and InstallSnapshot). A malformed payload is
+    /// fail-stop territory — it only arrives via committed snapshots.
+    fn restore(&self, state: &serde_json::Value);
 }
 
 /// A write accepted into the leader's log (durably appended, NOT committed).
@@ -294,6 +331,14 @@ enum Event {
         sent_seq: u64,
         result: Result<RpcResponse, TransportError>,
     },
+    InstallSnapshotReply {
+        sent_term: Term,
+        from: NodeId,
+        /// The boundary of the snapshot this reply answers: on success the
+        /// follower holds everything through it.
+        last_included_index: LogIndex,
+        result: Result<RpcResponse, TransportError>,
+    },
 }
 
 enum Role {
@@ -374,12 +419,28 @@ impl<T: Transport + Clone> RaftNode<T> {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let (control_tx, control_rx) = mpsc::unbounded_channel();
         let hard_state = storage.hard_state();
+        // Restore-at-boot (phase 14): everything through the snapshot
+        // boundary is committed and applied by definition — hand the state
+        // machine its snapshot BEFORE any of the retained log replays, and
+        // start commit_index/last_applied at the boundary (0 without a
+        // snapshot, exactly as before). This is the single chokepoint: the
+        // binary and every test restart path come through here.
+        let snapshot_index = storage.snapshot_index();
+        if let Some(snapshot) = storage.snapshot() {
+            state_machine.restore(&snapshot.state);
+            tracing::info!(
+                node = config.id,
+                last_included_index = snapshot.last_included_index,
+                last_included_term = snapshot.last_included_term,
+                "state machine restored from snapshot"
+            );
+        }
         let (status_tx, status_rx) = watch::channel(Status {
             id: config.id,
             term: hard_state.current_term,
             role: RoleKind::Follower,
             leader_id: None,
-            commit_index: 0,
+            commit_index: snapshot_index,
             last_log_index: storage.last_index(),
         });
         tracing::info!(
@@ -398,8 +459,8 @@ impl<T: Transport + Clone> RaftNode<T> {
             state_machine,
             role: Role::Follower,
             leader_id: None,
-            commit_index: 0,
-            last_applied: 0,
+            commit_index: snapshot_index,
+            last_applied: snapshot_index,
             pending: Vec::new(),
             last_leader_contact: None,
             election_deadline: Instant::now(),
@@ -558,6 +619,9 @@ impl<T: Transport + Clone> RaftNode<T> {
                 RpcResponse::AppendEntries(self.handle_append_entries(args))
             }
             RpcRequest::PreVote(args) => RpcResponse::PreVote(self.handle_pre_vote(args)),
+            RpcRequest::InstallSnapshot(args) => {
+                RpcResponse::InstallSnapshot(self.handle_install_snapshot(args))
+            }
         };
         // The peer may have timed out and dropped the reply channel.
         let _ = inbound.reply.send(response);
@@ -659,6 +723,70 @@ impl<T: Transport + Clone> RaftNode<T> {
         }
     }
 
+    /// InstallSnapshot (§7, phase 14): replaces our compacted-away past with
+    /// the leader's snapshot. Persisted (fsynced) before replying, like every
+    /// other RPC-visible state change.
+    fn handle_install_snapshot(&mut self, args: InstallSnapshotArgs) -> InstallSnapshotReply {
+        let current = self.current_term();
+        if args.term < current {
+            return InstallSnapshotReply { term: current };
+        }
+        if args.term == current && self.is_leader() {
+            tracing::error!(
+                node = self.config.id,
+                term = current,
+                other_leader = args.leader_id,
+                "SAFETY VIOLATION: InstallSnapshot from another leader of our term"
+            );
+        }
+        self.become_follower(args.term, Some(args.leader_id));
+        // Leader stickiness (§9.6): a snapshot is contact with a valid leader.
+        self.last_leader_contact = Some(Instant::now());
+        let term = self.current_term();
+        let boundary = args.snapshot.last_included_index;
+
+        // Idempotence guard: everything through the boundary is already
+        // committed here, so re-installing (a duplicated or reordered
+        // delivery — phase 10's standing fault) would rewind nothing and
+        // rewrite disk for no reason. Success as a no-op: the reply's
+        // meaning ("I hold everything through the boundary") is true.
+        if boundary <= self.commit_index {
+            tracing::debug!(
+                node = self.config.id,
+                term,
+                last_included_index = boundary,
+                commit_index = self.commit_index,
+                "duplicate InstallSnapshot ignored"
+            );
+            return InstallSnapshotReply { term };
+        }
+
+        self.storage
+            .install_snapshot(&args.snapshot)
+            .expect("cannot persist snapshot; fail-stop");
+        self.state_machine.restore(&args.snapshot.state);
+        self.commit_index = boundary;
+        self.last_applied = boundary;
+        // Local proposals at or below the boundary are now unverifiable: the
+        // compacted history may or may not hold them (their terms are gone).
+        // Drop their senders — waiters get the retryable "unknown" error,
+        // never a false "definitely didn't commit" (the entry may well be IN
+        // the snapshot we just applied).
+        self.pending.retain(|p| p.index > boundary);
+        // Anything retained beyond the boundary resolves normally: if the
+        // suffix was cleared (divergent), those entries can never commit.
+        self.resolve_pending();
+        tracing::info!(
+            node = self.config.id,
+            term,
+            last_included_index = boundary,
+            last_included_term = args.snapshot.last_included_term,
+            from = args.leader_id,
+            "installed snapshot from leader"
+        );
+        InstallSnapshotReply { term }
+    }
+
     /// Full §5.3 AppendEntries: consistency check, duplicate-tolerant entry
     /// processing with conflict truncation, and commit advancement.
     fn handle_append_entries(&mut self, args: AppendEntriesArgs) -> AppendEntriesReply {
@@ -687,8 +815,16 @@ impl<T: Transport + Clone> RaftNode<T> {
         let term = self.current_term();
 
         // Log-matching consistency check: we must hold the leader's prev
-        // entry. If not, the leader backtracks and retries.
-        if self.storage.term(args.prev_log_index) != Some(args.prev_log_term) {
+        // entry. If not, the leader backtracks and retries. An index below
+        // our snapshot boundary vacuously matches: compacted means committed,
+        // and the leader of our (adopted) term holds every committed entry
+        // (Leader Completeness) — without this, a follower that compacted
+        // ahead of the leader's bookkeeping would reject probes forever.
+        let prev_matches = match self.storage.term(args.prev_log_index) {
+            Some(term) => term == args.prev_log_term,
+            None => args.prev_log_index < self.storage.snapshot_index(),
+        };
+        if !prev_matches {
             tracing::debug!(
                 node = self.config.id,
                 term,
@@ -709,6 +845,11 @@ impl<T: Transport + Clone> RaftNode<T> {
         // enforced fail-stop below.
         let mut append_from = None;
         for entry in &args.entries {
+            if entry.index <= self.storage.snapshot_index() {
+                // Compacted ⇒ committed ⇒ identical to what we applied; the
+                // same vacuous-match argument as the prev check above.
+                continue;
+            }
             match self.storage.term(entry.index) {
                 Some(existing) if existing == entry.term => continue,
                 Some(_) => {
@@ -796,6 +937,10 @@ impl<T: Transport + Clone> RaftNode<T> {
         self.resolve_pending();
         // last_applied advanced — pending reads may now be servable.
         self.resolve_reads();
+        // ...and the applied prefix may have outgrown the snapshot threshold.
+        // After resolve_pending, so nothing pending ever sits below the new
+        // boundary (its outcome was decidable before the terms vanished).
+        self.maybe_compact();
     }
 
     /// Settles proposal waiters: `true` once committed (and, via
@@ -1022,6 +1167,71 @@ impl<T: Transport + Clone> RaftNode<T> {
                 }
                 // Acks advanced even if commit didn't — reads may confirm.
                 self.resolve_reads();
+            }
+            Event::InstallSnapshotReply {
+                sent_term,
+                from,
+                last_included_index,
+                result,
+            } => {
+                let reply = match result {
+                    Ok(RpcResponse::InstallSnapshot(reply)) => reply,
+                    Ok(other) => {
+                        tracing::warn!(
+                            node = self.config.id,
+                            from,
+                            ?other,
+                            "mismatched install-snapshot reply"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::trace!(
+                            node = self.config.id, from, %error,
+                            "install-snapshot rpc failed"
+                        );
+                        return;
+                    }
+                };
+                if reply.term > self.current_term() {
+                    self.become_follower(reply.term, None);
+                    return;
+                }
+                if sent_term != self.current_term() {
+                    return;
+                }
+                let last_index = self.storage.last_index();
+                let Role::Leader {
+                    next_index,
+                    match_index,
+                    last_contact,
+                    ..
+                } = &mut self.role
+                else {
+                    return;
+                };
+                // CheckQuorum: a snapshot reply at our term IS contact. But
+                // deliberately NOT an acked_seq entry — ReadIndex leadership
+                // confirmation stays AppendEntries-seq-tagged only, so a
+                // snapshot-fed peer never confirms a read it didn't ack.
+                last_contact.insert(from, Instant::now());
+                // The follower now holds everything through the boundary
+                // (including the duplicate case, where it already did).
+                let matched = match_index.entry(from).or_insert(0);
+                *matched = (*matched).max(last_included_index);
+                let next = next_index.entry(from).or_insert(1);
+                *next = (*next).max(last_included_index + 1);
+                tracing::info!(
+                    node = self.config.id,
+                    term = sent_term,
+                    peer = from,
+                    last_included_index,
+                    "snapshot installed on peer; resuming log replication"
+                );
+                self.maybe_advance_commit();
+                if last_included_index < last_index {
+                    self.send_append(from);
+                }
             }
         }
     }
@@ -1252,6 +1462,15 @@ impl<T: Transport + Clone> RaftNode<T> {
             .get(&peer)
             .copied()
             .unwrap_or_else(|| self.storage.last_index() + 1);
+        // The peer needs entries we compacted away (phase 14): only a
+        // snapshot can catch it up. Checked BEFORE the prev_log_term lookup
+        // below, which cannot answer at or below the boundary. Re-sent at
+        // heartbeat pace while the peer lags — no rate limiting (documented
+        // gap); duplicates are no-ops on the follower.
+        if next <= self.storage.snapshot_index() {
+            self.send_install_snapshot(peer);
+            return;
+        }
         let prev_log_index = next - 1;
         let prev_log_term = self
             .storage
@@ -1280,6 +1499,69 @@ impl<T: Transport + Clone> RaftNode<T> {
                 result,
             });
         });
+    }
+
+    /// Ships the current snapshot to a peer whose next_index fell at or
+    /// below the snapshot boundary. The payload is storage's in-memory copy
+    /// (small by scope; replaced — never stale — on each compaction).
+    fn send_install_snapshot(&self, peer: NodeId) {
+        let snapshot = self
+            .storage
+            .snapshot()
+            .expect("a nonzero snapshot boundary implies a snapshot")
+            .clone();
+        let term = self.current_term();
+        let last_included_index = snapshot.last_included_index;
+        tracing::debug!(
+            node = self.config.id,
+            term,
+            peer,
+            last_included_index,
+            "peer is behind the snapshot boundary; sending InstallSnapshot"
+        );
+        let args = InstallSnapshotArgs {
+            term,
+            leader_id: self.config.id,
+            snapshot,
+        };
+        let transport = self.transport.clone();
+        let events = self.events_tx.clone();
+        tokio::spawn(async move {
+            let result = transport
+                .send(peer, RpcRequest::InstallSnapshot(args))
+                .await;
+            let _ = events.send(Event::InstallSnapshotReply {
+                sent_term: term,
+                from: peer,
+                last_included_index,
+                result,
+            });
+        });
+    }
+
+    /// Compacts the applied prefix once it outgrows `snapshot_threshold`
+    /// (phase 14). Called after every apply batch, so with a fixed threshold
+    /// the compaction points are a pure function of the applied log —
+    /// deterministic by construction, no size or timer triggers. Always at
+    /// `last_applied`: commit_index may run ahead of what the state machine
+    /// actually contains.
+    fn maybe_compact(&mut self) {
+        let Some(threshold) = self.config.snapshot_threshold else {
+            return;
+        };
+        if self.last_applied - self.storage.snapshot_index() < threshold.max(1) {
+            return;
+        }
+        let state = self.state_machine.snapshot();
+        self.storage
+            .compact_to(self.last_applied, state)
+            .expect("cannot write snapshot; fail-stop");
+        tracing::info!(
+            node = self.config.id,
+            term = self.current_term(),
+            last_included_index = self.last_applied,
+            "log compacted"
+        );
     }
 
     /// Advances commit_index to the highest index replicated on a majority,

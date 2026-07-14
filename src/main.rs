@@ -39,8 +39,10 @@ async fn main() {
     };
     let (transport, raft_router, inbound) =
         HttpTransport::new(config.id, config.peers.clone(), RPC_TIMEOUT);
+    let mut raft_config = RaftConfig::new(config.id, peer_ids);
+    raft_config.snapshot_threshold = config.snapshot_threshold;
     let raft = RaftNode::spawn(
-        RaftConfig::new(config.id, peer_ids),
+        raft_config,
         storage,
         transport,
         inbound,

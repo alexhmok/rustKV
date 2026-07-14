@@ -223,6 +223,7 @@ async fn run_workload(
     reads: ReadMode,
     writes: WriteMode,
     duplicate_probability: f64,
+    snapshot_threshold: Option<u64>,
 ) -> (Vec<Recorded>, Vec<Vec<LogEntry>>, u64, u64) {
     let faults = rustkv::raft::transport::sim::FaultConfig {
         min_delay: ms(1),
@@ -231,7 +232,12 @@ async fn run_workload(
         duplicate_probability,
         rpc_timeout: ms(40),
     };
-    let cluster = Arc::new(spawn_cluster(3, seed, faults));
+    let cluster = Arc::new(spawn_cluster_with_threshold(
+        3,
+        seed,
+        faults,
+        snapshot_threshold,
+    ));
     let start = Instant::now();
     cluster.wait_for_leader().await;
 
@@ -491,6 +497,19 @@ async fn run_workload(
             .all(|s| s.last_log_index == max_last && s.commit_index == max_last)
     })
     .await;
+    // Final-STATE equality (map + dedup sessions). With snapshots on this
+    // REPLACES the callers' raw-log-equality checks (per-node compaction
+    // points legally differ, so retained logs do too); with them off it is
+    // a strictly additional claim (equal fully-committed logs already imply
+    // it — asserting it costs nothing and changes no schedule).
+    let reference_state = cluster.store(1).export();
+    for id in cluster.all_ids() {
+        assert_eq!(
+            cluster.store(id).export(),
+            reference_state,
+            "seed {seed}: node {id} final state diverges"
+        );
+    }
     for key in KEYS {
         let invoked_us = start.elapsed().as_micros() as u64;
         let result = match reads {
@@ -590,7 +609,7 @@ fn check_write_witness(history: &[Recorded], log: &[LogEntry]) -> Result<(), Str
 async fn confirmed_writes_are_linearizable_via_the_log_witness() {
     for seed in 0..6 {
         let (history, logs, _, _) =
-            run_workload(seed, ReadMode::Stale, WriteMode::FireOnce, 0.0).await;
+            run_workload(seed, ReadMode::Stale, WriteMode::FireOnce, 0.0, None).await;
         for log in &logs[1..] {
             assert_eq!(*log, logs[0], "seed {seed}: logs diverge");
         }
@@ -605,9 +624,9 @@ async fn same_seed_reproduces_the_same_history() {
     // With duplication on, so the determinism claim covers the full phase-10
     // fault mix: partitions, crashes/restarts, and duplicated messages.
     let (history_a, logs_a, crashes, _) =
-        run_workload(3, ReadMode::Linearizable, WriteMode::TokenRetry, 0.10).await;
+        run_workload(3, ReadMode::Linearizable, WriteMode::TokenRetry, 0.10, None).await;
     let (history_b, logs_b, _, _) =
-        run_workload(3, ReadMode::Linearizable, WriteMode::TokenRetry, 0.10).await;
+        run_workload(3, ReadMode::Linearizable, WriteMode::TokenRetry, 0.10, None).await;
     assert!(crashes > 0, "seed 3 must exercise a crash round");
     let refs_a: Vec<&Recorded> = history_a.iter().collect();
     let refs_b: Vec<&Recorded> = history_b.iter().collect();
@@ -630,7 +649,7 @@ async fn local_reads_expose_documented_staleness_under_partitions() {
     let mut violations = Vec::new();
     for seed in 0..6 {
         let (history, _, _, _) =
-            run_workload(seed, ReadMode::Stale, WriteMode::FireOnce, 0.0).await;
+            run_workload(seed, ReadMode::Stale, WriteMode::FireOnce, 0.0, None).await;
         if let Err(reason) = check_linearizable(&history) {
             violations.push((seed, reason));
         }
@@ -658,8 +677,14 @@ async fn linearizable_reads_pass_the_checker() {
     let mut total_crashes = 0;
     let mut total_retried_acks = 0;
     for seed in 0..6 {
-        let (history, _, crashes, retried_acks) =
-            run_workload(seed, ReadMode::Linearizable, WriteMode::TokenRetry, 0.0).await;
+        let (history, _, crashes, retried_acks) = run_workload(
+            seed,
+            ReadMode::Linearizable,
+            WriteMode::TokenRetry,
+            0.0,
+            None,
+        )
+        .await;
         total_crashes += crashes;
         total_retried_acks += retried_acks;
         let reads = history
@@ -704,6 +729,40 @@ async fn linearizable_reads_pass_the_checker() {
     );
 }
 
+/// Phase 14: the identical linearizable workload with an aggressively low
+/// snapshot threshold — every node compacts repeatedly mid-run, crashed
+/// nodes restore from their own snapshots and catch up through
+/// InstallSnapshot, and the WGL checker must STILL find zero violations on
+/// every seed. Raw-log equality is out of reach here by design (per-node
+/// compaction points legally differ); the final-state equality asserted
+/// inside `run_workload` and the checker are the claims.
+#[tokio::test(start_paused = true)]
+async fn linearizable_reads_pass_the_checker_with_snapshots_on() {
+    let mut total_crashes = 0;
+    for seed in 0..6 {
+        let (history, logs, crashes, _) = run_workload(
+            seed,
+            ReadMode::Linearizable,
+            WriteMode::TokenRetry,
+            0.0,
+            Some(16),
+        )
+        .await;
+        total_crashes += crashes;
+        // Vacuity guard: compaction really ran — no node's retained log
+        // still reaches back to index 1.
+        assert!(
+            logs.iter()
+                .all(|log| log.first().is_none_or(|e| e.index > 1)),
+            "seed {seed}: some node never compacted — the scenario is vacuous"
+        );
+        if let Err(reason) = check_linearizable(&history) {
+            panic!("seed {seed}: violation with snapshots on:\n{reason}");
+        }
+    }
+    assert!(total_crashes > 0, "no seed rolled a crash round");
+}
+
 /// The duplication soak: the linearizable workload with 10% of requests
 /// delivered twice on top of loss, partitions and crash/restarts. Both the
 /// lin checker and the log witness must still hold — duplicate
@@ -712,8 +771,14 @@ async fn linearizable_reads_pass_the_checker() {
 async fn linearizable_reads_survive_message_duplication() {
     let mut total_crashes = 0;
     for seed in 0..6 {
-        let (history, logs, crashes, _) =
-            run_workload(seed, ReadMode::Linearizable, WriteMode::TokenRetry, 0.10).await;
+        let (history, logs, crashes, _) = run_workload(
+            seed,
+            ReadMode::Linearizable,
+            WriteMode::TokenRetry,
+            0.10,
+            None,
+        )
+        .await;
         total_crashes += crashes;
         for log in &logs[1..] {
             assert_eq!(*log, logs[0], "seed {seed}: logs diverge");

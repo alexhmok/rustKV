@@ -62,6 +62,26 @@ pub struct LogEntry {
     pub command: Command,
 }
 
+/// A snapshot of the state machine at a log prefix (phase 14): everything
+/// the entries up to and including `last_included_index` produced. One shape
+/// serves both `snapshot.json` on disk and the InstallSnapshot RPC payload —
+/// a follower persists exactly what the leader sent.
+///
+/// `state` is opaque to Raft (the state machine's `snapshot()`/`restore()`
+/// pair owns its meaning — for the KV store, a [`KvSnapshot`] of map +
+/// dedup sessions). `membership` is reserved for dynamic membership
+/// (phase 15) and is always `None` today.
+///
+/// [`KvSnapshot`]: crate::store::KvSnapshot
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub last_included_index: LogIndex,
+    pub last_included_term: Term,
+    /// TODO(membership): populated by phase 15's dynamic membership.
+    pub membership: Option<Value>,
+    pub state: Value,
+}
+
 /// State that must survive crashes and be flushed to disk *before* answering
 /// any RPC (Raft §5.1, Figure 2 "persistent state"). The log itself is
 /// persisted separately (append-only) by [`crate::raft::Storage`].

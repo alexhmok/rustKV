@@ -332,9 +332,19 @@ async fn partition_heal_cycles_preserve_confirmed_writes() {
 /// restarts under 10% message loss (plus `duplicate_probability` message
 /// duplication), asserting invariants throughout.
 /// Returns the action trace and the final log for determinism checks.
+///
+/// With `snapshot_threshold` set (phase 14) the final check swaps
+/// `assert_final_consistency`'s disk-log-equality and
+/// confirmed-write-at-(term, index) claims — snapshot-incompatible, since
+/// per-node compaction points legally differ and compacted entries are gone
+/// from disk — for snapshot-aware ones (identical final states, every
+/// confirmed write's effect present, retained logs consistent with each
+/// node's own boundary). The token-less-threshold callers pass `None` and
+/// are untouched.
 async fn randomized_fault_schedule(
     seed: u64,
     duplicate_probability: f64,
+    snapshot_threshold: Option<u64>,
 ) -> (Vec<String>, Vec<LogEntry>) {
     let context = format!("seed {seed}");
     let faults = rustkv::raft::transport::sim::FaultConfig {
@@ -344,7 +354,7 @@ async fn randomized_fault_schedule(
         duplicate_probability,
         rpc_timeout: ms(40),
     };
-    let cluster = spawn_cluster(3, seed, faults);
+    let cluster = spawn_cluster_with_threshold(3, seed, faults, snapshot_threshold);
     let all = cluster.all_ids();
     let mut rng = SplitMix64::new(seed.wrapping_mul(0x5851_F42D_4C95_7F2D).wrapping_add(99));
     let mut trace = Vec::new();
@@ -439,14 +449,89 @@ async fn randomized_fault_schedule(
     }
     converge(&cluster).await;
     trace.push(format!("done: {} confirmed writes", confirmed.len()));
-    assert_final_consistency(&cluster, &confirmed, &context).await;
+    if snapshot_threshold.is_none() {
+        assert_final_consistency(&cluster, &confirmed, &context).await;
+    } else {
+        assert_final_consistency_with_snapshots(&cluster, &confirmed, &context).await;
+    }
     (trace, cluster.disk_log(1))
+}
+
+/// The snapshot-aware final check (see `randomized_fault_schedule` docs):
+/// identical final states with every confirmed write's effect present, and
+/// per-node disk consistency (retained log continues from that node's own
+/// boundary; a confirmed write is at its exact (term, index) whenever that
+/// index is still retained).
+async fn assert_final_consistency_with_snapshots(
+    cluster: &TestCluster,
+    confirmed: &[Confirmed],
+    context: &str,
+) {
+    assert!(
+        !confirmed.is_empty(),
+        "{context}: scenario confirmed no writes — nothing was actually tested"
+    );
+    let reference_state = cluster.store(1).export();
+    for id in cluster.all_ids() {
+        assert_eq!(
+            cluster.store(id).export(),
+            reference_state,
+            "{context}: node {id} state machine diverges"
+        );
+    }
+    for c in confirmed {
+        assert_eq!(
+            reference_state.map.get(&format!("v{}", c.value)),
+            Some(&json!(c.value)),
+            "{context}: confirmed write v{} missing from the final state",
+            c.value
+        );
+    }
+
+    cluster.shutdown();
+    tokio::time::sleep(ms(100)).await;
+    let mut compacted_nodes = 0;
+    for id in cluster.all_ids() {
+        let boundary = cluster
+            .disk_snapshot(id)
+            .map_or(0, |s| s.last_included_index);
+        if boundary > 0 {
+            compacted_nodes += 1;
+        }
+        let log = cluster.disk_log(id);
+        if let Some(first) = log.first() {
+            assert_eq!(
+                first.index,
+                boundary + 1,
+                "{context}: node {id} retained log must continue from its boundary"
+            );
+        }
+        for c in confirmed {
+            if c.index > boundary {
+                let entry = &log[usize::try_from(c.index - boundary - 1).unwrap()];
+                assert_eq!(
+                    (entry.term, &entry.command),
+                    (c.term, &c.command()),
+                    "{context}: node {id}: confirmed write v{} (term {}, index {}) was lost",
+                    c.value,
+                    c.term,
+                    c.index
+                );
+            }
+        }
+    }
+    // Vacuity guard: a snapshot scenario in which nothing ever compacted
+    // proves nothing about snapshots.
+    assert!(
+        compacted_nodes > 0,
+        "{context}: no node compacted — raise the write mix or lower the threshold"
+    );
 }
 
 #[tokio::test(start_paused = true)]
 async fn randomized_fault_schedules_preserve_safety_across_seeds() {
     for seed in 0..8 {
-        randomized_fault_schedule(seed, 0.0).await;
+        randomized_fault_schedule(seed, 0.0, None).await;
     }
 }
 
@@ -457,14 +542,25 @@ async fn randomized_fault_schedules_preserve_safety_across_seeds() {
 #[tokio::test(start_paused = true)]
 async fn randomized_fault_schedules_survive_message_duplication() {
     for seed in 0..8 {
-        randomized_fault_schedule(seed, 0.10).await;
+        randomized_fault_schedule(seed, 0.10, None).await;
+    }
+}
+
+/// Phase 14: the same randomized fault mix with an aggressively low
+/// snapshot threshold — nodes compact mid-schedule, restarts restore from
+/// snapshots, and lagging nodes cross compaction boundaries via
+/// InstallSnapshot, all under 10% loss.
+#[tokio::test(start_paused = true)]
+async fn randomized_fault_schedules_survive_with_snapshots_on() {
+    for seed in 0..4 {
+        randomized_fault_schedule(seed, 0.0, Some(8)).await;
     }
 }
 
 #[tokio::test(start_paused = true)]
 async fn same_seed_reproduces_the_same_fault_run() {
-    let (trace_a, log_a) = randomized_fault_schedule(5, 0.10).await;
-    let (trace_b, log_b) = randomized_fault_schedule(5, 0.10).await;
+    let (trace_a, log_a) = randomized_fault_schedule(5, 0.10, None).await;
+    let (trace_b, log_b) = randomized_fault_schedule(5, 0.10, None).await;
     assert_eq!(trace_a, trace_b, "action/outcome traces must be identical");
     assert_eq!(log_a, log_b, "final logs must be identical");
 }

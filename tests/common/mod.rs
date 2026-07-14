@@ -13,7 +13,7 @@ use std::time::Duration;
 use rustkv::raft::Storage;
 use rustkv::raft::node::{RaftConfig, RaftHandle, RaftNode, RoleKind, StateMachine, Status};
 use rustkv::raft::transport::sim::{FaultConfig, SimNetwork};
-use rustkv::raft::types::{Command, LogEntry, LogIndex, NodeId, Session, Term};
+use rustkv::raft::types::{Command, LogEntry, LogIndex, NodeId, Session, Snapshot, Term};
 use rustkv::store::KvStore;
 use serde_json::json;
 use tempfile::TempDir;
@@ -96,14 +96,22 @@ pub struct TestCluster {
     /// watch freezes at the last published value, so workloads must exclude
     /// them from leader sampling.
     crashed: Mutex<HashSet<NodeId>>,
+    /// Every node's `RaftConfig.snapshot_threshold` (phase 14). Stored so
+    /// [`Self::restart`] rebuilds the node with the SAME threshold — a
+    /// reborn node silently reverting to `None` would diverge from the
+    /// scenario under test.
+    snapshot_threshold: Option<u64>,
 }
 
 /// Spawns nodes 1..=n; `prepare` can pre-populate each node's storage
-/// (pre-existing log/term) before the node starts.
-pub fn spawn_cluster_with(
+/// (pre-existing log/term) before the node starts, and `snapshot_threshold`
+/// switches on log compaction (phase 14; `None` = off, the default
+/// everywhere so seeded schedules stay pinned).
+pub fn spawn_cluster_full(
     n: u64,
     seed: u64,
     faults: FaultConfig,
+    snapshot_threshold: Option<u64>,
     prepare: impl Fn(NodeId, &mut Storage),
 ) -> TestCluster {
     let net = SimNetwork::new(seed, faults);
@@ -116,10 +124,12 @@ pub fn spawn_cluster_with(
         prepare(id, &mut storage);
         let (transport, inbound) = net.register(id);
         let store = Arc::new(KvStore::new());
+        let mut config = node_config(id, n, seed);
+        config.snapshot_threshold = snapshot_threshold;
         nodes.push((
             id,
             Arc::new(RaftNode::spawn(
-                node_config(id, n, seed),
+                config,
                 storage,
                 transport,
                 inbound,
@@ -137,7 +147,26 @@ pub fn spawn_cluster_with(
         seed,
         incarnation: AtomicU64::new(0),
         crashed: Mutex::new(HashSet::new()),
+        snapshot_threshold,
     }
+}
+
+pub fn spawn_cluster_with(
+    n: u64,
+    seed: u64,
+    faults: FaultConfig,
+    prepare: impl Fn(NodeId, &mut Storage),
+) -> TestCluster {
+    spawn_cluster_full(n, seed, faults, None, prepare)
+}
+
+pub fn spawn_cluster_with_threshold(
+    n: u64,
+    seed: u64,
+    faults: FaultConfig,
+    snapshot_threshold: Option<u64>,
+) -> TestCluster {
+    spawn_cluster_full(n, seed, faults, snapshot_threshold, |_, _| {})
 }
 
 pub fn spawn_cluster(n: u64, seed: u64, faults: FaultConfig) -> TestCluster {
@@ -268,6 +297,7 @@ impl TestCluster {
         let store = Arc::new(KvStore::new());
         let mut config = node_config(id, n, self.seed);
         config.timeout_seed ^= incarnation << 32;
+        config.snapshot_threshold = self.snapshot_threshold;
         let handle = Arc::new(RaftNode::spawn(
             config,
             storage,
@@ -302,6 +332,22 @@ impl TestCluster {
             .expect("reopen storage")
             .entries()
             .to_vec()
+    }
+
+    /// Reads a node's snapshot back from disk (`None` if it never
+    /// compacted). Same caveat as [`Self::disk_log`]: only after the node
+    /// has been shut down or crashed.
+    pub fn disk_snapshot(&self, id: NodeId) -> Option<Snapshot> {
+        let dir = &self
+            .dirs
+            .iter()
+            .find(|(nid, _)| *nid == id)
+            .expect("no such node")
+            .1;
+        Storage::open(dir.path())
+            .expect("reopen storage")
+            .snapshot()
+            .cloned()
     }
 }
 

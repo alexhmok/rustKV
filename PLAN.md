@@ -756,12 +756,177 @@ a client exceeding the window can have a below-window op wrongly
 skipped-and-acked — the same failure class, now requiring >64 pipelined
 ops instead of 2.
 
-## Project complete (phases 0-13)
-Remaining ideas beyond the original scope, in planned order:
-snapshotting/compaction + InstallSnapshot, dynamic membership (incl.
-re-evaluating vote stickiness for removed servers), connection pooling,
-scripted Docker partition test. (TLS on the raft port: dropped — blocked
-on the dependency whitelist.)
+## Phase 14 — Snapshotting / log compaction + InstallSnapshot ✅
+
+The highest-risk phase of the roadmap: storage's implicit
+first-index-is-1 assumption died. The index-0 sentinel generalized to a
+snapshot boundary; 0/0 (no snapshot.json) reproduces the old behavior
+exactly, which is what kept every pre-phase-14 test and data dir intact.
+
+Done:
+- `src/raft/types.rs`: `Snapshot { last_included_index,
+  last_included_term, membership: Option<Value>, state: Value }` — ONE
+  shape for `snapshot.json` on disk and the InstallSnapshot RPC payload
+  (a follower persists exactly what the leader sent). `state` is opaque
+  to Raft; `membership` is reserved for phase 15 and always `None`.
+- `src/raft/storage.rs` (the bulk; both `TODO(compaction)` markers
+  resolved): `snapshot: Option<Snapshot>` held in memory whole (small by
+  scope — it doubles as the leader's payload cache, invalidated by each
+  compaction). All index arithmetic centralized in one private
+  `pos(index)`; every former `log[i-1]` site audited: `entry`/
+  `entries_from`/`term` (== boundary → `Some(snapshot_term)`; < boundary
+  → `None` = "compacted, only a snapshot can answer"), `last_index` =
+  boundary + retained len, `last_term` falls back to the boundary term
+  (load-bearing for elections after a full compaction), `truncate_from`
+  ERRORS at or below the boundary (compacted = committed = never
+  rewound). `compact_to(last_applied, state)` captures the boundary
+  entry's term BEFORE dropping it, then: write snapshot atomically →
+  rewrite log without the prefix → reopen the append handle.
+  `install_snapshot(&Snapshot)` persists a received snapshot, retaining
+  the log suffix iff our entry AT the boundary matches its term, else
+  clearing the log. Crash window between the two writes: replay skips
+  entries at or below the boundary (still validating line contiguity),
+  then requires the retained log to continue at boundary+1 — reopening
+  completes a half-done compaction idempotently.
+- Trigger (deterministic by construction — applied-entry count, no
+  size/timer): after each apply batch (and after `resolve_pending`, so
+  nothing pending ever sits below the new boundary),
+  `last_applied - snapshot_index >= threshold` →
+  `compact_to(last_applied, state_machine.snapshot())`. Always at
+  `last_applied`, never `commit_index` (committed-but-unapplied entries
+  aren't in the state yet). `RaftConfig.snapshot_threshold: Option<u64>`
+  — `None` = off = the default everywhere (the seed-churn firewall);
+  env `RUSTKV_SNAPSHOT_THRESHOLD` (>= 1 enforced) wired through
+  config.rs/main.rs.
+- `StateMachine` trait grew `snapshot() -> Value` / `restore(&Value)`;
+  KvStore implements them via phase 13's `export()/import()` +
+  serde_json. The landmine — KvStore's inherent map-only `snapshot()`
+  used by nearly every cluster test — is real but benign: Rust resolves
+  concrete calls to the inherent method, `dyn StateMachine` gets the
+  trait; pinned by a store.rs test calling both. Restore-at-boot lives
+  in `RaftNode::spawn` (the single chokepoint — main.rs and
+  `TestCluster::restart` work unchanged): restore the state machine,
+  init `commit_index`/`last_applied` to the boundary; the retained log
+  then replays through normal commit advancement.
+- InstallSnapshot (§7, single-shot — no chunking): leader sends it from
+  `send_append` when `next_index[peer] <= snapshot_index`, checked
+  BEFORE the prev_log_term lookup (which cannot answer below the
+  boundary). Follower: usual term checks + step-down; idempotence guard
+  `last_included_index <= commit_index` → success no-op (phase 10's
+  duplication fault is the standing proof); else persist (fsync before
+  replying) → restore → bump commit/last_applied. Reply carries only the
+  follower's term (Figure 13); a higher term deposes the leader. On
+  reply the leader folds `match_index`/`next_index` to the boundary
+  (max, so stale replies never rewind) and resumes AE for the tail.
+  Local proposals at or below an installed boundary become unverifiable
+  (their terms are gone): their senders are DROPPED (waiters get the
+  retryable/unknown error) rather than resolved `false` — a false
+  "definitely didn't commit" for an entry that IS in the snapshot would
+  be a lie the lin checker could catch.
+- Two AppendEntries generalizations on the follower (both vacuous at
+  boundary 0): a `prev_log_index` BELOW our boundary passes the
+  consistency check (compacted ⇒ committed ⇒ matches, by Leader
+  Completeness), and entries at or below the boundary are skipped in the
+  walk — without these, a follower that compacted ahead of the leader's
+  bookkeeping (its commit acks lost) would reject backtracking probes
+  forever while a never-compacting leader has no snapshot to send.
+- CheckQuorum interplay (decided + documented in node.rs): an
+  InstallSnapshot reply counts as `last_contact` (it IS contact at our
+  term) but never as `acked_seq` — ReadIndex confirmation stays
+  AE-seq-tagged only, so a snapshot-fed peer can't confirm a read.
+- Harness: `TestCluster` threads `snapshot_threshold` through spawn AND
+  `restart()` (a reborn node reverting to `None` would silently diverge
+  from the scenario); `disk_snapshot(id)` next to `disk_log(id)`;
+  `spawn_cluster_with_threshold`. RPC serde: existing variants' wire
+  encoding pinned byte-identical by verbatim-string tests (external
+  tagging keys by name, so the new variant changes nothing);
+  three_process.rs passed unchanged.
+
+Tested (137 total; 23 new):
+- Storage unit (11 new): compact→reopen boundary arithmetic (term/entry/
+  entries_from/last_index/last_term at, below, above the boundary);
+  compacting the whole log (empty retained log, boundary answers,
+  appends continue at boundary+1); truncate at/below boundary errors;
+  compact outside the retained range errors; the crash-window
+  idempotence test hand-builds the exact between-the-two-writes dir
+  state (plus the whole-log-covered variant); a forged boundary/log gap
+  fails loudly; install_snapshot retains a matching suffix / clears a
+  divergent log / refuses boundary regression / survives reopen; old
+  data dirs WITHOUT snapshot.json open byte-identically (log bytes
+  compared) and no snapshot file is conjured; torn-final-line repair
+  still works past a boundary.
+- tests/snapshot.rs (6 new, sim, paused time): threshold trigger
+  compacts every node (disk: snapshot + retained log continuing at each
+  node's own boundary; state machines identical); single node restarts
+  from its own snapshot and keeps working; the money test ×3 seeds —
+  crash a follower, commit+compact PAST its whole log on the survivors
+  (asserted, so the scenario can't lose its teeth), restart it → it
+  converges and its final log contains NO entry at or below its
+  crash-time last index (AE backfill was impossible; the snapshot path
+  provably ran); the same scenario under 100% request duplication
+  (duplicated InstallSnapshots hit the no-op guard; sim safety observer
+  clean); the phase-13 cross-check BOTH ways — a tokened write whose
+  application lives in the compacted prefix still dedups its retry on
+  (a) a node restarted from its own snapshot.json and (b) a node that
+  caught up via InstallSnapshot, with the interleaved conflicting value
+  winning the final state and the original entry provably absent from
+  the node's log (sessions rode the snapshot, nothing else could know).
+- Jepsen low-threshold variant (threshold 16, same 6 seeds, same
+  nemesis): the WGL checker still finds ZERO violations; final-STATE
+  equality (map + sessions, asserted inside run_workload after
+  convergence — with snapshots on it replaces raw-log equality, since
+  per-node compaction points legally differ; with them off it's a free
+  extra claim). Vacuity guard: no node's retained log still reaches
+  index 1. Crash rounds still nonzero across the seed set.
+- Faults: `randomized_fault_schedule` parametrized; a new 4-seed run
+  with threshold 8 under the full mix (10% loss, partitions,
+  crash/restart) using snapshot-aware final assertions — identical
+  exports, every confirmed write in the final state, each node's
+  retained log continuing from its own boundary, confirmed writes at
+  their exact (term, index) wherever still retained, ≥1 node compacted.
+  The token-less-threshold tests are untouched.
+- Sim unit: InstallSnapshot traffic is invisible to the phase-10 safety
+  observer (falls through the AppendEntries-only match by construction),
+  with a real conflicting AE still recording.
+- Serde pins: AppendEntries/RequestVote request+reply JSON pinned
+  verbatim against phase-13 output; InstallSnapshot roundtrips.
+- Seed-churn firewall held exactly as designed: with the feature off
+  this phase adds no RNG draws and no messages, and every pre-existing
+  suite (election, replication, read_index, faults, jepsen, dedup,
+  cluster_http, http_*, three_process) passed with ZERO behavioral
+  edits and ZERO re-pins. (Mechanical edits only: two driver functions
+  gained a `snapshot_threshold` param passed as `None`.)
+- Manual binary smoke: single node with RUSTKV_SNAPSHOT_THRESHOLD=4 —
+  10 writes → snapshot.json at boundary 8 + 3-line retained log on
+  disk; kill -9 → restart → restores from snapshot, serves all keys,
+  accepts new writes.
+
+Untested / known gaps (documented, not fixed):
+- No §7 chunking: the snapshot rides one RPC, held in memory whole on
+  both ends — payload size is unbounded in memory and on the wire
+  (fine at this project's scale; the real fix is offset-chunked
+  InstallSnapshot).
+- No snapshot-rate limiting: a lagging peer is re-sent the snapshot at
+  heartbeat pace until its first reply folds next_index forward
+  (duplicates are follower no-ops, so this wastes bandwidth, not
+  correctness).
+- Dedup duplicates still consume log indexes and now also snapshot
+  work (phase 13's gap, unchanged).
+- A leader compacts independently of peer progress: compacting past a
+  live-but-slow peer's match_index forces a snapshot where entries
+  would have done (no match_index floor on compact_to).
+- The sessions table inside snapshots inherits phase 13's unbounded
+  growth.
+
+## Project complete (phases 0-14)
+Remaining ideas beyond the original scope, in planned order: dynamic
+membership (incl. re-evaluating vote stickiness for removed servers;
+the snapshot file's `membership` field and InstallSnapshot joiner
+catch-up are already in place), connection pooling, scripted Docker
+partition test. (TLS on the raft port: dropped — blocked on the
+dependency whitelist.)
 
 ## Out of scope (deliberate)
-Snapshotting/log compaction, dynamic membership changes — leave clean TODOs.
+Dynamic membership changes — clean TODOs remain (`TODO(membership)` on
+the snapshot's reserved field). Snapshotting graduated from this list in
+phase 14.

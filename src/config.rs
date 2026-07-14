@@ -11,6 +11,8 @@
 //! - `RUSTKV_PEER_CLIENT_URLS`   — other members' client base URLs for write
 //!   redirects: `2=http://host:port,...` (optional; without it, non-leaders
 //!   answer 503 instead of 307)
+//! - `RUSTKV_SNAPSHOT_THRESHOLD` — compact the log every N applied entries
+//!   (>= 1; unset = snapshotting off, the default)
 
 use std::collections::HashMap;
 
@@ -24,6 +26,7 @@ pub struct NodeConfig {
     pub data_dir: String,
     pub peers: HashMap<NodeId, String>,
     pub peer_client_urls: HashMap<NodeId, String>,
+    pub snapshot_threshold: Option<u64>,
 }
 
 impl NodeConfig {
@@ -50,6 +53,17 @@ impl NodeConfig {
                 get("RUSTKV_PEER_CLIENT_URLS").as_deref().unwrap_or(""),
             )
             .map_err(|e| format!("RUSTKV_PEER_CLIENT_URLS: {e}"))?,
+            snapshot_threshold: match get("RUSTKV_SNAPSHOT_THRESHOLD") {
+                Some(raw) => match raw.parse::<u64>() {
+                    Ok(n) if n >= 1 => Some(n),
+                    _ => {
+                        return Err(format!(
+                            "RUSTKV_SNAPSHOT_THRESHOLD must be a number >= 1, got {raw:?}"
+                        ));
+                    }
+                },
+                None => None,
+            },
         };
         if config.peers.contains_key(&config.id) {
             return Err(format!(
@@ -100,6 +114,17 @@ mod tests {
         assert_eq!(config.data_dir, "./rustkv-data");
         assert!(config.peers.is_empty());
         assert!(config.peer_client_urls.is_empty());
+        assert_eq!(config.snapshot_threshold, None, "snapshotting is opt-in");
+    }
+
+    #[test]
+    fn parses_and_validates_the_snapshot_threshold() {
+        let config = NodeConfig::from_vars(vars(&[("RUSTKV_SNAPSHOT_THRESHOLD", "1000")])).unwrap();
+        assert_eq!(config.snapshot_threshold, Some(1000));
+        // 0 would mean "compact on every apply, even at the boundary" —
+        // rejected rather than silently clamped.
+        assert!(NodeConfig::from_vars(vars(&[("RUSTKV_SNAPSHOT_THRESHOLD", "0")])).is_err());
+        assert!(NodeConfig::from_vars(vars(&[("RUSTKV_SNAPSHOT_THRESHOLD", "abc")])).is_err());
     }
 
     #[test]

@@ -210,6 +210,19 @@ impl StateMachine for KvStore {
             Command::Noop => {}
         }
     }
+
+    // NOTE: this trait method coexists with the inherent map-only
+    // `KvStore::snapshot()`; concrete calls resolve to the inherent one, so
+    // existing callers are untouched (pinned by a test below).
+    fn snapshot(&self) -> Value {
+        serde_json::to_value(self.export()).expect("KvSnapshot serialization cannot fail")
+    }
+
+    fn restore(&self, state: &Value) {
+        let snapshot: KvSnapshot = serde_json::from_value(state.clone())
+            .expect("malformed KV snapshot payload; fail-stop");
+        self.import(snapshot);
+    }
 }
 
 #[cfg(test)]
@@ -401,6 +414,35 @@ mod tests {
         );
         assert_eq!(store.get("k"), None);
         assert_eq!(store.export().sessions, HashMap::new());
+    }
+
+    /// The method-resolution landmine, pinned: `KvStore::snapshot()` (the
+    /// inherent, map-only test helper) and `StateMachine::snapshot()` (the
+    /// phase-14 payload) coexist. Concrete calls resolve to the inherent
+    /// method; the trait method is reached through `dyn StateMachine` (or
+    /// UFCS) and captures map + sessions.
+    #[test]
+    fn inherent_and_trait_snapshot_methods_coexist() {
+        let store = KvStore::new();
+        apply(&store, 1, tokened_put("k", 1, 7, 1));
+
+        // Inherent: just the map.
+        let map: HashMap<String, Value> = store.snapshot();
+        assert_eq!(map, HashMap::from([("k".to_string(), json!(1))]));
+
+        // Trait: the full opaque payload, restorable elsewhere.
+        let payload: Value = StateMachine::snapshot(&store);
+        assert_eq!(
+            payload,
+            serde_json::to_value(store.export()).unwrap(),
+            "trait snapshot is the serialized KvSnapshot"
+        );
+        let restored = KvStore::new();
+        StateMachine::restore(&restored, &payload);
+        assert_eq!(restored.export(), store.export());
+        // Sessions rode along: the retry still dedups on the restored store.
+        apply(&restored, 2, tokened_put("k", 99, 7, 1));
+        assert_eq!(restored.get("k"), Some(json!(1)));
     }
 
     #[test]

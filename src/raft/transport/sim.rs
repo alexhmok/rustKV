@@ -366,9 +366,10 @@ fn draw_delay(rng: &mut SplitMix64, cfg: &FaultConfig) -> Duration {
 mod tests {
     use super::*;
     use crate::raft::rpc::{
-        AppendEntriesArgs, AppendEntriesReply, RequestVoteArgs, RequestVoteReply,
+        AppendEntriesArgs, AppendEntriesReply, InstallSnapshotArgs, InstallSnapshotReply,
+        RequestVoteArgs, RequestVoteReply,
     };
-    use crate::raft::types::Term;
+    use crate::raft::types::{Snapshot, Term};
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::time::Instant;
 
@@ -424,6 +425,9 @@ mod tests {
                         term: args.term,
                         vote_granted: true,
                     }),
+                    RpcRequest::InstallSnapshot(args) => {
+                        RpcResponse::InstallSnapshot(InstallSnapshotReply { term: args.term })
+                    }
                 };
                 let _ = inbound.reply.send(resp);
             }
@@ -779,6 +783,41 @@ mod tests {
 
         // Sanity that the observer is still awake: a conflicting REAL claim
         // for that term does record.
+        t2.send(3, ae_req(5, 2)).await.unwrap();
+        assert_eq!(net.safety_violations().len(), 1);
+    }
+
+    /// InstallSnapshot (phase 14) is, like PreVote, not an AppendEntries:
+    /// the safety observer ignores it by construction — even when it looks
+    /// like a conflicting leadership claim. (Its correctness is covered by
+    /// the Raft-level snapshot tests; the observer's three checks are all
+    /// defined over AppendEntries contents only.)
+    #[tokio::test(start_paused = true)]
+    async fn install_snapshots_are_invisible_to_the_safety_observer() {
+        let net = SimNetwork::new(0, fixed_delay_config(ms(1)));
+        let (t1, _rx1) = net.register(1);
+        let (t2, _rx2) = net.register(2);
+        let (_t3, rx3) = net.register(3);
+        spawn_echo(rx3);
+
+        let snap_req = |leader_id: NodeId| {
+            RpcRequest::InstallSnapshot(InstallSnapshotArgs {
+                term: 5,
+                leader_id,
+                snapshot: Snapshot {
+                    last_included_index: 3,
+                    last_included_term: 2,
+                    membership: None,
+                    state: serde_json::json!({}),
+                },
+            })
+        };
+        t1.send(3, snap_req(1)).await.unwrap();
+        t2.send(3, snap_req(2)).await.unwrap();
+        assert_eq!(net.safety_violations(), Vec::<String>::new());
+
+        // Sanity that the observer is still awake for real AE claims.
+        t1.send(3, ae_req(5, 1)).await.unwrap();
         t2.send(3, ae_req(5, 2)).await.unwrap();
         assert_eq!(net.safety_violations().len(), 1);
     }
