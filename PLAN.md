@@ -1562,13 +1562,229 @@ duplication fault injection, real power-loss testing, the residual
 partial-partition liveness gap, sessions-table growth, and the
 chunking/streaming path for genuinely slow-network snapshot transfer.
 
-## Project complete (phases 0-17 + testing review)
-Remaining ideas beyond the original scope: none — the scripted Docker
-partition test shipped in phase 17. (TLS on the raft port: dropped —
-blocked on the dependency whitelist.)
+## Phases 0-17 + testing review complete; phases 18-21 planned below
+The original scope shipped in phase 17; the 2026-07-14 testing review
+added the failure-mode catalog (FAILURE_MODES.md) and the follow-on
+phases below were planned from its findings. (TLS on the raft port:
+still dropped — blocked on the dependency whitelist; the mitigation
+ladder is in FAILURE_MODES.md.)
+
+## Planned phases 18-21 (not started)
+
+Ordered so each phase strengthens the net under the next: the Ongaro
+test first (insurance on the subtlest safety argument, before any
+membership code moves), then the two small membership hardenings, then
+the catch-up scalability work (which learner catch-up will lean on),
+then learners — the largest change — last, landing on top of all three.
+
+Standing rules for all four (beyond CLAUDE.md): the seed-churn firewall
+— new behavior must default OFF in `RaftConfig` (`None`/`false`) so
+every seeded sim schedule stays byte-identical, with the binary opting
+in via env config, exactly as `snapshot_threshold` did in phase 14; any
+wire-visible change gets verbatim serde pins proving old encodings are
+readable and default-config output is byte-identical; test-first for
+every claim of the form "X prevents Y" (demonstrate Y with X disabled,
+then invert); FAILURE_MODES.md is updated in the same commit as any
+phase that changes a documented failure mode.
+
+### Phase 18 — the Ongaro concurrent-change schedule (test-the-fix debt)
+
+Goal: demonstrate the disjoint-majority disease that the phase-15
+reconfig gates (no ConfigChange before this term's no-op commits +
+one-in-flight) exist to prevent, then show the gates refuse the same
+schedule. Pure test work plus one harness hook; no product behavior
+changes.
+
+Design:
+- `RaftConfig.test_disable_reconfig_gates: bool` (default false; doc
+  comment marks it harness-only — it must never be reachable from env
+  config). Threaded through `TestCluster` spawn/restart like the
+  snapshot knobs.
+- Schedule (from Ongaro's 2015 raft-dev counterexample, adapted to
+  effect-on-append): 4-server base {1,2,3,4}. With gates OFF, leader 1
+  appends `remove 4` (new quorum set {1,2,3}) and, via directed link
+  blocks, replicates it only to node 3 — {1,3} is a 2-of-3 majority
+  under the new config, so leader 1 commits it plus a payload write.
+  Concurrently node 2 (which never saw the entry) wins term+1 with
+  votes {2,3,4} gathered BEFORE the entry reached 3 (fixed sim delays
+  make this window constructible), appends `remove 3` (quorum set
+  {1,2,4}) and commits its own payload write with {2,4}. {1,3} and
+  {2,4} are disjoint: two leaders commit independently.
+- Assertions, gates OFF: the phase-10 event-level observer (log
+  matching / election safety) or the final-log divergence check MUST
+  fire — the run is expected-unsafe, written as a `#[should_panic]` or
+  explicit-violation-count test.
+- Assertions, gates ON: the identical driver refuses the second
+  proposal at the exact step (`InvalidConfigChange`), the run converges,
+  and the WGL/divergence checks pass.
+- Honest fallback, recorded if hit: if §5.4.1 log-completeness (node 3
+  denying candidate 2 once it holds the entry) independently blocks
+  every constructible interleaving, tighten the timing (grant-then-
+  deliver orderings are schedulable with fixed delays); if it STILL
+  cannot be constructed, document which defense actually binds in this
+  implementation — that finding replaces the test as the phase
+  deliverable, recorded here and in FAILURE_MODES.md.
+
+Done when: both directions land (disease demonstrated gates-off,
+refused gates-on), zero seed re-pins elsewhere (the flag adds no RNG
+draws), lint green, checkpoint.
+
+### Phase 19 — membership hardening pair (guard ack-tracking + removed-server notification)
+
+Two small, independent fixes in the same area; one phase, one
+checkpoint.
+
+(a) Reconfig guard blind spot in a fresh term (FAILURE_MODES.md
+"Reconfig guard blind spot"):
+- Today `last_contact` initializes to leadership start, so for the
+  first `election_timeout_max` of a term every member LOOKS recently
+  heard and a ConfigChange can pass while a member is down.
+- Fix: a member counts as reachable only once it has ACKED this term —
+  a per-peer flag set at the same site that updates `acked_seq`
+  (any AppendEntries reply at our term), self always counting.
+  Latency cost ~one heartbeat RTT, and in practice zero: the no-op
+  gate already forces waiting for a majority of acks.
+- Test (test-first): crash a member, force a leadership change, propose
+  the add inside the old blind window → must now be refused; after the
+  survivors ack → accepted. The existing guard tests must pass
+  unchanged (they operate on long-established leaders).
+
+(b) Removed servers are never told (FAILURE_MODES.md "Removed servers
+are never told"):
+- Today the leader stops replicating to a removed peer immediately, so
+  the peer never learns of its removal and probes forever.
+- Fix: keep sending AppendEntries to a removed peer until
+  `match_index[peer] >= the removal entry's index`, then stop. The
+  peer applies the ConfigChange, derives a membership excluding
+  itself, and the EXISTING campaign gate (self ∈ members, built for
+  join mode) parks it silently. Track a `departing: HashMap<NodeId,
+  LogIndex>` in `Role::Leader`, populated when a removal takes effect
+  on append; departing peers never count toward any quorum (already
+  excluded by membership) and are dropped from the map on ack or
+  step-down (a successor leader inherits nothing — a peer removed
+  under a crashed leader may still park probing; the fix is
+  best-effort by design, document that residual).
+- Known pitfall to solve in-phase: main.rs's membership watch installs
+  ONLY current members into the transport address book, which would
+  make the parting sends `Unreachable` in the real binary. The watch
+  payload must carry departing members' addresses until their removal
+  is replicated (a second watch update drops them). Sim tests don't
+  need addresses; add a real-transport assertion (cluster_http or
+  three_process) that a removed node goes quiet.
+- Test (test-first): extend `removed_follower_cannot_disrupt_the_
+  members` — after the fix the removed node must APPLY its own removal
+  and go silent (Follower, frozen term, zero pre-campaigns over N
+  virtual seconds), instead of probing forever.
+
+### Phase 20 — catch-up scalability (AE batch cap, size-aware timeout, §7 snapshot chunking)
+
+Closes the remaining half of the payload gap (FAILURE_MODES.md
+"Single-shot snapshot / batch vs the RPC timeout"). The 2 MiB hard cap
+died in the testing review; what remains is bandwidth × timeout.
+
+(a) AppendEntries byte cap (undoes the deliberate phase-4 "no batching
+cap" simplification):
+- `RaftConfig.max_append_bytes: Option<usize>` (None = unbounded =
+  today, the sim default — zero seed churn). main.rs default 1 MiB via
+  `RUSTKV_MAX_APPEND_BYTES`.
+- `send_append` truncates the `entries_from(next_index)` suffix at the
+  budget (estimate via serialized command sizes; exactness not
+  required). Raft handles partial progress natively: the follower acks
+  the prefix, match/next advance, and the existing
+  still-lagging-resend-immediately logic is the pump — no protocol
+  change, no wire change.
+- Tests: a follower N MiB behind converges in bounded-size steps
+  (counting-server or sim-level max-message-size assertion); the
+  payload experiment script re-run at 64-256 MiB with compaction off.
+
+(b) Size-aware RPC timeout (HTTP transport only, core untouched):
+- Effective timeout grows with body size past a threshold (e.g.
+  `rpc_timeout + bytes / RUSTKV_ASSUMED_BANDWIDTH`), so a big
+  InstallSnapshot no longer races the heartbeat-scale budget while
+  small RPCs keep tight failure detection. Env-tunable; unit tests on
+  the arithmetic.
+
+(c) §7 InstallSnapshot chunking (chosen over etcd-style out-of-band
+pull because chunking is transport-agnostic — the core never learns
+about HTTP, preserving the architecture rule):
+- `InstallSnapshotArgs` gains `offset`, `data` (chunk), `done` with
+  serde defaults such that today's messages read as offset-0/done-true
+  single chunks — old wire format stays valid, pinned verbatim.
+- Follower buffers chunks keyed by (term, leader, last_included_index),
+  discards the staging on term change or a mismatched key, persists +
+  restores only at `done` (the existing fsync-before-reply and
+  idempotence guards apply at the done step; per-chunk retries are
+  offset-idempotent).
+- `RaftConfig.snapshot_chunk_bytes: Option<usize>` (None = single-shot
+  = today = sim default; binary default a few MiB via env).
+- Tests: the phase-14 money test re-run with a tiny chunk size (forces
+  many chunks) including under 100% duplication; leader crash
+  mid-transfer (staging discarded, successor restarts transfer);
+  wire-format pins; joiner catch-up over chunks in membership.rs.
+
+Done when: the payload experiment converges at 256 MiB behind on
+defaults, all seeded suites green with zero re-pins (all three knobs
+off in sim), FAILURE_MODES.md entry rewritten.
+
+### Phase 21 — learner members
+
+The largest planned change (FAILURE_MODES.md "No learners"): every add
+currently reduces fault tolerance until catch-up, and 1→2 growth is
+deliberately impossible. Learners (etcd model) fix both: replicate to
+them, count them nowhere.
+
+Design:
+- `Membership` values grow a role: `MemberAddr` → add
+  `role: Role::{Voter, Learner}` with `#[serde(default = Voter)]` —
+  every existing log entry, snapshot, and admin body stays readable;
+  default-config output byte-identical (pinned verbatim, the phase-13
+  serde discipline).
+- Quorum arithmetic counts VOTERS only. Phase 15 funneled everything
+  through one `majority()` and members-iteration — the edit surface is
+  exactly: vote counting, commit advancement, ReadIndex confirmation,
+  CheckQuorum, and the availability guard (counts the new voter set).
+  Fan-out (AE, InstallSnapshot, heartbeats) iterates ALL members so
+  learners replicate. The campaign gate becomes self ∈ VOTERS (a
+  learner never campaigns or pre-votes; RequestVote/PreVote handlers
+  additionally refuse to GRANT from... no — grants stay log-checked
+  and harmless; only candidacy is gated. Decide and document
+  grant-side behavior explicitly in-phase).
+- ConfigChange validation: adding a learner never changes any quorum →
+  always safe (still one-in-flight, still no-op-gated for simplicity).
+  Promotion (learner → voter) is the ONLY quorum-changing add and
+  requires: reachability (the phase-19 ack-tracked guard) AND
+  catch-up proximity — leader-side check `match_index[id] >=
+  commit_index - threshold` (threshold a RaftConfig knob). Removal of
+  a learner is trivially safe. The single-server delta rule applies to
+  the VOTER set; learner add/remove/promote are each one config entry.
+- 1→2 growth becomes: add learner (guard passes — no new voter), wait
+  for catch-up, promote (guard checks the 2-of-2 voter majority is
+  reachable AND the learner is current — the brick scenario is
+  unreachable because promotion of a non-current learner is refused).
+- Admin API: `PUT /cluster/members/{id}` body gains optional
+  `"role": "learner"`; promotion via the same PUT with `"role":
+  "voter"` on an existing learner (the one allowed "address change"-
+  shaped update); GET exposes roles. 409 taxonomy documented.
+- Harness: `TestCluster::add_learner`, promotion helper, and the
+  membership churn soak gains learner rounds (add-learner →
+  write-while-catching-up → promote → occasionally remove-learner),
+  WGL-checked as ever.
+- Tests (the phase-15 suite is the template): learner replicates but
+  its failure never blocks commits (kill the learner, writes proceed —
+  the vacuity-guarded inverse of the add-voter window); learner never
+  campaigns and never counts (vote matrix); promotion refused while
+  lagging / while unreachable, accepted when current; 1→2→3 dynamic
+  bootstrap end-to-end over real HTTP (cluster_http + binary smoke);
+  leader crash with a learner mid-catch-up; soak.
+- FAILURE_MODES.md: rewrite "No learners" and "Dynamic 1→2 growth";
+  the reduced-fault-tolerance window entry shrinks to the promotion
+  round trip.
+
+Done when: all of the above green, zero seed re-pins in non-membership
+suites (roles default to Voter; no new RNG draws), churn soak extended,
+checkpoint. Joint consensus stays out of scope.
 
 ## Out of scope (deliberate)
-Joint-consensus (multi-server) membership changes and a snapshot
-chunking/streaming path for large joiner catch-up. Dynamic single-server
-membership graduated from this list in phase 15 (as snapshotting did in
-phase 14); no `TODO(membership)` markers remain.
+Joint-consensus (multi-server) membership changes. The snapshot
+chunking/streaming path graduated from this list into planned phase 20
+(as dynamic membership did in phase 15 and snapshotting in phase 14).
