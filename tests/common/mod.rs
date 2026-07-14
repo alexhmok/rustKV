@@ -13,7 +13,7 @@ use std::time::Duration;
 use rustkv::raft::Storage;
 use rustkv::raft::node::{RaftConfig, RaftHandle, RaftNode, RoleKind, StateMachine, Status};
 use rustkv::raft::transport::sim::{FaultConfig, SimNetwork};
-use rustkv::raft::types::{Command, LogEntry, LogIndex, NodeId, Term};
+use rustkv::raft::types::{Command, LogEntry, LogIndex, NodeId, Session, Term};
 use rustkv::store::KvStore;
 use serde_json::json;
 use tempfile::TempDir;
@@ -44,6 +44,17 @@ pub fn put(key: &str, value: u64) -> Command {
     Command::Put {
         key: key.to_string(),
         value: json!(value),
+        session: None,
+    }
+}
+
+/// Like [`put`], but carrying a dedup token (phase 13): the state machine
+/// applies at most one command per (client, seq).
+pub fn put_with_token(key: &str, value: u64, client: u64, seq: u64) -> Command {
+    Command::Put {
+        key: key.to_string(),
+        value: json!(value),
+        session: Some(Session { client, seq }),
     }
 }
 

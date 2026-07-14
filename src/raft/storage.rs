@@ -316,6 +316,7 @@ mod tests {
             command: Command::Put {
                 key: format!("k{index}"),
                 value: json!({ "i": index }),
+                session: None,
             },
         }
     }

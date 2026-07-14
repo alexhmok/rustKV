@@ -14,13 +14,39 @@ pub type Term = u64;
 /// (e.g. `prev_log_index` before the first entry).
 pub type LogIndex = u64;
 
+/// A client dedup token (phase 13): `seq` must be strictly increasing per
+/// `client`. The state machine applies a tokened command only if its `seq`
+/// is above the client's highest applied one, so a retried ambiguous write
+/// commits again but mutates nothing — exactly-once application on top of
+/// at-least-once delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Session {
+    pub client: u64,
+    pub seq: u64,
+}
+
 /// A state-machine command carried by a log entry. Put/Delete mirror the
 /// client API's write operations; Noop is appended by a fresh leader (§8) to
 /// commit prior-term entries promptly and is skipped by the state machine.
+///
+/// `session` is the optional dedup token. It is `#[serde(default)]` so
+/// pre-phase-13 log files stay readable, and skipped when absent so
+/// token-less commands serialize byte-identical to pre-phase-13 output
+/// (protecting both old data dirs and the RPC wire format) — pinned by
+/// unit tests below.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Command {
-    Put { key: String, value: Value },
-    Delete { key: String },
+    Put {
+        key: String,
+        value: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<Session>,
+    },
+    Delete {
+        key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<Session>,
+    },
     Noop,
 }
 
@@ -43,4 +69,91 @@ pub struct LogEntry {
 pub struct HardState {
     pub current_term: Term,
     pub voted_for: Option<NodeId>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Token-less commands must serialize byte-identical to the pre-phase-13
+    /// format: this is the on-disk `log.jsonl` line format AND the HTTP RPC
+    /// wire format, so a mixed-version cluster and old data dirs both depend
+    /// on it. The strings are pinned verbatim from phase-12 output.
+    #[test]
+    fn tokenless_commands_serialize_byte_identical_to_phase_12() {
+        let entry = LogEntry {
+            term: 3,
+            index: 7,
+            command: Command::Put {
+                key: "k".to_string(),
+                value: json!({"a": 1}),
+                session: None,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&entry).unwrap(),
+            r#"{"term":3,"index":7,"command":{"Put":{"key":"k","value":{"a":1}}}}"#
+        );
+        let delete = Command::Delete {
+            key: "gone".to_string(),
+            session: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&delete).unwrap(),
+            r#"{"Delete":{"key":"gone"}}"#
+        );
+    }
+
+    /// Pre-phase-13 log lines (no `session` field) must deserialize, with
+    /// the token absent — old data dirs stay readable.
+    #[test]
+    fn phase_12_log_lines_deserialize_without_a_session() {
+        let entry: LogEntry = serde_json::from_str(
+            r#"{"term":3,"index":7,"command":{"Put":{"key":"k","value":{"a":1}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            entry.command,
+            Command::Put {
+                key: "k".to_string(),
+                value: json!({"a": 1}),
+                session: None,
+            }
+        );
+        let delete: Command = serde_json::from_str(r#"{"Delete":{"key":"gone"}}"#).unwrap();
+        assert_eq!(
+            delete,
+            Command::Delete {
+                key: "gone".to_string(),
+                session: None,
+            }
+        );
+    }
+
+    #[test]
+    fn tokened_commands_roundtrip() {
+        let command = Command::Put {
+            key: "k".to_string(),
+            value: json!(1),
+            session: Some(Session { client: 4, seq: 9 }),
+        };
+        let encoded = serde_json::to_string(&command).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"Put":{"key":"k","value":1,"session":{"client":4,"seq":9}}}"#
+        );
+        assert_eq!(serde_json::from_str::<Command>(&encoded).unwrap(), command);
+
+        let delete = Command::Delete {
+            key: "k".to_string(),
+            session: Some(Session { client: 4, seq: 10 }),
+        };
+        let encoded = serde_json::to_string(&delete).unwrap();
+        assert_eq!(
+            encoded,
+            r#"{"Delete":{"key":"k","session":{"client":4,"seq":10}}}"#
+        );
+        assert_eq!(serde_json::from_str::<Command>(&encoded).unwrap(), delete);
+    }
 }

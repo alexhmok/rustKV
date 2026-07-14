@@ -24,22 +24,47 @@
 //! restart restores the majority — and a same-seed determinism check over
 //! the randomized schedule.
 //!
-//! Honest limits: each value is proposed at most once, so client-level
-//! retry duplication is out of scope (see PLAN.md) — transport-level
-//! duplication is covered by the `duplicate_probability` soak.
+//! Client-level retry duplication (phase 13): `write_until_confirmed`
+//! retries ONE value with ONE dedup token until some attempt definitely
+//! commits, so ambiguous outcomes no longer burn values. The log may then
+//! legally hold the same key several times — but only under one shared
+//! token, and only one application happens (asserted via final state).
+//! The single-shot writes of the randomized schedule stay token-less.
 
 mod common;
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::time::Duration;
 
 use common::*;
 use rustkv::raft::node::{RoleKind, Status};
-use rustkv::raft::types::{Command, LogEntry, LogIndex, NodeId, Term};
+use rustkv::raft::types::{Command, LogEntry, LogIndex, NodeId, Session, Term};
 use rustkv::rng::SplitMix64;
+use serde_json::json;
+
+/// The one logical client behind every `write_until_confirmed` retry loop;
+/// its seqs are the (strictly increasing) values themselves.
+const RETRY_CLIENT: u64 = 0;
 
 /// A write whose commit was positively observed.
-type Confirmed = (Term, LogIndex, u64);
+#[derive(Debug)]
+struct Confirmed {
+    term: Term,
+    index: LogIndex,
+    value: u64,
+    session: Option<Session>,
+}
+
+impl Confirmed {
+    /// The exact command the log must hold at (term, index).
+    fn command(&self) -> Command {
+        Command::Put {
+            key: format!("v{}", self.value),
+            value: json!(self.value),
+            session: self.session,
+        }
+    }
+}
 
 /// The single visible leader among `ids`, if there is exactly one.
 fn unique_leader(cluster: &TestCluster, ids: &[NodeId]) -> Option<Status> {
@@ -54,38 +79,58 @@ fn unique_leader(cluster: &TestCluster, ids: &[NodeId]) -> Option<Status> {
     }
 }
 
-/// One attempt: find a unique leader among `ids`, propose `value`, and wait
-/// up to 2 virtual seconds for the commit. `None` = outcome unknown or no
-/// leader; the caller must NOT reuse the value (it may still commit later).
-async fn try_confirmed_write(
+/// One attempt: find a unique leader among `ids`, propose `command`, and
+/// wait up to 2 virtual seconds for the commit. `None` = outcome unknown or
+/// no leader — the entry may still commit later.
+async fn try_confirmed_command(
     cluster: &TestCluster,
     ids: &[NodeId],
-    value: u64,
+    command: Command,
 ) -> Option<(Term, LogIndex)> {
     let leader = unique_leader(cluster, ids)?;
-    let proposal = cluster
-        .handle(leader.id)
-        .propose(put(&format!("v{value}"), value))
-        .await
-        .ok()?;
+    let proposal = cluster.handle(leader.id).propose(command).await.ok()?;
     match tokio::time::timeout(ms(2000), proposal.committed).await {
         Ok(Ok(true)) => Some((proposal.term, proposal.index)),
         _ => None,
     }
 }
 
-/// Burns values until one write is confirmed among `ids`; panics after 100
-/// attempts (a liveness failure worth failing loudly on).
+/// A single token-less attempt at `v{value}={value}`; on `None` the caller
+/// must NOT reuse the value (it may still commit later).
+async fn try_confirmed_write(
+    cluster: &TestCluster,
+    ids: &[NodeId],
+    value: u64,
+) -> Option<(Term, LogIndex)> {
+    try_confirmed_command(cluster, ids, put(&format!("v{value}"), value)).await
+}
+
+/// Retries ONE value with ONE dedup token until some attempt definitely
+/// commits (phase 13: an Unknown outcome no longer burns the value — the
+/// retry carries the same Session, so even if an earlier ambiguous attempt
+/// lands too, the mutation applies once). Panics after 100 attempts (a
+/// liveness failure worth failing loudly on).
 async fn write_until_confirmed(
     cluster: &TestCluster,
     ids: &[NodeId],
     next_value: &mut u64,
     confirmed: &mut Vec<Confirmed>,
 ) {
+    *next_value += 1;
+    let value = *next_value;
+    let session = Session {
+        client: RETRY_CLIENT,
+        seq: value,
+    };
+    let command = put_with_token(&format!("v{value}"), value, session.client, session.seq);
     for _ in 0..100 {
-        *next_value += 1;
-        if let Some((term, index)) = try_confirmed_write(cluster, ids, *next_value).await {
-            confirmed.push((term, index, *next_value));
+        if let Some((term, index)) = try_confirmed_command(cluster, ids, command.clone()).await {
+            confirmed.push(Confirmed {
+                term,
+                index,
+                value,
+                session: Some(session),
+            });
             return;
         }
         tokio::time::sleep(ms(100)).await;
@@ -111,7 +156,11 @@ async fn converge(cluster: &TestCluster) {
 
 /// Snapshots must match while nodes are alive; logs are compared from disk
 /// after shutdown; every confirmed write must be present at its exact
-/// (term, index); no Put key may appear twice (each value proposed once).
+/// (term, index) and in the final state. A Put key may appear in the log
+/// more than once ONLY if every occurrence carries the same dedup token
+/// (phase 13: a retried ambiguous write plus its confirmed retry) — the
+/// exactly-once claim is on the logical effect, asserted via final state,
+/// not on log occupancy.
 async fn assert_final_consistency(cluster: &TestCluster, confirmed: &[Confirmed], context: &str) {
     assert!(
         !confirmed.is_empty(),
@@ -125,6 +174,14 @@ async fn assert_final_consistency(cluster: &TestCluster, confirmed: &[Confirmed]
             "{context}: node {id} state machine diverges"
         );
     }
+    for c in confirmed {
+        assert_eq!(
+            reference_snapshot.get(&format!("v{}", c.value)),
+            Some(&json!(c.value)),
+            "{context}: confirmed write v{} missing from the final state",
+            c.value
+        );
+    }
 
     cluster.shutdown();
     tokio::time::sleep(ms(100)).await;
@@ -136,20 +193,25 @@ async fn assert_final_consistency(cluster: &TestCluster, confirmed: &[Confirmed]
             "{context}: node {id} log diverges"
         );
     }
-    for &(term, index, value) in confirmed {
-        let entry = &reference_log[usize::try_from(index - 1).unwrap()];
+    for c in confirmed {
+        let entry = &reference_log[usize::try_from(c.index - 1).unwrap()];
         assert_eq!(
             (entry.term, &entry.command),
-            (term, &put(&format!("v{value}"), value)),
-            "{context}: confirmed write v{value} (term {term}, index {index}) was lost"
+            (c.term, &c.command()),
+            "{context}: confirmed write v{} (term {}, index {}) was lost",
+            c.value,
+            c.term,
+            c.index
         );
     }
-    let mut keys = HashSet::new();
+    let mut keys: HashMap<String, Option<Session>> = HashMap::new();
     for entry in &reference_log {
-        if let Command::Put { key, .. } = &entry.command {
+        if let Command::Put { key, session, .. } = &entry.command
+            && let Some(previous) = keys.insert(key.clone(), *session)
+        {
             assert!(
-                keys.insert(key.clone()),
-                "{context}: key {key} committed twice"
+                session.is_some() && previous == *session,
+                "{context}: key {key} committed twice without a shared dedup token"
             );
         }
     }
@@ -175,7 +237,12 @@ async fn leader_crash_mid_write_preserves_confirmed_writes() {
             (leader.term, Ok(true)),
             "{context}"
         );
-        confirmed.push((p1.term, p1.index, 1));
+        confirmed.push(Confirmed {
+            term: p1.term,
+            index: p1.index,
+            value: 1,
+            session: None,
+        });
 
         // In-flight write, then crash the leader before its commit is known.
         // The entry is on the crashed leader's disk and may or may not have
@@ -197,7 +264,12 @@ async fn leader_crash_mid_write_preserves_confirmed_writes() {
         assert!(new.term > leader.term, "{context}");
         let p3 = cluster.handle(new.id).propose(put("v3", 3)).await.unwrap();
         assert_eq!(p3.committed.await, Ok(true), "{context}");
-        confirmed.push((p3.term, p3.index, 3));
+        confirmed.push(Confirmed {
+            term: p3.term,
+            index: p3.index,
+            value: 3,
+            session: None,
+        });
 
         cluster.restart(leader.id).await;
         converge(&cluster).await;
@@ -294,7 +366,12 @@ async fn randomized_fault_schedule(
                 next_value += 1;
                 match try_confirmed_write(&cluster, &alive, next_value).await {
                     Some((term, index)) => {
-                        confirmed.push((term, index, next_value));
+                        confirmed.push(Confirmed {
+                            term,
+                            index,
+                            value: next_value,
+                            session: None,
+                        });
                         trace.push(format!(
                             "step {step}: confirmed v{next_value} at t{term} i{index}"
                         ));
@@ -498,7 +575,12 @@ async fn writes_stall_without_majority_and_resume_after_restart() {
     // Full recovery and the usual final consistency checks.
     cluster.restart(followers[1]).await;
     converge(&cluster).await;
-    let confirmed = vec![(p1.term, p1.index, 1)];
+    let confirmed = vec![Confirmed {
+        term: p1.term,
+        index: p1.index,
+        value: 1,
+        session: None,
+    }];
     assert_final_consistency(&cluster, &confirmed, "majority-loss scenario").await;
     for id in cluster.all_ids() {
         assert_eq!(

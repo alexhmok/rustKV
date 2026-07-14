@@ -807,6 +807,7 @@ mod tests {
             command: Command::Put {
                 key: format!("k{index}"),
                 value: serde_json::json!(value),
+                session: None,
             },
         }
     }

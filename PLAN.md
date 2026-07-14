@@ -626,12 +626,106 @@ Untested / known gaps (documented, not fixed):
   leadership-transfer machinery); re-evaluated in the dynamic-membership
   phase for removed servers.
 
-## Project complete (phases 0-12)
-Remaining ideas beyond the original scope, in planned order: client dedup
-tokens for 504 retries, snapshotting/compaction + InstallSnapshot, dynamic
-membership (incl. re-evaluating vote stickiness for removed servers),
-connection pooling, scripted Docker partition test. (TLS on the raft
-port: dropped — blocked on the dependency whitelist.)
+## Phase 13 — Client dedup tokens (exactly-once writes) ✅
+
+The anomaly this closes (lost update by resurrection): a write whose
+outcome was ambiguous (504 — leader lost its majority before confirming)
+is retried after a leadership change; both copies commit, and the LATE
+duplicate's application clobbers a conflicting write another client had
+confirmed in between. A naive retry-same-value schedule cannot show this
+in an LWW map — the interleaved conflicting write is what makes the
+duplicate application observable.
+
+Done:
+- `src/raft/types.rs`: `Session { client, seq }`; `Command::Put/Delete`
+  gain `session: Option<Session>` with `#[serde(default,
+  skip_serializing_if = "Option::is_none")]` — old log.jsonl lines stay
+  readable AND token-less commands serialize byte-identical to phase-12
+  output (both pinned by unit tests with verbatim JSON strings; the
+  three_process interop test confirms the wire format end-to-end).
+- `src/store.rs`: dedup table IN the state machine —
+  `sessions: RwLock<HashMap<u64, u64>>` (client → highest applied seq).
+  `apply()` skips the mutation of a tokened command with
+  `seq <= sessions[client]`, else mutates and records. Dedup is at APPLY,
+  never at propose: the first copy may be committed-but-not-yet-applied,
+  so a propose-time check against the table would race it; the duplicate
+  entry still commits and occupies a log index. apply() stays a pure fold
+  of the log (no clocks/randomness) — which is exactly what makes the
+  table restart-safe (rebuilt by replay) and snapshottable.
+- Phase-14 hook landed now: `KvSnapshot { map, sessions }` +
+  `KvStore::export()/import()` (roundtrip-tested) — the snapshot payload
+  shape is settled; the pre-existing map-only `snapshot()` is untouched.
+- `src/api.rs`: optional `X-Client-Id`/`X-Client-Seq` headers (u64),
+  both-or-neither, unparseable values → 400; attached to the Command at
+  construction. Absent → at-least-once semantics, byte-identical.
+- `tests/common/mod.rs`: `put()` stays token-less; `put_with_token()`
+  added. No new dependencies; kv.rs unchanged (no retry helper — nothing
+  earned it: sim tests drive propose directly, HTTP tests drive reqwest).
+
+Tested (112 total; 16 new, plus faults/jepsen reworks):
+- Headline, test-first (`tests/dedup.rs`): the schedule was written
+  against phase-12 code and demonstrated the anomaly (final state k=1 —
+  B's confirmed k=2 silently destroyed), then implemented against and
+  inverted. Propose k=1 on L, sever both followers' reply legs (phase-12
+  trick: entry replicates, never commits on L, outcome Unknown);
+  CheckQuorum deposes L; a follower's no-op commits the entry
+  transitively; B confirms k=2; A retries same token — the retry COMMITS
+  (two same-token entries in the log) but mutates nothing: k=2 on every
+  node, sessions = {1→1} everywhere, both preserved across a
+  crash/restart by log replay alone. The untokened variant stays in the
+  suite as the documented at-least-once behavior.
+- Store unit tests: duplicate seq skipped (with interleaved conflict),
+  lower seq skipped, higher seq applies, clients independent, duplicate
+  delete skipped past a re-put, token-less commands never touch the
+  table, export/import roundtrip (including post-import dedup).
+- Serde pinning: token-less byte-identity, old-line readability, tokened
+  roundtrip — all against verbatim strings.
+- HTTP (`http_api.rs`): retried PUT and retried DELETE with the same
+  token → success status both times, applied once (interleaved
+  conflicting write proves the skip); next seq applies; five malformed
+  header combinations → 400 for PUT and DELETE, nothing stored.
+- `tests/faults.rs`: `write_until_confirmed` now retries ONE value with
+  ONE token until a definite Ok (Unknown no longer burns values); the
+  "no key committed twice" invariant relaxed to "duplicate keys in the
+  log are legal iff every occurrence shares one token", with the logical
+  effect asserted via final state (every confirmed key present exactly
+  with its value). All seeds green.
+- `tests/jepsen.rs`: write modes parametrized. Linearizable-mode writers
+  attach client=process/seq=op#, wait a deliberately tight 150ms, and
+  retry ambiguous outcomes (bounded, same command) — one Recorded op per
+  logical write (invoked at first attempt, returned at final ack), sound
+  only because of dedup. WGL checker: ZERO violations on all seeds, and
+  now zero permanently-Unknown ops (asserted). Vacuity guard: at least
+  one op across the seed set acked only AFTER an ambiguous attempt
+  (seed 5 rolls two) — the exact schedule where a duplicate copy also
+  commits. Stale mode kept `FireOnce` writes so its workload is
+  byte-identical: the ≥1-stale-violation regression passed with NO
+  re-pinning.
+- Seed churn as calibrated: zero — the sim passes values in memory and
+  this phase adds no RNG draws, so election/replication/read_index/
+  cluster_http/http_transport/three_process all passed without any edit;
+  churn appeared only where driver logic changed (faults/jepsen
+  workloads), as predicted.
+
+Untested / known gaps (documented, not fixed):
+- The sessions table never expires entries: unbounded growth with the
+  number of distinct clients (a per-node TTL would diverge replicas —
+  rejected by design). Stated assumption: one outstanding op per client,
+  seqs strictly increasing; a client running two concurrent ops can lose
+  the lower-seq one silently.
+- No result caching: Put/Delete return unit, so a deduped retry can't
+  report the original's result — fine today, a real gap if commands ever
+  return values.
+- Dedup is exactly-once APPLICATION, not exactly-once log occupancy:
+  duplicates still consume log indexes (and, in phase 14, snapshot
+  work).
+
+## Project complete (phases 0-13)
+Remaining ideas beyond the original scope, in planned order:
+snapshotting/compaction + InstallSnapshot, dynamic membership (incl.
+re-evaluating vote stickiness for removed servers), connection pooling,
+scripted Docker partition test. (TLS on the raft port: dropped — blocked
+on the dependency whitelist.)
 
 ## Out of scope (deliberate)
 Snapshotting/log compaction, dynamic membership changes — leave clean TODOs.

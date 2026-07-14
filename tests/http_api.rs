@@ -228,6 +228,146 @@ async fn put_without_content_type_header_is_accepted() {
     assert_eq!(got, json!({"a": 1}));
 }
 
+// ---- dedup tokens (phase 13): X-Client-Id / X-Client-Seq ----
+
+/// A retried PUT with the same token returns 201 both times but applies
+/// once. The interleaved conflicting write is what makes the skip
+/// observable: re-applying k=1 over k=1 would be invisible in an LWW map.
+#[tokio::test]
+async fn retried_put_with_same_token_applies_once() {
+    let server = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    let tokened_put = || {
+        client
+            .put(format!("{}/k", server.base))
+            .header("X-Client-Id", "1")
+            .header("X-Client-Seq", "1")
+            .json(&json!(1))
+    };
+    assert_eq!(tokened_put().send().await.unwrap().status(), 201);
+
+    // Another client's confirmed, conflicting write (token-less).
+    let conflicting = client
+        .put(format!("{}/k", server.base))
+        .json(&json!(2))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(conflicting.status(), 201);
+
+    // The retry: still 201 (its entry commits) but the mutation is skipped.
+    assert_eq!(tokened_put().send().await.unwrap().status(), 201);
+    let got: Value = client
+        .get(format!("{}/k", server.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(got, json!(2), "the duplicate must not clobber the conflict");
+}
+
+/// Same shape for DELETE: a retried tokened delete must not destroy a key
+/// re-created in between.
+#[tokio::test]
+async fn retried_delete_with_same_token_applies_once() {
+    let server = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    client
+        .put(format!("{}/k", server.base))
+        .json(&json!(1))
+        .send()
+        .await
+        .unwrap();
+    let tokened_delete = || {
+        client
+            .delete(format!("{}/k", server.base))
+            .header("X-Client-Id", "1")
+            .header("X-Client-Seq", "1")
+    };
+    assert_eq!(tokened_delete().send().await.unwrap().status(), 204);
+
+    // The key is re-created, then the delete is retried.
+    client
+        .put(format!("{}/k", server.base))
+        .json(&json!(2))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tokened_delete().send().await.unwrap().status(), 204);
+
+    let get = client
+        .get(format!("{}/k", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get.status(), 200, "the re-created key must survive");
+    assert_eq!(get.json::<Value>().await.unwrap(), json!(2));
+}
+
+/// A higher seq from the same client is a NEW op and applies normally.
+#[tokio::test]
+async fn next_seq_from_same_client_applies() {
+    let server = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    for (seq, value) in [("1", 1), ("2", 2)] {
+        let put = client
+            .put(format!("{}/k", server.base))
+            .header("X-Client-Id", "7")
+            .header("X-Client-Seq", seq)
+            .json(&json!(value))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(put.status(), 201, "seq {seq}");
+    }
+    let got: Value = client
+        .get(format!("{}/k", server.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(got, json!(2));
+}
+
+/// Both-or-neither, both u64 — anything else is 400 and stores nothing.
+#[tokio::test]
+async fn malformed_token_headers_are_rejected_with_400() {
+    let server = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    let cases: [&[(&str, &str)]; 5] = [
+        &[("X-Client-Id", "1")],                          // seq missing
+        &[("X-Client-Seq", "1")],                         // id missing
+        &[("X-Client-Id", "abc"), ("X-Client-Seq", "1")], // non-numeric id
+        &[("X-Client-Id", "1"), ("X-Client-Seq", "-2")],  // negative seq
+        &[("X-Client-Id", "1"), ("X-Client-Seq", "1.5")], // non-integer seq
+    ];
+    for headers in cases {
+        let mut put = client.put(format!("{}/k", server.base)).json(&json!(1));
+        let mut delete = client.delete(format!("{}/k", server.base));
+        for (name, value) in headers {
+            put = put.header(*name, *value);
+            delete = delete.header(*name, *value);
+        }
+        assert_eq!(put.send().await.unwrap().status(), 400, "{headers:?}");
+        assert_eq!(delete.send().await.unwrap().status(), 400, "{headers:?}");
+    }
+
+    let get = client
+        .get(format!("{}/k", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get.status(), 404, "rejected writes must store nothing");
+}
+
 #[tokio::test]
 async fn kv_state_survives_restart() {
     let dir = tempfile::tempdir().expect("tempdir");

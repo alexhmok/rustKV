@@ -14,6 +14,14 @@
 //!   role, leader, commit index). Under `/cluster/` so no single-segment
 //!   key is shadowed.
 //!
+//! Dedup tokens (phase 13): writes may carry `X-Client-Id` and
+//! `X-Client-Seq` headers (both u64). Both-or-neither — anything else is
+//! `400`. With a token, retrying the byte-same request after a `504` is
+//! safe: the retry may commit a second log entry, but the state machine
+//! applies each (client, seq) at most once. Without them, writes keep the
+//! at-least-once semantics below, byte-identical to before. Sequs must be
+//! strictly increasing per client with one outstanding op at a time.
+//!
 //! Non-leaders answer writes and linearizable reads with `307 Temporary
 //! Redirect` to the leader's client URL when it is known (the brief allows
 //! forward-or-redirect; redirect keeps this layer stateless), else `503`.
@@ -28,14 +36,14 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::kv::{KvNode, ReadError, WriteError};
-use crate::raft::types::{Command, NodeId};
+use crate::raft::types::{Command, NodeId, Session};
 
 /// Everything a handler needs: the local KV service and, for redirects, the
 /// client-facing base URL of each peer (empty for a single-node deployment;
@@ -112,14 +120,44 @@ async fn get_status(State(ctx): State<Arc<ApiContext>>) -> Response {
     .into_response()
 }
 
+const CLIENT_ID_HEADER: &str = "x-client-id";
+const CLIENT_SEQ_HEADER: &str = "x-client-seq";
+
+/// Parses the optional dedup token headers: both-or-neither, each a u64.
+/// The error is the 400 body text; callers wrap it into a response.
+fn session_from_headers(key: &str, headers: &HeaderMap) -> Result<Option<Session>, &'static str> {
+    let parse = |name: &str| {
+        headers
+            .get(name)
+            .map(|v| v.to_str().ok().and_then(|s| s.parse::<u64>().ok()))
+    };
+    match (parse(CLIENT_ID_HEADER), parse(CLIENT_SEQ_HEADER)) {
+        (None, None) => Ok(None),
+        (Some(Some(client)), Some(Some(seq))) => Ok(Some(Session { client, seq })),
+        (Some(None), _) | (_, Some(None)) => {
+            tracing::warn!(key, "write rejected: unparseable dedup token header");
+            Err("X-Client-Id and X-Client-Seq must be unsigned integers\n")
+        }
+        _ => {
+            tracing::warn!(key, "write rejected: only one dedup token header present");
+            Err("X-Client-Id and X-Client-Seq must be provided together\n")
+        }
+    }
+}
+
 // The body is parsed manually (rather than via `axum::Json`) so that requests
 // without a `Content-Type: application/json` header are still accepted; the
 // contract only requires the body to be valid JSON.
 async fn put_key(
     State(ctx): State<Arc<ApiContext>>,
     Path(key): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let session = match session_from_headers(&key, &headers) {
+        Ok(session) => session,
+        Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
+    };
     let value = match serde_json::from_slice::<Value>(&body) {
         Ok(value) => value,
         Err(error) => {
@@ -132,6 +170,7 @@ async fn put_key(
         .write(Command::Put {
             key: key.clone(),
             value,
+            session,
         })
         .await
     {
@@ -143,8 +182,23 @@ async fn put_key(
     }
 }
 
-async fn delete_key(State(ctx): State<Arc<ApiContext>>, Path(key): Path<String>) -> Response {
-    match ctx.kv.write(Command::Delete { key: key.clone() }).await {
+async fn delete_key(
+    State(ctx): State<Arc<ApiContext>>,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let session = match session_from_headers(&key, &headers) {
+        Ok(session) => session,
+        Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
+    };
+    match ctx
+        .kv
+        .write(Command::Delete {
+            key: key.clone(),
+            session,
+        })
+        .await
+    {
         Ok(()) => {
             tracing::info!(key, "delete committed");
             StatusCode::NO_CONTENT.into_response()

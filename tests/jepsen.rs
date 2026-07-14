@@ -24,6 +24,16 @@
 //! rounds (at most one node down at a time, always restarted before the
 //! round ends), and a soak variant additionally duplicates 10% of all
 //! requests in flight.
+//!
+//! Write modes (phase 13): the linearizable workload attaches a dedup
+//! token (client = process, seq = op number) to every write and retries
+//! ambiguous outcomes with the SAME command, recording ONE op per logical
+//! write — invocation at the first attempt, return at the final ack. That
+//! is sound only because dedup makes the effect apply at most once no
+//! matter how many retried copies commit; it shrinks the Unknowns the
+//! checker must tolerate. The stale-mode workload stays byte-identical to
+//! phase 12 (single-shot, token-less) — it is the checker-has-teeth
+//! regression and its ≥1-violation claim is pinned per seed.
 
 mod common;
 
@@ -32,7 +42,7 @@ use std::sync::Arc;
 use common::lin::{OpKind, Recorded, WriteKind, WriteOutcome, check_linearizable, render};
 use common::*;
 use rustkv::raft::node::RoleKind;
-use rustkv::raft::types::{Command, LogEntry, NodeId};
+use rustkv::raft::types::{Command, LogEntry, NodeId, Session};
 use rustkv::rng::SplitMix64;
 use tokio::time::Instant;
 
@@ -191,15 +201,29 @@ enum ReadMode {
     Linearizable,
 }
 
+/// How the workload's clients write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteMode {
+    /// Each op proposed at most once, token-less — the pre-phase-13 client.
+    /// Stale-mode tests use this so their pinned schedules stay
+    /// byte-identical.
+    FireOnce,
+    /// Dedup token per op, ambiguous outcomes retried (bounded) with the
+    /// same command; one Recorded op per logical write (phase 13).
+    TokenRetry,
+}
+
 /// Runs one seeded workload; returns the merged history, each node's final
-/// on-disk log (nodes are shut down afterwards), and how many crash rounds
-/// the nemesis rolled — callers assert on the sum so crash coverage can't
-/// silently vanish in a future seed re-pin.
+/// on-disk log (nodes are shut down afterwards), how many crash rounds the
+/// nemesis rolled, and how many ops acked only after an ambiguous attempt
+/// — callers assert on the sums so crash and retry coverage can't silently
+/// vanish in a future seed re-pin.
 async fn run_workload(
     seed: u64,
     reads: ReadMode,
+    writes: WriteMode,
     duplicate_probability: f64,
-) -> (Vec<Recorded>, Vec<Vec<LogEntry>>, u64) {
+) -> (Vec<Recorded>, Vec<Vec<LogEntry>>, u64, u64) {
     let faults = rustkv::raft::transport::sim::FaultConfig {
         min_delay: ms(1),
         max_delay: ms(15),
@@ -253,6 +277,8 @@ async fn run_workload(
             let mut rng = SplitMix64::new(seed.wrapping_mul(31).wrapping_add(process + 100));
             let mut history: Vec<Recorded> = Vec::new();
             let mut seq = 0u64;
+            let mut op_no = 0u64;
+            let mut retried_acks = 0u64;
             for _ in 0..OPS_PER_CLIENT {
                 tokio::time::sleep(ms(rng.next_range(5..=80))).await;
                 let key = KEYS[rng.next_range(0..=2) as usize];
@@ -294,7 +320,7 @@ async fn run_workload(
                             });
                         }
                     }
-                } else {
+                } else if writes == WriteMode::FireOnce {
                     // Write through whoever currently looks like the leader;
                     // skip the turn if leadership is unclear.
                     let Some(leader) = unique_leader(&cluster) else {
@@ -310,6 +336,7 @@ async fn run_workload(
                         WriteKind::Put(value) => put(key, value),
                         WriteKind::Delete => Command::Delete {
                             key: key.to_string(),
+                            session: None,
                         },
                     };
                     let invoked_us = start.elapsed().as_micros() as u64;
@@ -341,15 +368,109 @@ async fn run_workload(
                         invoked_us,
                         returned_us,
                     });
+                } else {
+                    // TokenRetry: one logical op, one token; ambiguous
+                    // outcomes are retried with the SAME command (bounded).
+                    // Recorded as ONE op — invocation at the first attempt,
+                    // return at the final ack — sound only because dedup
+                    // applies the effect at most once however many retried
+                    // copies commit.
+                    op_no += 1;
+                    let kind = if dice < 9 {
+                        seq += 1;
+                        WriteKind::Put((process + 1) * 1_000_000 + seq)
+                    } else {
+                        WriteKind::Delete
+                    };
+                    let command = match kind {
+                        WriteKind::Put(value) => put_with_token(key, value, process, op_no),
+                        WriteKind::Delete => Command::Delete {
+                            key: key.to_string(),
+                            session: Some(Session {
+                                client: process,
+                                seq: op_no,
+                            }),
+                        },
+                    };
+                    let invoked_us = start.elapsed().as_micros() as u64;
+                    let mut outcome = WriteOutcome::Fail;
+                    let mut log_pos = None;
+                    let mut ambiguous = false;
+                    for _attempt in 0..4 {
+                        let Some(leader) = unique_leader(&cluster) else {
+                            tokio::time::sleep(ms(30)).await;
+                            continue;
+                        };
+                        match cluster.handle(leader).propose(command.clone()).await {
+                            // Rejected before append: this attempt
+                            // definitely never happened.
+                            Err(_) => {}
+                            Ok(p) => {
+                                let pos = Some((p.term, p.index));
+                                // A much tighter bounded wait than
+                                // FireOnce's 1500ms: an impatient client
+                                // gives up while its copy may still commit
+                                // — behind a dropped-message retransmit
+                                // (~50-100ms) or a nemesis partition — so
+                                // real ambiguity occurs and the retry's
+                                // copy really does commit alongside the
+                                // original's (the case dedup exists for).
+                                match tokio::time::timeout(ms(150), p.committed).await {
+                                    Ok(Ok(true)) => {
+                                        outcome = WriteOutcome::Ok;
+                                        log_pos = pos;
+                                        break;
+                                    }
+                                    // Replaced by another leader: definitely
+                                    // not applied at this position.
+                                    Ok(Ok(false)) => {}
+                                    // Unknown — this copy may still commit
+                                    // later; the retry is what dedup is for.
+                                    _ => {
+                                        ambiguous = true;
+                                        log_pos = pos;
+                                    }
+                                }
+                            }
+                        }
+                        tokio::time::sleep(ms(30)).await;
+                    }
+                    if outcome == WriteOutcome::Ok && ambiguous {
+                        retried_acks += 1;
+                    }
+                    // Fail only if EVERY attempt definitely didn't happen;
+                    // one ambiguous copy in flight makes the op Unknown.
+                    if outcome != WriteOutcome::Ok && ambiguous {
+                        outcome = WriteOutcome::Unknown;
+                    }
+                    let returned_us = if outcome == WriteOutcome::Unknown {
+                        u64::MAX
+                    } else {
+                        start.elapsed().as_micros() as u64
+                    };
+                    history.push(Recorded {
+                        process,
+                        key: key.to_string(),
+                        op: OpKind::Write {
+                            kind,
+                            outcome,
+                            log_pos,
+                        },
+                        invoked_us,
+                        returned_us,
+                    });
                 }
             }
-            history
+            (history, retried_acks)
         }));
     }
 
     let mut history = Vec::new();
+    let mut retried_acks = 0u64;
     for client in clients {
-        history.extend(client.await.expect("client task"));
+        let (client_history, client_retried) = client.await.expect("client task");
+        history.extend(client_history);
+        retried_acks += client_retried;
     }
     let crashes = nemesis.await.expect("nemesis task");
 
@@ -405,7 +526,7 @@ async fn run_workload(
         .into_iter()
         .map(|id| cluster.disk_log(id))
         .collect();
-    (history, logs, crashes)
+    (history, logs, crashes, retried_acks)
 }
 
 // ---- checked claims ----
@@ -432,11 +553,21 @@ fn check_write_witness(history: &[Recorded], log: &[LogEntry]) -> Result<(), Str
                 entry.term, term,
                 "confirmed write replaced at index {index}"
             );
-            let expected = match kind {
-                WriteKind::Put(value) => put(&r.key, value),
-                WriteKind::Delete => Command::Delete { key: r.key.clone() },
+            // Compared field-wise, ignoring the dedup token: put values are
+            // unique per logical op, so key+value pins the entry as
+            // precisely as full equality did before tokens existed.
+            let matches = match (&entry.command, kind) {
+                (Command::Put { key, value, .. }, WriteKind::Put(v)) => {
+                    *key == r.key && *value == serde_json::json!(v)
+                }
+                (Command::Delete { key, .. }, WriteKind::Delete) => *key == r.key,
+                _ => false,
             };
-            assert_eq!(entry.command, expected, "wrong command at index {index}");
+            assert!(
+                matches,
+                "wrong command at index {index}: {:?}",
+                entry.command
+            );
             (r, term, index)
         })
         .collect();
@@ -458,7 +589,8 @@ fn check_write_witness(history: &[Recorded], log: &[LogEntry]) -> Result<(), Str
 #[tokio::test(start_paused = true)]
 async fn confirmed_writes_are_linearizable_via_the_log_witness() {
     for seed in 0..6 {
-        let (history, logs, _) = run_workload(seed, ReadMode::Stale, 0.0).await;
+        let (history, logs, _, _) =
+            run_workload(seed, ReadMode::Stale, WriteMode::FireOnce, 0.0).await;
         for log in &logs[1..] {
             assert_eq!(*log, logs[0], "seed {seed}: logs diverge");
         }
@@ -472,8 +604,10 @@ async fn confirmed_writes_are_linearizable_via_the_log_witness() {
 async fn same_seed_reproduces_the_same_history() {
     // With duplication on, so the determinism claim covers the full phase-10
     // fault mix: partitions, crashes/restarts, and duplicated messages.
-    let (history_a, logs_a, crashes) = run_workload(3, ReadMode::Linearizable, 0.10).await;
-    let (history_b, logs_b, _) = run_workload(3, ReadMode::Linearizable, 0.10).await;
+    let (history_a, logs_a, crashes, _) =
+        run_workload(3, ReadMode::Linearizable, WriteMode::TokenRetry, 0.10).await;
+    let (history_b, logs_b, _, _) =
+        run_workload(3, ReadMode::Linearizable, WriteMode::TokenRetry, 0.10).await;
     assert!(crashes > 0, "seed 3 must exercise a crash round");
     let refs_a: Vec<&Recorded> = history_a.iter().collect();
     let refs_b: Vec<&Recorded> = history_b.iter().collect();
@@ -495,7 +629,8 @@ async fn same_seed_reproduces_the_same_history() {
 async fn local_reads_expose_documented_staleness_under_partitions() {
     let mut violations = Vec::new();
     for seed in 0..6 {
-        let (history, _, _) = run_workload(seed, ReadMode::Stale, 0.0).await;
+        let (history, _, _, _) =
+            run_workload(seed, ReadMode::Stale, WriteMode::FireOnce, 0.0).await;
         if let Err(reason) = check_linearizable(&history) {
             violations.push((seed, reason));
         }
@@ -510,16 +645,23 @@ async fn local_reads_expose_documented_staleness_under_partitions() {
     }
 }
 
-/// The phase-9 inversion of the test above: the same seeds, keys, nemesis
-/// pattern, and client mix, but reads go through ReadIndex. The checker
-/// that provably catches stale local reads must find NO violation here —
-/// on any seed. This is the phase's headline claim: reads are linearizable.
+/// The phase-9 inversion of the test above: the same seeds, keys and
+/// nemesis pattern, but reads go through ReadIndex — and, since phase 13,
+/// writers carry dedup tokens and retry ambiguous outcomes, so retried ops
+/// land in the history as single Ok ops instead of permanent Unknowns.
+/// The checker that provably catches stale local reads must find NO
+/// violation here — on any seed. That is both phase 9's headline claim
+/// (reads are linearizable) and phase 13's (retried tokened writes are
+/// exactly-once, or the tighter history would linearize nowhere).
 #[tokio::test(start_paused = true)]
 async fn linearizable_reads_pass_the_checker() {
     let mut total_crashes = 0;
+    let mut total_retried_acks = 0;
     for seed in 0..6 {
-        let (history, _, crashes) = run_workload(seed, ReadMode::Linearizable, 0.0).await;
+        let (history, _, crashes, retried_acks) =
+            run_workload(seed, ReadMode::Linearizable, WriteMode::TokenRetry, 0.0).await;
         total_crashes += crashes;
+        total_retried_acks += retried_acks;
         let reads = history
             .iter()
             .filter(|r| matches!(r.op, OpKind::Read { .. }))
@@ -530,13 +672,36 @@ async fn linearizable_reads_pass_the_checker() {
             reads > 3,
             "seed {seed}: too few granted reads ({reads}) to mean anything"
         );
+        // Phase 13's "fewer Unknowns" claim, made exact: with token-carrying
+        // retries no op in these histories is left permanently ambiguous.
+        // (Under FireOnce an unconfirmed write stayed Unknown forever.)
+        let unknowns = history
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.op,
+                    OpKind::Write {
+                        outcome: WriteOutcome::Unknown,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(unknowns, 0, "seed {seed}: retries left an op ambiguous");
         if let Err(reason) = check_linearizable(&history) {
             panic!("seed {seed}: linearizable reads produced a violation:\n{reason}");
         }
     }
-    // The other vacuity guard: the seed set must exercise crash rounds, or
-    // "linearizable under crashes" was never actually tested.
+    // Vacuity guards: the seed set must exercise crash rounds, and at
+    // least one op must have acked only AFTER an ambiguous attempt — the
+    // exact case where a duplicate copy may also commit and only dedup
+    // keeps the recorded single op honest.
     assert!(total_crashes > 0, "no seed rolled a crash round");
+    assert!(
+        total_retried_acks > 0,
+        "no seed exercised an ambiguous-then-acked retry — the dedup claim \
+         was never actually stressed"
+    );
 }
 
 /// The duplication soak: the linearizable workload with 10% of requests
@@ -547,7 +712,8 @@ async fn linearizable_reads_pass_the_checker() {
 async fn linearizable_reads_survive_message_duplication() {
     let mut total_crashes = 0;
     for seed in 0..6 {
-        let (history, logs, crashes) = run_workload(seed, ReadMode::Linearizable, 0.10).await;
+        let (history, logs, crashes, _) =
+            run_workload(seed, ReadMode::Linearizable, WriteMode::TokenRetry, 0.10).await;
         total_crashes += crashes;
         for log in &logs[1..] {
             assert_eq!(*log, logs[0], "seed {seed}: logs diverge");
