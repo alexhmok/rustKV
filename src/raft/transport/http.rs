@@ -135,10 +135,18 @@ impl HttpTransport {
     /// fresh-connection failure is a real network answer and is never
     /// retried. The retry may duplicate an RPC the peer already processed
     /// (the pooled attempt can fail after the request was written); that
-    /// is safe because Raft RPCs are duplicate-tolerant — phase 10's
-    /// duplication fault is the standing proof, and InstallSnapshot
-    /// carries its own idempotence guard (phase 14). Callers wrap this in
-    /// rpc_timeout, so the retry spends the same budget, not extra.
+    /// is safe on TWO legs, both load-bearing: a LIVE peer re-processing
+    /// is covered by Raft's duplicate tolerance (phase 10's duplication
+    /// fault is the standing proof; InstallSnapshot carries its own
+    /// idempotence guard, phase 14), and a peer that crashed BETWEEN
+    /// processing and replying is covered by fsync-before-reply (the
+    /// restarted peer re-grants the same persisted vote / idempotently
+    /// re-appends) — if reply-before-fsync is ever adopted, this retry
+    /// silently becomes unsafe. Callers wrap this in rpc_timeout, so the
+    /// retry spends the same budget, not extra. Note the retry only fires
+    /// on an io ERROR from the pooled attempt: a half-open idle socket
+    /// (partition, NAT eviction) hangs the read instead, and the outer
+    /// rpc_timeout kills the whole call — one burned RPC, self-healing.
     async fn post_json(&self, addr: &str, path: &str, body: &[u8]) -> std::io::Result<Vec<u8>> {
         if let Some(mut stream) = self.checkout(addr) {
             match request_response(&mut stream, addr, path, body).await {

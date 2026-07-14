@@ -1133,8 +1133,14 @@ Tested (160 total; 19 new):
   planned, by the seeded suites themselves). cluster_http's known
   real-time CPU-starvation flake surfaced once during parallel full-suite
   runs and reproduces identically on the pristine phase-14 commit under
-  the same load; 5/5 green in isolation. Mechanical edits only: the two
-  `ApiContext { peer_urls }` constructor sites.
+  the same load; 5/5 green in isolation. [Scope corrected in phase 16:
+  the trigger is WITHIN-BINARY concurrency, not cross-binary load —
+  `follower_redirects_writes_to_the_leader` fails ~1/8 running just the
+  cluster_http binary (its 6 tests in parallel = 6 concurrent 3-node
+  clusters), at the same rate on pristine phase-15 code; it never fails
+  run single-test. "In isolation" means one test, not one binary.]
+  Mechanical edits only: the two `ApiContext { peer_urls }` constructor
+  sites.
 - Manual binary smoke (scripted): real 3-process cluster, real joiner
   with RUSTKV_JOIN=1 and NO RUSTKV_PEERS, admin add through a follower
   redirect → joiner adopts the 4-member config and replicates old + live
@@ -1290,11 +1296,15 @@ Done:
   POOLED connection — the stale-idle race (peer closed the socket while
   it sat idle). A fresh-connection failure is a real network answer and
   is never retried. The retry runs inside the same outer rpc_timeout.
-  Retry-safety argument: the pooled attempt can fail after the request
-  was written, so the retry may duplicate an RPC the peer already
-  processed — safe because Raft RPCs are duplicate-tolerant (phase 10's
-  duplication fault is the standing proof) and InstallSnapshot carries
-  its own idempotence guard (phase 14).
+  Retry-safety argument — TWO legs, both load-bearing: (1) a LIVE peer
+  processing the RPC twice is safe because Raft RPCs are
+  duplicate-tolerant (phase 10's duplication fault is the standing
+  proof; InstallSnapshot carries its own idempotence guard, phase 14);
+  (2) a peer that crashed BETWEEN processing and replying is safe
+  because of the fsync-before-reply durability rule (phase 1): the
+  restarted peer re-grants the same persisted vote / idempotently
+  re-appends the same entries. If reply-before-fsync is ever adopted as
+  an optimization, the transport retry silently becomes unsafe.
 - `set_peers` (the phase-15 invalidation hook the original roadmap
   predates) prunes pool entries whose address left the book in the same
   critical section — otherwise idle sockets to removed/re-addressed
@@ -1329,14 +1339,81 @@ Untested / known gaps:
   phases 14/15 gap notes). Budget interaction noted: rpc_timeout now
   covers checkout + a possible stale-conn retry — still comfortable at
   LAN latencies, but it tightens the same budget that large snapshot
-  payloads already strain.
+  payloads already strain. Worse, the stale-conn worst case TRANSMITS
+  THE PAYLOAD TWICE inside that one window (full write → RST on read →
+  full rewrite on the fresh connection): trivial for heartbeats,
+  compounding for InstallSnapshot.
 - Idle pooled sockets are dropped lazily (on failed use → retry), not
   proactively health-checked; that is the design (the retry IS the
   recovery path), but a mass peer restart costs one wasted attempt per
   stale socket.
 - Pool metrics (hit rate, churn) are not exposed anywhere; the reuse
   claim is proven by the counting-server test, not observable in
-  production.
+  production. The perf claim itself is architectural, not measured: no
+  before/after latency, throughput, or socket-churn numbers were taken
+  (pre-pooling scale: a 3-node leader at 50ms heartbeats opened ~40
+  connections/s — thousands of TIME_WAIT sockets at steady state).
+
+### Phase 16 concern review (post-checkpoint, docs-only)
+
+Deeper findings from the concern pass; no code changes beyond citing the
+second retry-safety leg in the post_json doc comment. Also corrected the
+phase-15 cluster_http flake note above (within-binary, not cross-binary).
+
+- **The retry only rescues failures TCP reports** (FIN/RST → io error on
+  the pooled attempt). A HALF-OPEN idle connection — network partition,
+  host power loss, NAT/conntrack evicting a long-idle flow in a
+  Docker/k8s deployment — produces no error: the write buffers, the read
+  hangs, the OUTER rpc_timeout kills the whole call, and the retry never
+  runs. Cost: one full 150ms burn (one lost heartbeat or a delayed
+  vote), self-healing since the stream is dropped. Pre-pooling this
+  failure mode did not exist (every connection was fresh) — this is the
+  one scenario where phase 16 is strictly worse than phase 15; Raft's
+  timing tolerances absorb it. First place to look if a deployment shows
+  periodic single-heartbeat losses.
+- **Pools are only ever warm on leaders**: only leaders (heartbeats every
+  50ms) and candidates send RPCs; followers send nothing. So the conns
+  most likely to be stale are an ex-leader's, idle since its old term —
+  election-time RPCs (votes/PreVotes) are disproportionately the ones
+  that hit the retry path or, in the half-open case, burn a timeout.
+  Randomized election timeouts absorb this.
+- **MAX_IDLE_PER_PEER = 4 has an arithmetic behind it**: send_append has
+  no per-peer in-flight guard, so a slow peer accumulates about
+  ceil(rpc_timeout / heartbeat_interval) = ceil(150/50) = 3 concurrent
+  AppendEntries (which mostly time out → dropped, never pooled). Revisit
+  the cap if the heartbeat/timeout ratio ever changes.
+- **The pool is LIFO with no culling** (Vec push/pop): steady traffic
+  keeps exactly one connection hot; slots 2-4 fill only during bursts,
+  then sit indefinitely — so the long-idle bottom-of-stack conns popped
+  during a LATER burst are the most likely stale hits. Deliberate
+  (simplest correct thing; failed-use retry is the cull).
+- **Read-to-close quietly changed meaning**: the old client SENT
+  `Connection: close`, so close-delimited framing was self-fulfilling.
+  Now nothing asks the server to close; a 200 without Content-Length is
+  only readable if the server spontaneously closes (RFC-required for
+  unframed responses, and axum always sets Content-Length). Only matters
+  if the raft port ever fronts a non-rustkv server — a nonconforming
+  unframed response now hangs to timeout where the old code succeeded.
+- **Executed but not asserted**: the set_peers pool-prune runs under
+  cluster_http's admin membership tests (watch → set_peers) but nothing
+  asserts sockets were actually pruned; the excess-bytes non-reuse path,
+  the server `Connection: close` opt-out (parse-level unit test only),
+  and the 4-idle cap have no integration assertions; and the
+  duplicate-delivery scenario against a LIVE raft node over HTTP
+  (server processes, closes pre-reply, retry re-delivers) was never
+  constructed — that claim rests on the phase-10 sim proof plus the
+  two-leg argument above.
+- Structural positive worth recording: response cross-talk is impossible
+  by construction, not by care — one request per connection at a time,
+  retries always on fresh connections, single checkin site gated on a
+  fully-consumed response. The only path to reading another RPC's
+  response would be a repooled half-read stream, and that path does not
+  exist (the timeout test pins it anyway).
+- Lock discipline invariant to preserve: only set_peers holds the peers
+  write lock and the pool mutex together (in that fixed order); send
+  drops its peers read guard before any pool touch; checkout/checkin
+  touch only the pool. No other nesting exists, so no ordering inversion
+  is possible — keep it that way if another lock ever appears.
 
 ## Project complete (phases 0-16)
 Remaining ideas beyond the original scope: scripted Docker partition
