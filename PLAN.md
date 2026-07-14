@@ -1777,21 +1777,165 @@ Untested / known gaps:
   ~3s of real time; it does not count RPCs on the wire, so "quiet" is
   behavioral (frozen state), not packet-level.
 
-## Phases 0-19 + testing review complete; phases 20-21 planned below
+## Phase 20 — catch-up scalability ✅ (2026-07-14)
+
+Closes the remaining half of the payload gap (FAILURE_MODES.md, was
+"Single-shot snapshot / batch vs the RPC timeout" — rewritten this
+phase): the 2 MiB hard cap died in the testing review; this phase
+closed bandwidth × timeout. Three parts, all following the seed-churn
+firewall: OFF (`None`) by default in `RaftConfig`/the sim, ON by
+default in the binary via env (each opts out with `0`).
+
+Done:
+- (a) AppendEntries byte cap: `RaftConfig.max_append_bytes`
+  (`RUSTKV_MAX_APPEND_BYTES`, binary default 1 MiB). `send_append`
+  truncates the suffix where the entries' estimated serialized sizes
+  (`serde_json` per entry; array framing uncounted — bounded, not
+  exact) exceed the budget; the first entry always ships so one
+  oversized entry can never stall replication. Partial progress is
+  native Raft: the follower acks the prefix, match/next advance, and
+  the existing still-lagging-immediate-resend is the pump. No wire
+  change, no protocol change.
+- (b) Size-aware RPC timeout, HTTP transport ONLY (the core never
+  learns about it): bodies over a 64 KiB threshold get `rpc_timeout +
+  body_bytes / RUSTKV_ASSUMED_BANDWIDTH` (binary default 8 MiB/s —
+  toward a real link's floor, not its peak); bodies at or under it
+  keep the flat budget, so failure detection for ordinary traffic
+  stays exactly as configured. Constructor default is flat (off);
+  main.rs opts in via `HttpTransport::with_assumed_bandwidth`.
+- (c) §7 InstallSnapshot chunking (transport-agnostic, preserving the
+  architecture rule): `InstallSnapshotArgs` gains `offset`/`data`/
+  `done` with serde defaults such that a pre-phase-20 message reads as
+  an offset-0/done single-shot AND a phase-20 single-shot sender emits
+  byte-identical phase-14 output (both pinned verbatim in rpc.rs).
+  `data` chunks are UTF-8-boundary slices of the SERIALIZED state (the
+  metadata rides every chunk with `state: null`); the follower stages
+  them in a volatile buffer keyed by (term, leader, boundary) —
+  `buf.len()` is the only appending offset, making duplicates no-ops;
+  a gap discards the staging; a term bump or superseding key discards
+  it eagerly — and persists + restores ONLY at `done` (fsync-before-
+  reply and the phase-14 idempotence guard apply there, unchanged).
+  Leader side: per-peer transfer state (payload serialized once,
+  offset) lives inside `Role::Leader` and dies on step-down; the reply
+  pump advances chunks, the heartbeat-pace re-send retries the current
+  chunk after a lost reply, and a completed/superseded boundary resets
+  the transfer. Recovery is self-healing by construction: a follower
+  that lost its staging still acks, the leader's post-done AppendEntries
+  probe is rejected, backtracks to the boundary, and the transfer
+  restarts from offset 0. `RaftConfig.snapshot_chunk_bytes`
+  (`RUSTKV_SNAPSHOT_CHUNK_BYTES`, binary default 4 MiB). CAVEAT,
+  documented in config.rs + FAILURE_MODES.md: chunked messages are not
+  readable by pre-phase-20 binaries (`state` is null) — chunking must
+  be `0` during a mixed-version rollout.
+- Sim wire-size observer: `SimNetwork::max_rpc_bytes()` — high-water
+  serialized size of entry-carrying AppendEntries and InstallSnapshot,
+  measured at send in the existing critical section. Pure observation
+  like the T2 FaultStats (zero RNG draws, zero delays; kept OUT of
+  FaultStats so its exact-equality assertions stay untouched).
+- Harness: `ClusterTuning { max_append_bytes, snapshot_chunk_bytes }`
+  + `spawn_cluster_tuned`, preserved across restarts and joiners like
+  the snapshot knobs.
+- FAILURE_MODES.md: the payload/timeout entry rewritten as closed
+  (residuals: whole payload still held in memory both ends; a single
+  over-cap entry still ships whole); the snapshot re-send waste entry
+  now notes chunking shrinks the waste unit to one chunk.
+
+Tested (inversion verified for each "X prevents Y"):
+- (a) `append_entries_byte_cap_bounds_catch_up_batches`: with the cap
+  unset a healed follower's ~200 KiB deficit crossed in ONE 198 KiB
+  AppendEntries (the disease, asserted > 2× cap); the pre-fix run with
+  the knob present-but-inert sent the same 198 KiB batch over a 64 KiB
+  cap (watched red); post-fix every message is under cap + framing and
+  the same catch-up converges, still multi-entry per batch.
+- (b) unit tests pin the arithmetic (threshold edge, 8 MiB at 8 MiB/s
+  = +1s, 256 MiB = +32s, zero-bandwidth/overflow saturation);
+  `size_aware_timeout_lets_big_payloads_through_and_keeps_small_ones_tight`
+  runs the inversion on real sockets against a slow peer (300ms to
+  answer — a slow peer is transport-indistinguishable from a slow
+  link, and loopback transfer speed itself proved machine-dependent:
+  the first version of the disease leg passed in release mode and was
+  replaced): flat 50ms budget times out on a 1 MiB body, the same
+  base goes through size-aware at 1 MiB/s, and a small RPC on the SAME
+  transport still times out at the base budget (elapsed < the peer's
+  pause — the growth keys on body size, not config).
+- (c) `chunked_install_snapshot_catches_up_in_bounded_messages`: the
+  weighted money test (2 KiB values; all original proofs kept — victim
+  log never contains the compacted prefix, so only InstallSnapshot can
+  have carried it) as an intra-test inversion: single-shot ships the
+  whole tens-of-KiB state in one RPC (asserted > 8× the chunk bound),
+  1 KiB chunks keep every InstallSnapshot under 2×chunk + metadata
+  (the 2× covers JSON escaping of the payload slice) while converging
+  to identical states — which forces tens of offset-contiguous chunks
+  or the reassembly could not have parsed.
+- (c) `duplicated_snapshot_chunks_are_harmless`: the same schedule
+  under 100% request duplication (vacuity-guarded), same chunk bound.
+- (c) `leader_crash_mid_transfer_is_restarted_by_the_successor`:
+  ~250-chunk transfer, leader crashed strictly between the first chunk
+  crossing and any install (construction-guarded: the victim's
+  commit_index is asserted still below the boundary at crash time);
+  the successor restarts the transfer and the victim converges to the
+  identical state with the money-test disk proofs.
+- (c) `joiner_catches_up_via_chunked_install_snapshot` (membership.rs):
+  the phase-15 joiner InstallSnapshot-path test with 2 KiB values and
+  512-byte chunks — joiner converges, its disk snapshot can only have
+  arrived over the wire, max InstallSnapshot stays under the chunk
+  bound.
+- Wire pins (rpc.rs): pre-phase-20 encoding → offset-0/done/data-None;
+  single-shot sender output byte-identical to the phase-14 string;
+  chunked and final-chunk encodings pinned verbatim and roundtripped.
+- Unit tests: `batch_len_within` (budget edges, first-entry-always,
+  empty heartbeats), `next_snapshot_chunk` (full-coverage reassembly
+  walks, multi-byte UTF-8 shrink/grow at budgets 1..=8, empty final
+  chunk for the lost-done-ack retry).
+- Zero seed re-pins: the full suite (222 tests) passes with all three
+  knobs off in every pre-existing test; the pinned money tests,
+  membership schedules, and both Ongaro tests are byte-identical
+  (default-config sends draw no new RNG and serialize identically —
+  pinned by the single-shot wire test). Wide soaks green at 256 seeds
+  (`RUSTKV_SOAK_SEEDS=256`, faults + jepsen, zero violations).
+- The payload experiment (testing-review script, real 3-process
+  cluster on binary defaults): mode A (AE backfill, compaction off)
+  converged at 64 MiB behind in 4s and 256 MiB in 8s; mode B (wiped
+  dir → InstallSnapshot, threshold 8) converged at 64 MiB in 6s and at
+  256 MiB within the 45s catch-up window. FINDING from mode B at
+  256 MiB, recorded as a new open FAILURE_MODES.md entry: the
+  in-event-loop snapshot capture/serialize/fsync stalls heartbeats
+  past the election timeout once the state is large (~80 MiB at 1 MiB
+  values), so leadership wobbles under heavy write load — availability
+  jitter, not a safety issue (a leader-aware client retries through it
+  and every write commits; the original script's naive curl treated
+  the 307 as fatal and was patched to re-discover the leader).
+
+Untested / known gaps:
+- The follower staging-gap discard (offset beyond `buf.len()`) and the
+  unparseable-reassembly discard are defensive code, not constructed
+  in any test: the first needs a follower crash-restart mid-transfer
+  timed between two chunk acks (what it degrades to — transfer restart
+  after one probe round-trip — IS the tested leader-crash shape), and
+  the second is unreachable from correct peers.
+- The mixed-version constraint (old binary receiving a chunked
+  message) is documented, not tested — there is no old binary in the
+  harness to receive one.
+- Memory: chunking bounds MESSAGES, not resident memory — both ends
+  still hold the whole payload (recorded as a residual in
+  FAILURE_MODES.md).
+- (b)'s inversion models the slow link as a slow peer; no test drives
+  a real bandwidth-limited link (the Docker partition harness shapes
+  connectivity, not throughput).
+
+## Phases 0-20 + testing review complete; phase 21 planned below
 The original scope shipped in phase 17; the 2026-07-14 testing review
 added the failure-mode catalog (FAILURE_MODES.md) and the follow-on
-phases were planned from its findings — phase 18 (above) is the first
-of them, shipped. (TLS on the raft port: still dropped — blocked on the
+phases were planned from its findings — phases 18-20 (above) shipped
+from that plan. (TLS on the raft port: still dropped — blocked on the
 dependency whitelist; the mitigation ladder is in FAILURE_MODES.md.)
 
-## Planned phases 20-21 (not started)
+## Planned phase 21 (not started)
 
-Ordered so each phase strengthens the net under the next: the catch-up
-scalability work first (learner catch-up will lean on it), then
-learners — the largest change — landing on top of it and of the
-phase-19 hardenings shipped above.
+Planned to land on top of the phase-20 catch-up scalability work
+(learner catch-up leans on it) and the phase-19 hardenings.
 
-Standing rules for both (beyond CLAUDE.md): the seed-churn
+Standing rules (beyond CLAUDE.md): the seed-churn
 firewall — new behavior must default OFF in `RaftConfig`
 (`None`/`false`) so every seeded sim schedule stays byte-identical,
 with the binary opting in via env config, exactly as
@@ -1801,56 +1945,6 @@ default-config output is byte-identical; test-first for every claim of
 the form "X prevents Y" (demonstrate Y with X disabled, then invert);
 FAILURE_MODES.md is updated in the same commit as any phase that
 changes a documented failure mode.
-
-### Phase 20 — catch-up scalability (AE batch cap, size-aware timeout, §7 snapshot chunking)
-
-Closes the remaining half of the payload gap (FAILURE_MODES.md
-"Single-shot snapshot / batch vs the RPC timeout"). The 2 MiB hard cap
-died in the testing review; what remains is bandwidth × timeout.
-
-(a) AppendEntries byte cap (undoes the deliberate phase-4 "no batching
-cap" simplification):
-- `RaftConfig.max_append_bytes: Option<usize>` (None = unbounded =
-  today, the sim default — zero seed churn). main.rs default 1 MiB via
-  `RUSTKV_MAX_APPEND_BYTES`.
-- `send_append` truncates the `entries_from(next_index)` suffix at the
-  budget (estimate via serialized command sizes; exactness not
-  required). Raft handles partial progress natively: the follower acks
-  the prefix, match/next advance, and the existing
-  still-lagging-resend-immediately logic is the pump — no protocol
-  change, no wire change.
-- Tests: a follower N MiB behind converges in bounded-size steps
-  (counting-server or sim-level max-message-size assertion); the
-  payload experiment script re-run at 64-256 MiB with compaction off.
-
-(b) Size-aware RPC timeout (HTTP transport only, core untouched):
-- Effective timeout grows with body size past a threshold (e.g.
-  `rpc_timeout + bytes / RUSTKV_ASSUMED_BANDWIDTH`), so a big
-  InstallSnapshot no longer races the heartbeat-scale budget while
-  small RPCs keep tight failure detection. Env-tunable; unit tests on
-  the arithmetic.
-
-(c) §7 InstallSnapshot chunking (chosen over etcd-style out-of-band
-pull because chunking is transport-agnostic — the core never learns
-about HTTP, preserving the architecture rule):
-- `InstallSnapshotArgs` gains `offset`, `data` (chunk), `done` with
-  serde defaults such that today's messages read as offset-0/done-true
-  single chunks — old wire format stays valid, pinned verbatim.
-- Follower buffers chunks keyed by (term, leader, last_included_index),
-  discards the staging on term change or a mismatched key, persists +
-  restores only at `done` (the existing fsync-before-reply and
-  idempotence guards apply at the done step; per-chunk retries are
-  offset-idempotent).
-- `RaftConfig.snapshot_chunk_bytes: Option<usize>` (None = single-shot
-  = today = sim default; binary default a few MiB via env).
-- Tests: the phase-14 money test re-run with a tiny chunk size (forces
-  many chunks) including under 100% duplication; leader crash
-  mid-transfer (staging discarded, successor restarts transfer);
-  wire-format pins; joiner catch-up over chunks in membership.rs.
-
-Done when: the payload experiment converges at 256 MiB behind on
-defaults, all seeded suites green with zero re-pins (all three knobs
-off in sim), FAILURE_MODES.md entry rewritten.
 
 ### Phase 21 — learner members
 
@@ -1912,8 +2006,8 @@ checkpoint. Joint consensus stays out of scope.
 
 ## Out of scope (deliberate)
 Joint-consensus (multi-server) membership changes. The snapshot
-chunking/streaming path graduated from this list into planned phase 20
-(as dynamic membership did in phase 15 and snapshotting in phase 14).
+chunking/streaming path graduated from this list and shipped in phase
+20 (as dynamic membership did in phase 15 and snapshotting in phase 14).
 
 ## Phase T1 — CI pipeline ✅ (2026-07-14)
 

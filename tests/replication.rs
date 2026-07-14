@@ -617,3 +617,90 @@ async fn append_entries_rpc_conformance() {
         "conflict was replaced"
     );
 }
+
+// ---- phase 20a: the AppendEntries byte cap ----
+
+/// Runs the phase-20a scenario: a follower is partitioned away while the
+/// leader commits ~200 KiB of writes, then healed; returns the largest
+/// AppendEntries (in serialized bytes) the sim ever saw. Convergence is
+/// asserted in BOTH legs — a capped catch-up must still complete, pumped
+/// by partial-batch acks and the still-lagging immediate resend.
+async fn catch_up_max_batch_bytes(seed: u64, max_append_bytes: Option<usize>) -> usize {
+    let cluster = spawn_cluster_tuned(
+        3,
+        seed,
+        low_loss_faults(),
+        None,
+        0,
+        ClusterTuning {
+            max_append_bytes,
+            ..ClusterTuning::default()
+        },
+    );
+    let all = cluster.all_ids();
+    let leader = cluster.wait_for_leader().await;
+    let victim = *all.iter().find(|&&id| id != leader.id).unwrap();
+    for &id in all.iter().filter(|&&id| id != victim) {
+        cluster.net.set_pair_blocked(victim, id, true);
+    }
+
+    // ~200 KiB of committed writes the victim will have to catch up on.
+    for i in 1..=24u64 {
+        let proposal = cluster
+            .handle(leader.id)
+            .propose(Command::Put {
+                key: format!("big{i}"),
+                value: serde_json::json!("x".repeat(8 * 1024)),
+                session: None,
+            })
+            .await
+            .expect("leader accepts the proposal");
+        assert_eq!(proposal.committed.await, Ok(true), "write {i} must commit");
+    }
+
+    for &id in all.iter().filter(|&&id| id != victim) {
+        cluster.net.set_pair_blocked(victim, id, false);
+    }
+    wait_until("the healed follower converges", || {
+        let statuses = cluster.statuses_among(&all);
+        let max_last = statuses.iter().map(|s| s.last_log_index).max().unwrap();
+        statuses
+            .iter()
+            .all(|s| s.last_log_index == max_last && s.commit_index == max_last)
+    })
+    .await;
+    cluster.shutdown();
+    cluster.net.max_rpc_bytes().append_entries
+}
+
+/// Phase 20a, the inversion pair. Disease first: with `max_append_bytes`
+/// unset (the default), the healed follower's whole ~200 KiB deficit rides
+/// ONE AppendEntries — nothing bounds the batch, which is exactly what
+/// races an RPC timeout on a real network. Inverted: a 64 KiB cap keeps
+/// every AppendEntries under cap-plus-framing while the catch-up still
+/// converges in bounded steps (and still batches multiple entries — the
+/// cap must not degrade to entry-at-a-time).
+#[tokio::test(start_paused = true)]
+async fn append_entries_byte_cap_bounds_catch_up_batches() {
+    const CAP: usize = 64 * 1024;
+    /// JSON framing around the entries array (batch wrapper + separators).
+    const FRAMING_SLACK: usize = 1024;
+
+    let uncapped = catch_up_max_batch_bytes(29, None).await;
+    assert!(
+        uncapped > 2 * CAP,
+        "uncapped catch-up must ship one giant batch (saw {uncapped} bytes; \
+         the scenario has lost its teeth if this shrank)"
+    );
+
+    let capped = catch_up_max_batch_bytes(29, Some(CAP)).await;
+    assert!(
+        capped <= CAP + FRAMING_SLACK,
+        "capped catch-up sent an AppendEntries of {capped} bytes, over the \
+         {CAP}-byte budget"
+    );
+    assert!(
+        capped > 2 * 8 * 1024,
+        "batches must still carry multiple entries under the cap (saw {capped} bytes)"
+    );
+}

@@ -108,6 +108,22 @@ pub struct FaultStats {
     pub reorders: u64,
 }
 
+/// Largest serialized payload-bearing RPC seen crossing the network, per
+/// kind (phase 20): the sim-level "wire size" — `serde_json` bytes of the
+/// [`RpcRequest`], the same encoding the HTTP transport posts (its envelope
+/// adds a small constant). Pure observation like [`FaultStats`]: no RNG
+/// draws, no delays, so pinned seeded schedules are unaffected. Small
+/// fixed-shape RPCs (votes, empty-batch heartbeats) are not measured —
+/// only AppendEntries carrying entries and InstallSnapshot, the two kinds
+/// whose size the phase-20 knobs exist to bound.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MaxRpcBytes {
+    /// Largest AppendEntries with a non-empty entries batch.
+    pub append_entries: usize,
+    /// Largest InstallSnapshot (single-shot or one chunk).
+    pub install_snapshot: usize,
+}
+
 struct State {
     rng: SplitMix64,
     config: FaultConfig,
@@ -123,6 +139,8 @@ struct State {
     violations: Vec<String>,
     /// Fault-event counters (see [`FaultStats`]).
     stats: FaultStats,
+    /// Wire-size high-water marks (see [`MaxRpcBytes`]).
+    max_rpc_bytes: MaxRpcBytes,
     /// Per directed link: sequence number for the next primary send, and the
     /// highest sequence delivered so far — a delivery below the high-water
     /// mark overtook an earlier send (a reorder).
@@ -148,6 +166,7 @@ impl SimNetwork {
                 entries_seen: HashMap::new(),
                 violations: Vec::new(),
                 stats: FaultStats::default(),
+                max_rpc_bytes: MaxRpcBytes::default(),
                 link_send_seq: HashMap::new(),
                 link_delivered_seq: HashMap::new(),
             })),
@@ -209,6 +228,13 @@ impl SimNetwork {
         self.lock().stats
     }
 
+    /// Wire-size high-water marks seen so far (see [`MaxRpcBytes`]): what
+    /// the phase-20 batch/chunk caps are asserted against. Deterministic
+    /// per seed, like the fault stats.
+    pub fn max_rpc_bytes(&self) -> MaxRpcBytes {
+        self.lock().max_rpc_bytes
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().expect("sim network lock poisoned")
     }
@@ -242,6 +268,7 @@ impl Transport for SimTransport {
         let plan = {
             let mut st = self.state.lock().expect("sim network lock poisoned");
             inspect_append_entries(&mut st, &req);
+            measure_rpc(&mut st, &req);
             let cfg = st.config.clone();
             st.stats.sends += 1;
             let seq = {
@@ -409,6 +436,24 @@ fn inspect_append_entries(st: &mut State, req: &RpcRequest) {
             Some(_) => {}
         }
     }
+}
+
+/// The wire-size observer (see [`MaxRpcBytes`]): serializes only the two
+/// payload-bearing RPC kinds — every other variant is a few dozen bytes of
+/// fixed shape, and skipping them keeps the observer near-free on
+/// heartbeat-dominated runs.
+fn measure_rpc(st: &mut State, req: &RpcRequest) {
+    let slot = match req {
+        RpcRequest::AppendEntries(args) if !args.entries.is_empty() => {
+            &mut st.max_rpc_bytes.append_entries
+        }
+        RpcRequest::InstallSnapshot(_) => &mut st.max_rpc_bytes.install_snapshot,
+        _ => return,
+    };
+    let bytes = serde_json::to_vec(req)
+        .expect("rpc serialization cannot fail")
+        .len();
+    *slot = (*slot).max(bytes);
 }
 
 fn check_shape(st: &mut State, args: &AppendEntriesArgs) {
@@ -896,6 +941,9 @@ mod tests {
                     membership: None,
                     state: serde_json::json!({}),
                 },
+                offset: 0,
+                data: None,
+                done: true,
             })
         };
         t1.send(3, snap_req(1)).await.unwrap();

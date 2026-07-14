@@ -49,6 +49,11 @@ struct Envelope {
 /// Idle connections kept per address; parallelism beyond this churns
 /// (extra connections are opened per RPC and dropped instead of pooled).
 const MAX_IDLE_PER_PEER: usize = 4;
+/// Bodies at or below this size keep the flat `rpc_timeout` (phase 20b):
+/// failure detection for ordinary traffic — votes, heartbeats, small
+/// batches — stays as tight as configured, and only genuinely large
+/// payloads (catch-up batches, snapshots) earn transfer time.
+const SIZE_AWARE_THRESHOLD: usize = 64 * 1024;
 /// Backstop against a peer streaming garbage instead of a header terminator.
 const MAX_RESPONSE_HEAD: usize = 16 * 1024;
 
@@ -65,6 +70,14 @@ pub struct HttpTransport {
     /// clones; a std `Mutex` because it is never held across an await.
     pool: Arc<Mutex<HashMap<String, Vec<TcpStream>>>>,
     rpc_timeout: Duration,
+    /// Size-aware timeout (phase 20b): with `Some(bytes_per_sec)`, an RPC
+    /// whose body exceeds [`SIZE_AWARE_THRESHOLD`] gets `rpc_timeout` plus
+    /// the body's transfer time at this assumed bandwidth — a big
+    /// InstallSnapshot no longer races a heartbeat-scale budget. `None`
+    /// (the constructor default) keeps the flat timeout for every RPC,
+    /// the pre-phase-20 behavior; the binary opts in via
+    /// `RUSTKV_ASSUMED_BANDWIDTH`.
+    assumed_bandwidth: Option<u64>,
 }
 
 impl HttpTransport {
@@ -93,8 +106,16 @@ impl HttpTransport {
             peers: Arc::new(RwLock::new(peers)),
             pool: Arc::new(Mutex::new(HashMap::new())),
             rpc_timeout,
+            assumed_bandwidth: None,
         };
         (transport, router, inbound_rx)
+    }
+
+    /// Opts in to the size-aware timeout (phase 20b; see the field docs).
+    /// Call before the transport is cloned into the Raft node.
+    pub fn with_assumed_bandwidth(mut self, bytes_per_sec: Option<u64>) -> Self {
+        self.assumed_bandwidth = bytes_per_sec;
+        self
     }
 
     /// Replaces the peer address book (phase 15: membership changed). All
@@ -202,7 +223,11 @@ impl Transport for HttpTransport {
         })
         .expect("rpc serialization cannot fail");
 
-        let raw = tokio::time::timeout(self.rpc_timeout, self.post_json(&addr, "/raft", &body))
+        let budget = match self.assumed_bandwidth {
+            Some(bandwidth) => effective_timeout(self.rpc_timeout, body.len(), bandwidth),
+            None => self.rpc_timeout,
+        };
+        let raw = tokio::time::timeout(budget, self.post_json(&addr, "/raft", &body))
             .await
             .map_err(|_elapsed| TransportError::Timeout)?
             .map_err(|error| {
@@ -214,6 +239,20 @@ impl Transport for HttpTransport {
             TransportError::Timeout
         })
     }
+}
+
+/// The phase-20b arithmetic: bodies at or below [`SIZE_AWARE_THRESHOLD`]
+/// keep the flat base budget; larger ones add the whole body's transfer
+/// time at the assumed bandwidth (integer math, saturating — a silly
+/// bandwidth of 0 is treated as 1 byte/sec rather than dividing by zero).
+fn effective_timeout(base: Duration, body_bytes: usize, bandwidth_bytes_per_sec: u64) -> Duration {
+    if body_bytes <= SIZE_AWARE_THRESHOLD {
+        return base;
+    }
+    let transfer_ms = (body_bytes as u128)
+        .saturating_mul(1000)
+        .div_euclid(u128::from(bandwidth_bytes_per_sec.max(1)));
+    base + Duration::from_millis(u64::try_from(transfer_ms).unwrap_or(u64::MAX))
 }
 
 async fn handle_raft_rpc(
@@ -387,6 +426,38 @@ mod tests {
         assert!(parse_response_head(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked").is_err());
         assert!(parse_response_head(b"HTTP/1.1 200 OK\r\nContent-Length: nope").is_err());
         assert!(parse_response_head(b"garbage").is_err());
+    }
+
+    #[test]
+    fn effective_timeout_grows_past_the_threshold_only() {
+        let base = Duration::from_millis(150);
+        let mib = 1024 * 1024;
+
+        // At or below the threshold: the flat budget, exactly — small RPCs
+        // keep tight failure detection.
+        assert_eq!(effective_timeout(base, 0, 8 * mib as u64), base);
+        assert_eq!(
+            effective_timeout(base, SIZE_AWARE_THRESHOLD, 8 * mib as u64),
+            base
+        );
+
+        // Past it: base + body / bandwidth. 8 MiB at 8 MiB/s = +1s.
+        assert_eq!(
+            effective_timeout(base, 8 * mib, 8 * mib as u64),
+            base + Duration::from_secs(1)
+        );
+        // 256 MiB at 8 MiB/s = +32s: the payload-experiment scale.
+        assert_eq!(
+            effective_timeout(base, 256 * mib, 8 * mib as u64),
+            base + Duration::from_secs(32)
+        );
+
+        // Degenerate inputs saturate instead of panicking.
+        assert_eq!(
+            effective_timeout(base, mib, 0),
+            base + Duration::from_millis(1000 * mib as u64)
+        );
+        assert!(effective_timeout(base, usize::MAX, 1) > Duration::from_secs(3600));
     }
 
     #[test]

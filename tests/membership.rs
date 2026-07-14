@@ -1529,3 +1529,90 @@ async fn removed_follower_cannot_disrupt_the_members() {
     assert_ne!(cluster.handle(victim).status().role, RoleKind::Leader);
     cluster.shutdown();
 }
+
+/// The InstallSnapshot joiner path under chunking (phase 20c): identical
+/// construction to `joiner_catches_up_purely_via_install_snapshot` — the
+/// joiner never self-compacts, so its snapshot can only have arrived over
+/// the wire — but the values carry 2 KiB payloads and the leader streams
+/// the transfer in 512-byte chunks, so the catch-up provably crossed in
+/// many bounded messages (the sim's high-water InstallSnapshot size stays
+/// within chunk-times-escaping plus metadata).
+#[tokio::test(start_paused = true)]
+async fn joiner_catches_up_via_chunked_install_snapshot() {
+    const CHUNK: usize = 512;
+    let cluster = spawn_cluster_tuned(
+        3,
+        157,
+        low_loss_faults(),
+        Some(8),
+        0,
+        ClusterTuning {
+            snapshot_chunk_bytes: Some(CHUNK),
+            ..ClusterTuning::default()
+        },
+    );
+    let originals = cluster.all_ids();
+    cluster.wait_for_leader().await;
+    for i in 1..=20u64 {
+        let leader = cluster.wait_for_leader_among(&originals).await;
+        let proposal = cluster
+            .handle(leader.id)
+            .propose(Command::Put {
+                key: format!("k{i}"),
+                value: json!(format!("{i}:{}", "x".repeat(2048))),
+                session: None,
+            })
+            .await
+            .expect("leader accepts the proposal");
+        assert_eq!(proposal.committed.await, Ok(true), "write {i} must commit");
+    }
+    converge_among(&cluster, &originals).await;
+
+    cluster.add_node_with(4, None, 0);
+    commit_config(&cluster, &originals, |m| {
+        m.insert(4, member_addr(4));
+    })
+    .await;
+
+    let all = cluster.all_ids();
+    converge_among(&cluster, &all).await;
+    assert_states_identical(&cluster, &all);
+    for i in 1..=20u64 {
+        let value = cluster.store(4).get(&format!("k{i}"));
+        assert_eq!(
+            value.and_then(|v| v.as_str().map(|s| s.starts_with(&format!("{i}:")))),
+            Some(true),
+            "k{i} missing or wrong on the joiner"
+        );
+    }
+
+    // Bounded messages: the whole tens-of-KiB state crossed, yet no single
+    // InstallSnapshot exceeded chunk (×2 for JSON escaping) + metadata.
+    let max_install = cluster.net.max_rpc_bytes().install_snapshot;
+    assert!(
+        max_install > 0,
+        "the joiner's catch-up must have used InstallSnapshot"
+    );
+    assert!(
+        max_install <= 2 * CHUNK + 512,
+        "a chunked joiner transfer sent an InstallSnapshot of \
+         {max_install} bytes, over the {CHUNK}-byte chunk bound"
+    );
+
+    cluster.shutdown();
+    tokio::time::sleep(ms(100)).await;
+    let snapshot = cluster
+        .disk_snapshot(4)
+        .expect("the joiner can only own a snapshot via InstallSnapshot");
+    assert!(
+        snapshot.last_included_index >= 16,
+        "boundary {} below what the survivors provably compacted",
+        snapshot.last_included_index
+    );
+    let log = cluster.disk_log(4);
+    assert!(
+        log.iter().all(|e| e.index > snapshot.last_included_index),
+        "the joiner's log reaches into the compacted prefix — something \
+         backfilled what only a snapshot should carry"
+    );
+}
