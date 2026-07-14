@@ -1974,3 +1974,151 @@ Known gaps:
   superseded pushes on the same ref).
 - Cache is keyed by Swatinem defaults; first run per branch is cold
   (~4m test job). No cache-warming job — not worth it at this runtime.
+
+## Phase T2 — harness soundness ✅ (2026-07-14)
+
+Second testing-regime phase: prove the harness can catch the bugs it
+claims to guard against — a checker that never fires is indistinguishable
+from one that works. Branch `t2-harness`. Additive throughout: one new
+test file (tests/harness_soundness.rs), appends to existing test suites,
+one flagged test-infrastructure hook in src/ (below). No runtime behavior
+touched; no Makefile change needed (the new soaks match `make soak`'s
+existing `extended_soak` name filter).
+
+### Flagged src/ hook: SimNetwork fault-event counters
+
+`FaultStats` in src/raft/transport/sim.rs — counters for sends, dropped
+request/reply legs, blocked legs, delivered duplicates, and observed
+reorders (per-link send-sequence high-water mark), read via
+`SimNetwork::fault_stats()`. Sim-transport only (the real binary never
+constructs a SimNetwork); pure observation — no RNG draws, no delays —
+so every pinned schedule is unchanged (the pre-existing byte-identity
+determinism tests passing unmodified is the proof). Unit-pinned in
+sim.rs: exact counts under certain drop/duplication/blocking, reorder
+counter agreeing with directly observed arrival order in BOTH directions
+(zero on in-order seeds, exact on reordering ones), counters themselves
+seed-reproducible.
+
+### 1. Checker sensitivity (the alarm rings)
+
+Every checker was fed deliberately-violating inputs and must REJECT them;
+each rejection is paired with the nearest legal input it must ACCEPT, so
+no probe can pass by the checker rejecting everything.
+
+- WGL linearizability checker (tests/harness_soundness.rs, 8 tests):
+  lost acknowledged write (vs legal unknown-write "never happened");
+  lost acknowledged overwrite (value resurrection); stale read judged by
+  real time, not value (same read accepted while concurrent, rejected
+  once past the write's return); violation on one key buried among
+  healthy keys (compositional check blames the right key); double-applied
+  write surfacing after an interleaved conflicting write — REJECTED under
+  the tokened workload's Ok-once recording, ACCEPTED under the untokened
+  Unknown recording (the pair documents that the exactly-once claim rests
+  on dedup tightening the history); double-applied delete; unknown writes
+  can't excuse unwritten values or before-invocation reads; the 63-op cap
+  trips loudly instead of mischecking.
+- White-box log witness (`check_write_witness`, appended to
+  tests/jepsen.rs, 5 tests): faithful log accepted; confirmed write
+  missing from the log, replaced by another term's entry, or rewritten to
+  a different command all refused; a log order inverting real time
+  refused even with every entry present and intact.
+- Final-consistency checker (`assert_final_consistency`, appended to
+  tests/faults.rs, 4 should_panic probes against a real healthy cluster):
+  a forged never-applied confirmed write ("lost ack"), a confirmed write
+  whose (term, index) no longer matches ("replaced"), an untokened
+  same-key double commit (the at-least-once log signature), and a
+  replica state machine poked into divergence (double-apply) each fail
+  the run.
+
+### 2. Determinism audit
+
+- Same-seed byte-identity now also compares the fault-event counters
+  (`FaultStats`) — divergence in event counts is nondeterminism even when
+  the trace/history comparison happens not to see it.
+- NEW surface: snapshots-on determinism had never been checked (compaction
+  adds disk truncation, snapshot capture, and InstallSnapshot to the
+  replayed surface). Default suite: 2 seeds × 2 runs in both tests/faults.rs
+  (randomized schedule, dup 0.10 + threshold 8) and tests/jepsen.rs
+  (linearizable workload, dup 0.10 + threshold 16), comparing
+  trace/history, retained logs, compaction counts and fault stats.
+- Wide N behind #[ignore], wired into `make soak` by name:
+  `extended_soak_same_seed_determinism_across_seeds` (faults) and
+  `extended_soak_same_seed_history_determinism` (jepsen) — every seed run
+  TWICE under the strongest mix. Verified at the nightly width
+  (RUSTKV_SOAK_SEEDS=256): all four soaks green — faults binary 237s,
+  jepsen 335s, `make soak` ~10 min total on the dev machine (the
+  determinism soaks double per-seed work; the T1-era "~12s per suite"
+  figure no longer describes the widened soak — nightly's 120-min job
+  timeout still has ample headroom).
+- Same-process reruns DO catch HashMap iteration-order leaks (RandomState
+  reseeds per HashMap instance); cross-process identity remains unclaimed
+  (the FAILURE_MODES.md "determinism is sim-only" note stands).
+
+### 3. Vacuity audit
+
+`assert_scheduled_faults_fired` (tests/common/mod.rs): every test that
+schedules probabilistic faults now asserts they actually fired, per run —
+loss ⇒ ≥1 dropped leg, duplication ⇒ ≥1 delivered duplicate — and the
+multi-seed suites add cross-set claims (≥1 reorder and ≥1
+partition-suppressed leg somewhere in the seed set), generalizing the
+seeds_with_compaction pattern. Wired into: both fault-schedule helpers
+(tests/faults.rs `randomized_fault_schedule`, tests/jepsen.rs
+`run_workload` — so every pinned suite and every soak inherits it),
+election.rs 25%-loss test, replication.rs 15%-loss test, snapshot.rs
+duplication catch-up variants. Crash-round and compaction vacuity guards
+already existed (phase 10/14) and are unchanged. All pinned seeds pass:
+no currently-scheduled fault turns out to be vacuous.
+
+### 4. FAILURE_MODES.md cross-check (what the harness can/can't provoke)
+
+Provokable and asserted today: ambiguous-write dedup retries, stale-read
+opt-in violations, >64-window dedup skip (unit-pinned), >2 MiB RPC
+regression, trailing-window catch-up, compaction-ambiguity proposal
+drops, minority-partition write rejection, CheckQuorum under 25% loss,
+1→2 growth guard, fresh-term reconfig guard, parting sends, stacked-
+removal split-brain (gates off) and its refusal (gates on), oversized
+client bodies, exotic keys, null values.
+
+NOT provokable by the current harness — input to T3/T4, not T2 work:
+- Real power loss / torn or reordered writes at the fsync boundary
+  (crash durability rests on fsync-before-reply + hand-corrupted-file
+  recovery tests) → T3 storage fault injection.
+- Reply duplication: the sim duplicates requests only; the core's
+  stale-reply folding has zero fault-injection coverage → T4 (sim
+  extension: duplicate reply legs).
+- Size/bandwidth-dependent transfer failure (single-shot InstallSnapshot
+  vs RPC timeout): sim delays are size-independent, so the documented
+  bandwidth-bound failure mode cannot occur in sim → T4 (size-aware sim
+  delays) or scripted real-network only.
+- Half-open pooled connections (no-RST severance): needs real sockets;
+  observed live in the Docker test but never asserted → T5/T6 candidate.
+- Sessions-table unbounded growth: needs a client-id-churn workload;
+  current workloads reuse 4 client ids → T4.
+- One-way link loss toward a follower (the documented PreVote parking
+  residual): constructible in the sim today (set_link_blocked is
+  directional) but no test pins the parked-forever behavior → T4
+  candidate (liveness-documentation test).
+- Mixed-version ConfigChange rejection: needs a pre-phase-15 binary;
+  out of scope for the sim harness entirely.
+- Cross-term split-brain invisibility of the event-level safety observer
+  is inherent (per-term checks); divergence/WGL assertions remain the
+  detector for that class (phase-18 record).
+
+### 5. What the probes caught
+
+No harness bug survived to the checkpoint: every checker rejected every
+violation class on first contact, all pinned schedules were already
+deterministic on the new snapshots-on surface (and at 256-seed width),
+and no scheduled fault was vacuous. Two honest notes: (a) the untokened-
+double-commit probe initially tripped the DIVERGENCE alarm instead of the
+dedup-rule alarm (replicas hadn't applied the second commit yet when the
+checker ran) — probe construction, not a checker defect, fixed by
+converging applies first; it demonstrates the checkers overlap rather
+than gap. (b) The WGL basics (jepsen.rs phase-8 "testing the tests") were
+already self-tested; T2's new value is the lost-ack/double-apply classes,
+the witness and final-consistency probes, the determinism width, and the
+vacuity infrastructure — the pre-existing guards turned out to be real,
+which is itself the result T2 exists to establish.
+
+Verified: `make ci` green locally; PR into main with lint/test/partition
+green on the Actions run (see PR for run link). Do not start T3 unasked.

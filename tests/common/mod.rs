@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use rustkv::raft::Storage;
 use rustkv::raft::node::{RaftConfig, RaftHandle, RaftNode, RoleKind, StateMachine, Status};
-use rustkv::raft::transport::sim::{FaultConfig, SimNetwork};
+use rustkv::raft::transport::sim::{FaultConfig, FaultStats, SimNetwork};
 use rustkv::raft::types::{
     Command, LogEntry, LogIndex, MemberAddr, NodeId, Session, Snapshot, Term,
 };
@@ -506,6 +506,42 @@ impl TestCluster {
             .snapshot()
             .cloned()
     }
+}
+
+/// Vacuity guard (testing-regime T2): asserts that the probabilistic faults
+/// a test SCHEDULED actually FIRED during the run — a test whose fault never
+/// fired must fail, not silently pass as if the system had survived it.
+/// Returns the stats so callers can add cross-seed claims (e.g. reorders or
+/// partition-suppressed legs over a whole seed set) on top of the per-run
+/// ones. Reading the counters consumes no RNG draws, so pinned schedules
+/// are unaffected.
+pub fn assert_scheduled_faults_fired(
+    cluster: &TestCluster,
+    faults: &FaultConfig,
+    context: &str,
+) -> FaultStats {
+    let stats = cluster.net.fault_stats();
+    assert!(
+        stats.sends > 0,
+        "{context}: no message ever crossed the network"
+    );
+    if faults.drop_probability > 0.0 {
+        assert!(
+            stats.requests_dropped + stats.replies_dropped > 0,
+            "{context}: loss was scheduled (p={}) but no leg was ever \
+             dropped — the scenario is vacuous",
+            faults.drop_probability
+        );
+    }
+    if faults.duplicate_probability > 0.0 {
+        assert!(
+            stats.duplicates_delivered > 0,
+            "{context}: duplication was scheduled (p={}) but no duplicate \
+             was ever delivered — the scenario is vacuous",
+            faults.duplicate_probability
+        );
+    }
+    stats
 }
 
 /// Polls `pred` every 5ms of virtual time; panics after 60 virtual seconds.

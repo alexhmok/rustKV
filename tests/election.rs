@@ -242,7 +242,7 @@ async fn at_most_one_leader_per_term_under_message_loss() {
             duplicate_probability: 0.0,
             rpc_timeout: ms(40),
         };
-        let cluster = spawn_cluster(3, seed, faults);
+        let cluster = spawn_cluster(3, seed, faults.clone());
 
         let mut leaders_by_term: HashMap<Term, NodeId> = HashMap::new();
         for _ in 0..600 {
@@ -263,6 +263,9 @@ async fn at_most_one_leader_per_term_under_message_loss() {
             !leaders_by_term.is_empty(),
             "seed {seed}: elections still succeed under loss"
         );
+        // Vacuity (T2): the 25% loss this test is titled after must have
+        // actually dropped something.
+        assert_scheduled_faults_fired(&cluster, &faults, &format!("seed {seed}"));
         cluster.shutdown();
     }
 }

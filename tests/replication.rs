@@ -448,7 +448,7 @@ async fn confirmed_writes_survive_sustained_message_loss() {
             duplicate_probability: 0.0,
             rpc_timeout: ms(40),
         };
-        let cluster = spawn_cluster(3, seed, faults);
+        let cluster = spawn_cluster(3, seed, faults.clone());
 
         // (term, index, value) of every write whose commit was confirmed.
         let mut confirmed: Vec<(Term, LogIndex, u64)> = Vec::new();
@@ -484,6 +484,9 @@ async fn confirmed_writes_survive_sustained_message_loss() {
             statuses.iter().all(|s| s.commit_index == max_commit)
         })
         .await;
+        // Vacuity (T2): the sustained loss this test is titled after must
+        // have actually dropped something.
+        assert_scheduled_faults_fired(&cluster, &faults, &format!("seed {seed}"));
         cluster.shutdown();
         tokio::time::sleep(ms(200)).await;
 
