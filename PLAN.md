@@ -1829,12 +1829,15 @@ the local daemon needed fixing. Locally: `make ci` green, and
 the two extended soaks (the 256-seed width was exercised locally in the
 post-completion testing review, ~90s per suite there).
 
+Merge gate (resolved at checkpoint): branch protection is a paid
+feature on private repos (classic API and rulesets both 403 under
+GitHub Free), so per user decision the repo was made PUBLIC on
+2026-07-14 and ruleset `main-ci-gate` (id 18933682) is active on main:
+required status checks lint/test/partition, no bypass actors. Direct
+pushes to main are now rejected — ALL mainline work (both active
+sessions) merges via PR through the same gate.
+
 Known gaps:
-- Branch protection on main NOT enabled: both the classic protection
-  API and rulesets return 403 on a private repo under the GitHub Free
-  plan ("Upgrade to GitHub Pro or make this repository public").
-  Decision needed at checkpoint: upgrade, go public, or run without an
-  enforced gate (CI still runs and reports on every push/PR).
 - nightly.yml has not executed on a runner: workflow_dispatch/schedule
   only register once the file is on the default branch, so its first
   real run happens post-merge. `make soak` (the job's entire body) is
