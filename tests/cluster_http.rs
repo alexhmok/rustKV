@@ -136,6 +136,46 @@ impl HttpCluster {
     fn followers(&self, leader: NodeId) -> Vec<&HttpNode> {
         self.nodes.iter().filter(|n| n.id != leader).collect()
     }
+
+    /// Sends a raw (redirects disabled) request to a CURRENT follower and
+    /// returns once it observes the 307 with a Location matching the
+    /// CURRENT leader. Leadership is re-sampled per attempt: under parallel
+    /// test load a step-down/re-election can land between sampling and the
+    /// request (the documented CPU-starvation flake class), in which case
+    /// the follower legitimately answers 503 or points at a newer leader —
+    /// retried within a bounded deadline rather than hard-asserted.
+    async fn assert_follower_redirects(&self, path: &str, body: Option<&Value>) {
+        let raw = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let leader = self.wait_for_leader().await;
+            let follower = self.followers(leader.id)[0];
+            let request = match body {
+                Some(value) => raw.put(format!("{}/{path}", follower.url)).json(value),
+                None => raw.put(format!("{}/{path}", follower.url)),
+            };
+            let resp = request.send().await.unwrap();
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|l| l.to_str().ok())
+                .map(str::to_string);
+            if resp.status() == 307
+                && location.as_deref() == Some(&format!("{}/{path}", leader.url))
+            {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no stable 307-to-leader observed for {path}: last status {} location {location:?}",
+                resp.status()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 }
 
 /// Polls a LOCAL (`?stale=true`) GET on `url/key` until the expected outcome
@@ -199,35 +239,38 @@ async fn leader_write_becomes_visible_on_every_node() {
 async fn follower_redirects_writes_to_the_leader() {
     let _serial = SERIAL.lock().await;
     let cluster = spawn_http_cluster(3, 32).await;
-    let leader = cluster.wait_for_leader().await;
-    let follower = cluster.followers(leader.id)[0];
     let value = json!({"via": "follower"});
 
-    // Raw redirect: 307 with a Location pointing at the leader.
-    let raw = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
-    let resp = raw
-        .put(format!("{}/redirected", follower.url))
-        .json(&value)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 307);
-    let location = resp.headers()["location"].to_str().unwrap();
-    assert_eq!(location, format!("{}/redirected", leader.url));
+    // Raw redirect: 307 with a Location pointing at the leader
+    // (leadership-churn-tolerant probe; see assert_follower_redirects).
+    cluster
+        .assert_follower_redirects("redirected", Some(&value))
+        .await;
 
     // A standard client follows the 307 (re-sending the PUT body) and lands
-    // the write.
+    // the write. Retried within a deadline: a re-election mid-flight can
+    // surface as a retryable 503.
     let client = reqwest::Client::new();
-    let put = client
-        .put(format!("{}/redirected", follower.url))
-        .json(&value)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(put.status(), 201);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let leader = cluster.wait_for_leader().await;
+        let follower = cluster.followers(leader.id)[0];
+        let put = client
+            .put(format!("{}/redirected", follower.url))
+            .json(&value)
+            .send()
+            .await
+            .unwrap();
+        if put.status() == 201 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "redirected PUT never landed: last status {}",
+            put.status()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     for node in &cluster.nodes {
         wait_for_local_get(&client, &node.url, "redirected", Some(&value)).await;
     }
@@ -330,7 +373,6 @@ async fn admin_membership_endpoints_crud_and_redirect() {
     let _serial = SERIAL.lock().await;
     let cluster = spawn_http_cluster(3, 36).await;
     let leader = cluster.wait_for_leader().await;
-    let follower = cluster.followers(leader.id)[0];
     let client = reqwest::Client::new();
 
     // GET: any node answers with its own view of the bootstrap membership.
@@ -349,25 +391,17 @@ async fn admin_membership_endpoints_crud_and_redirect() {
         }
     }
 
-    // Raw PUT on a follower: 307 with a Location on the leader.
-    let raw = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
+    // Raw PUT on a follower: 307 with a Location on the leader
+    // (leadership-churn-tolerant probe; see assert_follower_redirects).
+    // NOTE: if a churn race lands the probe on a fresh leader it may
+    // EXECUTE the add — the steps below tolerate "already done".
     let addr = json!({"raft": "127.0.0.1:1", "client": "http://127.0.0.1:1"});
-    let resp = raw
-        .put(format!("{}/cluster/members/4", follower.url))
-        .json(&addr)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 307);
-    assert_eq!(
-        resp.headers()["location"].to_str().unwrap(),
-        format!("{}/cluster/members/4", leader.url)
-    );
+    cluster
+        .assert_follower_redirects("cluster/members/4", Some(&addr))
+        .await;
 
-    // Malformed body: 400, nothing proposed.
+    // Malformed body: 400, nothing proposed (leadership-independent: the
+    // body is rejected before any write is attempted).
     let resp = client
         .put(format!("{}/cluster/members/4", leader.url))
         .body("not json")
@@ -378,21 +412,62 @@ async fn admin_membership_endpoints_crud_and_redirect() {
 
     // Add member 4 (no such process runs — the change itself commits with
     // 3 of the new 4 acking). A follower with redirects lands it too.
-    let resp = client
-        .put(format!("{}/cluster/members/4", follower.url))
-        .json(&addr)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 201);
-    let resp = client
-        .get(format!("{}/cluster/members", leader.url))
-        .send()
-        .await
-        .unwrap();
-    let body = resp.json::<Value>().await.unwrap();
-    assert_eq!(body.as_object().unwrap().len(), 4);
-    assert_eq!(body["4"]["raft"], json!("127.0.0.1:1"));
+    // Bounded retry: mid-flight re-elections surface as retryable 503s and
+    // no-op-gate 409s; the authoritative "it landed" signal is the
+    // membership view (a 409 may also mean an earlier ambiguous attempt —
+    // including the redirect probe above — already added it).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let leader_now = cluster.wait_for_leader().await;
+        let follower_now = cluster.followers(leader_now.id)[0];
+        let put = client
+            .put(format!("{}/cluster/members/4", follower_now.url))
+            .json(&addr)
+            .send()
+            .await
+            .unwrap();
+        let status = put.status();
+        let view = client
+            .get(format!("{}/cluster/members", leader_now.url))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        if view.as_object().unwrap().contains_key("4") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "add-member never landed: last status {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Every node's local view converges to the 4-member config.
+    for node in &cluster.nodes {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let body = client
+                .get(format!("{}/cluster/members", node.url))
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap();
+            let members = body.as_object().unwrap();
+            if members.len() == 4 && body["4"]["raft"] == json!("127.0.0.1:1") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node {} never saw the 4-member config: {body}",
+                node.id
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
 
     // Re-adding an existing member (an address change) is refused: 409.
     let resp = client
@@ -411,49 +486,98 @@ async fn admin_membership_endpoints_crud_and_redirect() {
         .unwrap();
     assert_eq!(resp.status(), 404);
 
-    // Remove member 4 through a follower redirect: 204, view back to 3.
-    let resp = client
-        .delete(format!("{}/cluster/members/4", follower.url))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 204);
-    let resp = client
-        .get(format!("{}/cluster/members", leader.url))
-        .send()
-        .await
-        .unwrap();
-    let body = resp.json::<Value>().await.unwrap();
-    assert_eq!(body.as_object().unwrap().len(), 3);
+    // Remove member 4 through a follower redirect: view back to 3. Same
+    // churn-tolerant shape as the add above (a 404 means an earlier
+    // ambiguous attempt already removed it).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let leader_now = cluster.wait_for_leader().await;
+        let follower_now = cluster.followers(leader_now.id)[0];
+        let del = client
+            .delete(format!("{}/cluster/members/4", follower_now.url))
+            .send()
+            .await
+            .unwrap();
+        let status = del.status();
+        let view = client
+            .get(format!("{}/cluster/members", leader_now.url))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        if !view.as_object().unwrap().contains_key("4") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "remove-member never landed: last status {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
-    // The cluster still serves ordinary writes after the round trip.
-    let put = client
-        .put(format!("{}/still-works", leader.url))
-        .json(&json!(true))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(put.status(), 201);
+    // The cluster still serves ordinary writes after the round trip
+    // (through whichever node leads now; redirects are followed).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let leader_now = cluster.wait_for_leader().await;
+        let put = client
+            .put(format!("{}/still-works", leader_now.url))
+            .json(&json!(true))
+            .send()
+            .await
+            .unwrap();
+        if put.status() == 201 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "post-churn write never landed: last status {}",
+            put.status()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]
 async fn minority_partitioned_leader_times_out_writes_and_never_applies_them() {
     let _serial = SERIAL.lock().await;
     let cluster = spawn_http_cluster(3, 34).await;
-    let leader = cluster.wait_for_leader().await;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
 
     // Baseline write so the cluster provably works before the partition.
-    let put = client
-        .put(format!("{}/alive", leader.url))
-        .json(&json!(true))
-        .send()
-        .await
+    // Redirects are DISABLED so a 201 proves the sampled node itself
+    // served the write as leader — churn between sampling and the request
+    // (the documented starvation flake class) surfaces as 307/503 and is
+    // retried with a fresh sample instead of hard-asserted.
+    let raw = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
         .unwrap();
-    assert_eq!(put.status(), 201);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let leader = loop {
+        let leader_now = cluster.wait_for_leader().await;
+        let put = raw
+            .put(format!("{}/alive", leader_now.url))
+            .json(&json!(true))
+            .send()
+            .await
+            .unwrap();
+        if put.status() == 201 {
+            break leader_now;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "baseline write never landed on a stable leader: last status {}",
+            put.status()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
 
     // Cut the leader off from both followers: it is now a minority of one.
     let follower_ids: Vec<NodeId> = cluster.followers(leader.id).iter().map(|n| n.id).collect();

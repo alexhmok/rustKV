@@ -1483,7 +1483,86 @@ Untested / known gaps:
 - The 503-vs-504 race means the script never pins WHICH rejection the
   isolated node serves, only that it is one of the two.
 
-## Project complete (phases 0-17)
+## Post-completion testing review ✅ (2026-07-14)
+
+Exhaustive validation pass over the finished project: rerun and widen
+every suite, attack the recorded "untested" gaps, and consolidate every
+known failure mode into FAILURE_MODES.md (new; linked from README).
+
+Found and FIXED — catch-up liveness bug (severe, default config):
+- axum's default 2 MiB body limit sat on the raft port, so any
+  AppendEntries catch-up batch or InstallSnapshot payload beyond it was
+  rejected with a mid-upload connection reset; the sender saw a generic
+  timeout and re-sent the identical oversized RPC forever. A follower
+  more than ~2 MiB of log behind could NEVER rejoin — with snapshotting
+  off (the default), not just the documented snapshot-payload case.
+  Demonstrated on a real 3-process cluster (3.8 MiB behind: stuck >45s,
+  endless pre-campaigns; 1.5 MiB control: recovered in 2s; identical
+  results for the InstallSnapshot variant with a wiped data dir).
+  Fix: `DefaultBodyLimit::disable()` on the raft route (cluster-internal
+  port; payloads are held in memory whole by design — the practical
+  bound is what the wire moves within rpc_timeout). Regression-pinned by
+  `rpcs_larger_than_two_mebibytes_roundtrip`. Post-fix the same
+  scenarios recover in 2-3s, and a 64 MiB snapshot transfers in ~5s on
+  loopback AT THE DEFAULT TIMEOUT (the documented payload-vs-150ms
+  concern binds only on slower networks/disks).
+- `RUSTKV_RPC_TIMEOUT_MS` (default 150, the old constant) wired through
+  config.rs/main.rs so deployments whose snapshots outgrow the budget
+  have a knob (validated end-to-end at 2000ms); config unit tests added.
+
+Widened coverage (new tests, all green):
+- Extended soaks (`--ignored`, seed count via RUSTKV_SOAK_SEEDS): the
+  randomized fault schedule AND the jepsen linearizable workload with
+  10% duplication AND snapshots on TOGETHER (never previously combined)
+  — 256 seeds each, zero safety/linearizability violations. Harness
+  change: the per-seed compaction vacuity guard moved to the callers
+  (seed 151's schedule legally spends most of the run without a
+  majority and never compacts; the wide soak asserts compaction across
+  the seed set, the pinned 4-seed test still asserts it per seed).
+- Phase-16 "executed but not asserted" pool behaviors, now pinned in
+  tests/http_transport.rs: set_peers prunes pooled sockets to departed
+  addresses (observed as server-side EOF + fresh reconnect), the 4-idle
+  cap drops exactly accepted-4 burst connections, excess-bytes responses
+  are never repooled, and the server `Connection: close` opt-out is
+  honored end-to-end.
+- Phase-0 "untested" HTTP edges, pinned in tests/http_api.rs: 1 MiB
+  values roundtrip; >2 MiB client-API bodies are rejected storing
+  nothing (as 413 OR a mid-upload reset — the early-response race,
+  either arm correct); percent-encoded keys decode before storage
+  (unicode/space/%2F, the slash key addressable only encoded; root path
+  not a key); null/scalars/arrays roundtrip (stored null ≠ 404); 32
+  concurrent PUTs to one key all commit and one wins.
+- The phase-13 dedup window contract's failure mode pinned as behavior
+  (store unit test): >64 outstanding pipelined ops → a below-window op
+  is wrongly skipped-and-acked, exactly as documented.
+
+Flake class quantified and mitigated:
+- The documented cluster_http real-time flake reproduced at 2/16 debug
+  full-binary runs (0/16 in release); it hits THREE sites, not one —
+  follower_redirects_writes_to_the_leader,
+  admin_membership_endpoints_crud_and_redirect (raw-307 assert), and
+  minority_partitioned's baseline write — the shared trigger is
+  leadership moving between the one-shot wait_for_leader sample and the
+  assertion. All three now re-sample leadership in bounded retry loops
+  (assert_follower_redirects helper; admin add/remove verify via the
+  membership view, tolerating churn-raced "already done" 409/404; the
+  partition baseline uses a redirect-disabled client so its 201 proves
+  the sampled node itself led). Correctness claims unchanged: a wrong
+  Location or a lost write still fails. Post-mitigation: 0 failures in
+  32 consecutive debug full-binary runs (the class is starvation-driven,
+  so "rarer than 1/32" is the honest claim, not "gone").
+
+Also rerun: full suite ×2 (170/170 pre-changes, 181/181 after), make
+lint at every step, `make partition-test` (real Docker network, PASS),
+and the payload experiments archived in the session job dir.
+
+Untested / known gaps (unchanged by this review, recorded in
+FAILURE_MODES.md): Ongaro concurrent-change schedule (test debt), reply
+duplication fault injection, real power-loss testing, the residual
+partial-partition liveness gap, sessions-table growth, and the
+chunking/streaming path for genuinely slow-network snapshot transfer.
+
+## Project complete (phases 0-17 + testing review)
 Remaining ideas beyond the original scope: none — the scripted Docker
 partition test shipped in phase 17. (TLS on the raft port: dropped —
 blocked on the dependency whitelist.)

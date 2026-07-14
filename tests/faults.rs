@@ -345,7 +345,7 @@ async fn randomized_fault_schedule(
     seed: u64,
     duplicate_probability: f64,
     snapshot_threshold: Option<u64>,
-) -> (Vec<String>, Vec<LogEntry>) {
+) -> (Vec<String>, Vec<LogEntry>, usize) {
     let context = format!("seed {seed}");
     let faults = rustkv::raft::transport::sim::FaultConfig {
         min_delay: ms(1),
@@ -449,12 +449,13 @@ async fn randomized_fault_schedule(
     }
     converge(&cluster).await;
     trace.push(format!("done: {} confirmed writes", confirmed.len()));
-    if snapshot_threshold.is_none() {
+    let compacted_nodes = if snapshot_threshold.is_none() {
         assert_final_consistency(&cluster, &confirmed, &context).await;
+        0
     } else {
-        assert_final_consistency_with_snapshots(&cluster, &confirmed, &context).await;
-    }
-    (trace, cluster.disk_log(1))
+        assert_final_consistency_with_snapshots(&cluster, &confirmed, &context).await
+    };
+    (trace, cluster.disk_log(1), compacted_nodes)
 }
 
 /// The snapshot-aware final check (see `randomized_fault_schedule` docs):
@@ -466,7 +467,7 @@ async fn assert_final_consistency_with_snapshots(
     cluster: &TestCluster,
     confirmed: &[Confirmed],
     context: &str,
-) {
+) -> usize {
     assert!(
         !confirmed.is_empty(),
         "{context}: scenario confirmed no writes — nothing was actually tested"
@@ -520,12 +521,11 @@ async fn assert_final_consistency_with_snapshots(
             }
         }
     }
-    // Vacuity guard: a snapshot scenario in which nothing ever compacted
-    // proves nothing about snapshots.
-    assert!(
-        compacted_nodes > 0,
-        "{context}: no node compacted — raise the write mix or lower the threshold"
-    );
+    // Vacuity is judged by the caller: the pinned seeds require compaction
+    // per run; the wide soak requires it across the seed set (a rare quiet
+    // schedule — e.g. seed 151, most of its run without a majority — can
+    // legally finish under the threshold).
+    compacted_nodes
 }
 
 #[tokio::test(start_paused = true)]
@@ -553,14 +553,45 @@ async fn randomized_fault_schedules_survive_message_duplication() {
 #[tokio::test(start_paused = true)]
 async fn randomized_fault_schedules_survive_with_snapshots_on() {
     for seed in 0..4 {
-        randomized_fault_schedule(seed, 0.0, Some(8)).await;
+        let (_, _, compacted) = randomized_fault_schedule(seed, 0.0, Some(8)).await;
+        assert!(
+            compacted > 0,
+            "seed {seed}: no node compacted — raise the write mix or lower the threshold"
+        );
     }
+}
+
+/// Extended soak, excluded from the default run (`cargo test --test faults
+/// -- --ignored`): message duplication AND snapshots together — no pinned
+/// schedule combines those two faults — across a much wider seed range than
+/// the pinned suites. Fresh seeds through the full invariant check are
+/// exactly where an untested fault interaction would surface.
+#[tokio::test(start_paused = true)]
+#[ignore = "extended soak; run explicitly with --ignored"]
+async fn extended_soak_duplication_and_snapshots_across_seeds() {
+    let seeds: u64 = std::env::var("RUSTKV_SOAK_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24);
+    let mut seeds_with_compaction = 0u64;
+    for seed in 0..seeds {
+        let (_, _, compacted) = randomized_fault_schedule(seed, 0.10, Some(8)).await;
+        if compacted > 0 {
+            seeds_with_compaction += 1;
+        }
+    }
+    // Cross-set vacuity guard: single quiet seeds are legal, but the soak
+    // as a whole must overwhelmingly exercise compaction.
+    assert!(
+        seeds_with_compaction * 2 > seeds,
+        "only {seeds_with_compaction}/{seeds} seeds compacted — the soak lost its teeth"
+    );
 }
 
 #[tokio::test(start_paused = true)]
 async fn same_seed_reproduces_the_same_fault_run() {
-    let (trace_a, log_a) = randomized_fault_schedule(5, 0.10, None).await;
-    let (trace_b, log_b) = randomized_fault_schedule(5, 0.10, None).await;
+    let (trace_a, log_a, _) = randomized_fault_schedule(5, 0.10, None).await;
+    let (trace_b, log_b, _) = randomized_fault_schedule(5, 0.10, None).await;
     assert_eq!(trace_a, trace_b, "action/outcome traces must be identical");
     assert_eq!(log_a, log_b, "final logs must be identical");
 }

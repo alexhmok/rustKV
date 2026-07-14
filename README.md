@@ -63,6 +63,13 @@ through `/cluster/members` (phase 15).
 Logging uses `tracing`; control verbosity with `RUST_LOG` (default `info`), e.g.
 `RUST_LOG=debug make run`.
 
+Node-to-node RPCs share one budget, `RUSTKV_RPC_TIMEOUT_MS` (default 150). Snapshot
+transfers and catch-up batches ride single RPCs, so on slow networks a large state may
+need a larger budget — see FAILURE_MODES.md ("Single-shot snapshot / batch vs the RPC
+timeout") for the sizing math.
+
+Known limitations and operational edges are cataloged in **FAILURE_MODES.md**.
+
 ## HTTP API
 
 | Method   | Path     | Behavior                                                          |

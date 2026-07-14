@@ -359,6 +359,28 @@ mod tests {
         assert_eq!(store.get("k"), Some(json!(3)));
     }
 
+    /// DOCUMENTED FAILURE MODE, pinned as behavior (phase-13 amendment):
+    /// dedup is sound only under the contract of at most SESSION_WINDOW
+    /// outstanding ops per client. A client that violates it — here seq 66
+    /// wins the race to the log while seq 1 is still in flight — gets the
+    /// below-window op silently skipped as an assumed duplicate: the write
+    /// is acked upstream (its entry committed) yet never takes effect.
+    /// If this test ever fails, the window semantics changed — re-evaluate
+    /// the documented contract in FAILURE_MODES.md alongside it.
+    #[test]
+    fn beyond_window_pipelining_wrongly_skips_a_never_applied_op() {
+        let store = KvStore::new();
+        apply(&store, 1, tokened_put("hi", 1, 7, SESSION_WINDOW + 2));
+        // Seq 1 arrives after the window slid past it: offset 65 >= 64,
+        // assumed already applied, skipped.
+        apply(&store, 2, tokened_put("lo", 1, 7, 1));
+        assert_eq!(
+            store.get("lo"),
+            None,
+            "documented contract-violation behavior: below-window op skipped"
+        );
+    }
+
     #[test]
     fn duplicate_delete_is_skipped() {
         let store = KvStore::new();

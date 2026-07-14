@@ -91,6 +91,60 @@ async fn rpc_roundtrip_over_real_http() {
     );
 }
 
+/// Regression pin for the catch-up liveness bug found in the post-project
+/// testing review: axum's 2 MiB default body limit on the raft port made
+/// any AppendEntries batch or InstallSnapshot payload beyond it permanently
+/// undeliverable (the limit layer resets the upload mid-write; the sender
+/// sees a timeout and retries the identical oversized RPC forever, so a
+/// follower more than ~2 MiB behind could never rejoin). The raft router
+/// now disables the limit; this pins a >2 MiB RPC roundtripping.
+#[tokio::test]
+async fn rpcs_larger_than_two_mebibytes_roundtrip() {
+    let _serial = SERIAL.lock().await;
+    let (_t2, addr2, mut rx2) = bind_transport(2, HashMap::new()).await;
+    let (t1, _addr1, _rx1) = bind_transport(1, HashMap::from([(2, addr2)])).await;
+
+    tokio::spawn(async move {
+        while let Some(inbound) = rx2.recv().await {
+            let RpcRequest::AppendEntries(args) = &inbound.request else {
+                panic!("unexpected rpc");
+            };
+            let reply = rustkv::raft::rpc::AppendEntriesReply {
+                term: args.term,
+                success: true,
+            };
+            let _ = inbound.reply.send(RpcResponse::AppendEntries(reply));
+        }
+    });
+
+    // One 3 MiB entry — the size class of a real catch-up batch or
+    // snapshot payload.
+    let request = RpcRequest::AppendEntries(rustkv::raft::rpc::AppendEntriesArgs {
+        term: 7,
+        leader_id: 1,
+        prev_log_index: 0,
+        prev_log_term: 0,
+        entries: vec![rustkv::raft::types::LogEntry {
+            term: 7,
+            index: 1,
+            command: rustkv::raft::types::Command::Put {
+                key: "big".to_string(),
+                value: serde_json::Value::String("x".repeat(3 * 1024 * 1024)),
+                session: None,
+            },
+        }],
+        leader_commit: 0,
+    });
+    let response = t1.send(2, request).await.unwrap();
+    assert_eq!(
+        response,
+        RpcResponse::AppendEntries(rustkv::raft::rpc::AppendEntriesReply {
+            term: 7,
+            success: true
+        })
+    );
+}
+
 #[tokio::test]
 async fn unknown_peer_is_unreachable_dead_peer_times_out() {
     let _serial = SERIAL.lock().await;
@@ -385,6 +439,203 @@ async fn timed_out_connection_is_never_repooled() {
         "the RPC after the timeout must open a fresh connection"
     );
     server.kill();
+}
+
+/// Phase-15/16 interaction, previously executed but unasserted: `set_peers`
+/// must prune idle pooled connections to addresses that left the book —
+/// otherwise sockets to removed or re-addressed members would linger until
+/// process exit. The drop is observed server-side (EOF ends the connection
+/// task) and client-side (the next RPC after re-adding the address opens a
+/// fresh connection instead of resurrecting the pruned one).
+#[tokio::test]
+async fn set_peers_prunes_pooled_connections_to_departed_addresses() {
+    let _serial = SERIAL.lock().await;
+    let server = spawn_counting_server("127.0.0.1:0", None).await;
+    let transport = client_transport(server.addr.clone(), RPC_TIMEOUT);
+
+    assert_eq!(
+        transport.send(2, vote_request(1)).await.unwrap(),
+        vote_reply(1)
+    );
+    assert_eq!(server.accepted.load(Ordering::SeqCst), 1);
+
+    // Membership change: node 2 leaves. Its pooled socket must be closed.
+    transport.set_peers(HashMap::new());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !server
+        .conn_tasks
+        .lock()
+        .unwrap()
+        .iter()
+        .all(tokio::task::JoinHandle::is_finished)
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "pruned pooled socket was never closed"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        transport.send(2, vote_request(2)).await,
+        Err(TransportError::Unreachable(2)),
+        "departed peer is unreachable"
+    );
+
+    // Node 2 rejoins at the same address: the pool entry is gone, so the
+    // next RPC must open a fresh connection.
+    transport.set_peers(HashMap::from([(2, server.addr.clone())]));
+    assert_eq!(
+        transport.send(2, vote_request(3)).await.unwrap(),
+        vote_reply(3)
+    );
+    assert_eq!(
+        server.accepted.load(Ordering::SeqCst),
+        2,
+        "the RPC after the prune must use a fresh connection"
+    );
+    server.kill();
+}
+
+/// MAX_IDLE_PER_PEER pinned end-to-end (previously a code comment only): a
+/// parallel burst opens one connection per RPC, but only 4 survive checkin;
+/// the excess are dropped, observable as server-side EOFs on exactly
+/// `accepted - 4` connections.
+#[tokio::test]
+async fn idle_pool_cap_drops_excess_connections_after_a_burst() {
+    let _serial = SERIAL.lock().await;
+    let server = spawn_counting_server("127.0.0.1:0", None).await;
+    let transport = client_transport(server.addr.clone(), RPC_TIMEOUT);
+
+    let mut joins = Vec::new();
+    for term in 1..=8u64 {
+        let transport = transport.clone();
+        joins.push(tokio::spawn(async move {
+            transport.send(2, vote_request(term)).await
+        }));
+    }
+    for join in joins {
+        join.await.unwrap().unwrap();
+    }
+    let accepted = server.accepted.load(Ordering::SeqCst);
+    assert!(
+        accepted > 4,
+        "burst opened only {accepted} connections — too few to exercise the cap"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let finished = server
+            .conn_tasks
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.is_finished())
+            .count();
+        if finished == accepted - 4 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expected {} connections dropped by the idle cap, saw {finished}",
+            accepted - 4
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    server.kill();
+}
+
+/// A raw server answering every framed request on every connection with the
+/// same canned bytes — for probing how the pool treats responses with
+/// nonstandard framing (excess bytes, `Connection: close`).
+async fn spawn_canned_server(raw_response: Vec<u8>) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    tokio::spawn({
+        let accepted = accepted.clone();
+        async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                accepted.fetch_add(1, Ordering::SeqCst);
+                let response = raw_response.clone();
+                tokio::spawn(async move {
+                    while read_framed_request(&mut stream).await.is_some() {
+                        if stream.write_all(&response).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        }
+    });
+    (addr, accepted)
+}
+
+/// Phase-16 gap closure: bytes beyond the declared Content-Length leave a
+/// connection in an unknowable state. The RPC itself succeeds (the body is
+/// truncated to the declared length) but the connection is poisoned — the
+/// next RPC must not read leftover junk, and completes on a fresh
+/// connection (directly if the poisoned one was never repooled, via the
+/// one fresh retry if the junk raced past the excess-bytes check).
+#[tokio::test]
+async fn excess_body_bytes_poison_the_connection_for_reuse() {
+    let _serial = SERIAL.lock().await;
+    let body = serde_json::to_vec(&vote_reply(1)).unwrap();
+    let mut response =
+        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+    response.extend_from_slice(&body);
+    response.extend_from_slice(b"JUNKJUNK");
+    let (addr, accepted) = spawn_canned_server(response).await;
+    let transport = client_transport(addr, RPC_TIMEOUT);
+
+    assert_eq!(
+        transport.send(2, vote_request(1)).await.unwrap(),
+        vote_reply(1),
+        "body must be truncated to the declared length"
+    );
+    assert_eq!(
+        transport.send(2, vote_request(1)).await.unwrap(),
+        vote_reply(1),
+        "the junk must never surface in a later RPC's response"
+    );
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        2,
+        "the second RPC must complete on a fresh connection"
+    );
+}
+
+/// The server's keep-alive opt-out is honored end-to-end (previously pinned
+/// only at the parse level): a correctly framed 200 carrying
+/// `Connection: close` is consumed but never repooled.
+#[tokio::test]
+async fn server_connection_close_opt_out_is_never_repooled() {
+    let _serial = SERIAL.lock().await;
+    let body = serde_json::to_vec(&vote_reply(1)).unwrap();
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(&body);
+    let (addr, accepted) = spawn_canned_server(response).await;
+    let transport = client_transport(addr, RPC_TIMEOUT);
+
+    assert_eq!(
+        transport.send(2, vote_request(1)).await.unwrap(),
+        vote_reply(1)
+    );
+    assert_eq!(
+        transport.send(2, vote_request(1)).await.unwrap(),
+        vote_reply(1)
+    );
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        2,
+        "a Connection: close response must not be repooled"
+    );
 }
 
 // ---- a real 3-node cluster over the HTTP transport, in-process ----

@@ -408,3 +408,179 @@ async fn kv_state_survives_restart() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+// ---- edge cases (closing the phase-0 "untested" notes): large bodies,
+// exotic key encodings, scalar values, concurrent writes ----
+
+/// Large values roundtrip; bodies beyond axum's default extractor limit
+/// (2 MiB) are rejected and store nothing. The rejection is NOT a clean
+/// 413 from the client's perspective: axum answers and closes while the
+/// upload is still in flight, so the client may instead see a connection
+/// reset mid-write (the standard early-response race) — pinned here as
+/// documented behavior, either arm is correct.
+#[tokio::test]
+async fn large_values_roundtrip_and_oversized_bodies_are_rejected() {
+    let server = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    let value = json!("x".repeat(1024 * 1024));
+    let put = client
+        .put(format!("{}/big", server.base))
+        .json(&value)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 201, "1 MiB body must be accepted");
+    let get = client
+        .get(format!("{}/big", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get.json::<Value>().await.unwrap(), value);
+
+    let oversized = format!("\"{}\"", "y".repeat(3 * 1024 * 1024));
+    match client
+        .put(format!("{}/big2", server.base))
+        .body(oversized)
+        .send()
+        .await
+    {
+        Ok(resp) => assert_eq!(
+            resp.status(),
+            413,
+            "bodies past the 2 MiB extractor limit are rejected"
+        ),
+        Err(error) => assert!(
+            error.is_request(),
+            "an oversized upload may die as a mid-write connection reset \
+             instead of a readable 413; got an unrelated error: {error}"
+        ),
+    }
+    let get = client
+        .get(format!("{}/big2", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get.status(), 404, "the rejected body must store nothing");
+}
+
+/// Percent-encoded key segments are decoded before they reach the store
+/// (axum's Path extractor), so the stored key is the decoded string:
+/// unicode and spaces roundtrip through their encodings, and %2F decodes
+/// to a key containing a literal slash — addressable ONLY in encoded form
+/// (the raw two-segment path matches no route). The bare root path is not
+/// a key at all.
+#[tokio::test]
+async fn exotic_key_encodings_are_decoded_and_roundtrip() {
+    let server = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    for (encoded, decoded) in [
+        ("caf%C3%A9", "café"),
+        ("hello%20world", "hello world"),
+        ("a%2Fb", "a/b"),
+    ] {
+        let put = client
+            .put(format!("{}/{encoded}", server.base))
+            .json(&json!(1))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(put.status(), 201, "PUT /{encoded}");
+        assert_eq!(
+            server.kv.get(decoded),
+            Some(json!(1)),
+            "stored under the DECODED key {decoded:?}"
+        );
+        let get = client
+            .get(format!("{}/{encoded}", server.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(get.status(), 200, "GET /{encoded}");
+    }
+
+    // The decoded slash key is unreachable as a raw path: two segments
+    // match no route.
+    let get = client
+        .get(format!("{}/a/b", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get.status(), 404, "raw /a/b is not a route");
+
+    // The root path is not a key.
+    let get = client
+        .get(format!("{}/", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get.status(), 404, "the root path is not a key");
+}
+
+/// Any JSON value is accepted, not just objects (documented phase-0
+/// decision) — including null, which is stored and served as a 200 with
+/// body `null`, distinguishable from an absent key's 404.
+#[tokio::test]
+async fn scalar_and_null_json_values_roundtrip() {
+    let server = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    for (key, value) in [
+        ("null", json!(null)),
+        ("num", json!(42.5)),
+        ("bool", json!(false)),
+        ("arr", json!([1, "two", null])),
+        ("str", json!("plain string")),
+    ] {
+        let put = client
+            .put(format!("{}/{key}", server.base))
+            .json(&value)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(put.status(), 201, "PUT {key}");
+        let get = client
+            .get(format!("{}/{key}", server.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(get.status(), 200, "GET {key}");
+        assert_eq!(get.json::<Value>().await.unwrap(), value, "GET {key}");
+    }
+}
+
+/// 32 concurrent PUTs to one key: every one commits (201) and the final
+/// value is one of the written ones — the API-level check that concurrent
+/// writes serialize through the log without corruption or lost responses.
+#[tokio::test]
+async fn concurrent_puts_to_one_key_all_commit_and_one_wins() {
+    let server = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    let mut joins = Vec::new();
+    for i in 0..32u64 {
+        let client = client.clone();
+        let url = format!("{}/hot", server.base);
+        joins.push(tokio::spawn(async move {
+            client
+                .put(url)
+                .json(&json!(i))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }));
+    }
+    for join in joins {
+        assert_eq!(join.await.unwrap(), 201);
+    }
+
+    let get = client
+        .get(format!("{}/hot", server.base))
+        .send()
+        .await
+        .unwrap();
+    let winner = get.json::<Value>().await.unwrap().as_u64().unwrap();
+    assert!(winner < 32, "the final value must be one of the writes");
+}

@@ -792,3 +792,46 @@ async fn linearizable_reads_survive_message_duplication() {
     }
     assert!(total_crashes > 0, "no seed rolled a crash round");
 }
+
+/// Extended soak, excluded from the default run (`cargo test --test jepsen
+/// -- --ignored`): the strongest checker configuration — linearizable reads,
+/// tokened retrying writers, 10% duplication AND snapshots on together (no
+/// pinned test combines them) — across a much wider seed range. Every
+/// history must linearize; every seed must actually compact somewhere.
+#[tokio::test(start_paused = true)]
+#[ignore = "extended soak; run explicitly with --ignored"]
+async fn extended_soak_linearizable_under_duplication_and_snapshots() {
+    let seeds: u64 = std::env::var("RUSTKV_SOAK_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24);
+    let mut total_crashes = 0;
+    let mut seeds_with_compaction = 0u64;
+    for seed in 0..seeds {
+        let (history, logs, crashes, _) = run_workload(
+            seed,
+            ReadMode::Linearizable,
+            WriteMode::TokenRetry,
+            0.10,
+            Some(16),
+        )
+        .await;
+        total_crashes += crashes;
+        if logs
+            .iter()
+            .any(|log| log.first().is_none_or(|e| e.index > 1))
+        {
+            seeds_with_compaction += 1;
+        }
+        if let Err(reason) = check_linearizable(&history) {
+            panic!("seed {seed}: violation under duplication+snapshots:\n{reason}");
+        }
+    }
+    assert!(total_crashes > 0, "no seed rolled a crash round");
+    // Cross-set vacuity guard: a rare quiet seed may legally stay under the
+    // threshold, but the soak as a whole must exercise compaction.
+    assert!(
+        seeds_with_compaction * 2 > seeds,
+        "only {seeds_with_compaction}/{seeds} seeds compacted — the soak lost its teeth"
+    );
+}

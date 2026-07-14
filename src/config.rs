@@ -29,6 +29,13 @@
 //! - `RUSTKV_ADVERTISE_CLIENT_URL` — the client base URL peers should
 //!   redirect to for this node (default: `http://{RUSTKV_LISTEN}`); same
 //!   caveat as above.
+//! - `RUSTKV_RPC_TIMEOUT_MS`     — per-RPC budget for node-to-node calls
+//!   (default 150). Everything an RPC needs — connect, a possible
+//!   stale-connection retry, transmitting the payload, the peer's fsync,
+//!   the reply — must fit; raise it when snapshots or catch-up batches
+//!   outgrow what the network moves in the default budget. Election
+//!   timeouts are not derived from it, so raising it mainly delays failure
+//!   detection of individual RPCs.
 
 use std::collections::HashMap;
 
@@ -45,6 +52,8 @@ pub struct NodeConfig {
     pub snapshot_threshold: Option<u64>,
     pub snapshot_trailing: u64,
     pub join: bool,
+    /// Per-RPC budget for node-to-node calls, in milliseconds.
+    pub rpc_timeout_ms: u64,
     /// What OTHER nodes dial/redirect to for this node (phase 15). Resolved
     /// here — defaults derived from the listen addresses — so the rest of
     /// the binary never has to know about the distinction.
@@ -98,6 +107,17 @@ impl NodeConfig {
                     format!("RUSTKV_SNAPSHOT_TRAILING must be a number, got {raw:?}")
                 })?,
                 None => 0,
+            },
+            rpc_timeout_ms: match get("RUSTKV_RPC_TIMEOUT_MS") {
+                Some(raw) => match raw.parse::<u64>() {
+                    Ok(n) if n >= 1 => n,
+                    _ => {
+                        return Err(format!(
+                            "RUSTKV_RPC_TIMEOUT_MS must be a number >= 1, got {raw:?}"
+                        ));
+                    }
+                },
+                None => 150,
             },
             join: match get("RUSTKV_JOIN").as_deref() {
                 None | Some("") | Some("0") | Some("false") => false,
@@ -158,6 +178,15 @@ mod tests {
         assert!(config.peer_client_urls.is_empty());
         assert_eq!(config.snapshot_threshold, None, "snapshotting is opt-in");
         assert!(!config.join, "join mode is opt-in");
+        assert_eq!(config.rpc_timeout_ms, 150, "rpc timeout defaults to 150ms");
+    }
+
+    #[test]
+    fn parses_and_validates_the_rpc_timeout() {
+        let config = NodeConfig::from_vars(vars(&[("RUSTKV_RPC_TIMEOUT_MS", "2000")])).unwrap();
+        assert_eq!(config.rpc_timeout_ms, 2000);
+        assert!(NodeConfig::from_vars(vars(&[("RUSTKV_RPC_TIMEOUT_MS", "0")])).is_err());
+        assert!(NodeConfig::from_vars(vars(&[("RUSTKV_RPC_TIMEOUT_MS", "fast")])).is_err());
     }
 
     /// Advertise addresses default to the listen addresses (the phase-15

@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -76,8 +76,17 @@ impl HttpTransport {
         rpc_timeout: Duration,
     ) -> (Self, Router, mpsc::UnboundedReceiver<Inbound>) {
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        // No inbound size cap: axum's 2 MiB default made any catch-up
+        // AppendEntries batch or InstallSnapshot payload beyond it
+        // PERMANENTLY undeliverable (the limit layer resets the upload, the
+        // sender sees a plain timeout and retries the identical oversized
+        // RPC forever — a follower more than ~2 MiB behind could never
+        // rejoin). The raft port is cluster-internal and Raft payloads are
+        // already held in memory whole by design; the practical bound is
+        // what the wire can move within rpc_timeout.
         let router = Router::new()
             .route("/raft", post(handle_raft_rpc))
+            .layer(DefaultBodyLimit::disable())
             .with_state(inbound_tx);
         let transport = Self {
             id,
