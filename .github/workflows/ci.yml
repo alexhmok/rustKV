@@ -1,0 +1,60 @@
+# CI for rustkv (testing-regime phase T1).
+#
+# Toolchain: rustup on the runners reads rust-toolchain.toml (pinned channel +
+# clippy/rustfmt components) automatically on the first cargo invocation — no
+# explicit toolchain-install step needed.
+#
+# Tests run in RELEASE: the documented cluster_http flake class is
+# CPU-starvation-driven (reproduced 2/16 in debug, 0/16 in release locally;
+# CI runners are slower than the dev machine). Debug is still compile-checked.
+#
+# FLAKE POLICY: no automatic retries anywhere in this pipeline. If a
+# cluster_http test fails, it gets exactly ONE manual re-run; if the failure
+# reproduces, it is a real bug — file it, do not re-run again.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: debug compile check
+        run: cargo build --locked
+      - name: release tests
+        run: cargo test --release --locked
+
+  # End-to-end Docker Compose partition test (phase 17). ubuntu-latest ships a
+  # Docker daemon + compose plugin. The script takes no args, wipes its own
+  # volumes on exit, and refuses to run if rustkv containers are already up.
+  partition:
+    name: partition
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: make partition-test

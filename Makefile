@@ -41,3 +41,24 @@ partition-test:
 
 clean:
 	cargo clean
+
+# --- CI targets (testing-regime phase T1) -------------------------------
+
+.PHONY: ci soak
+
+# Local parity with .github/workflows/ci.yml: lint + debug compile check +
+# locked release tests (release because the cluster_http flake class is
+# CPU-starvation-driven and only reproduces in debug).
+ci:
+	cargo fmt --check
+	cargo clippy --all-targets --locked -- -D warnings
+	cargo build --locked
+	cargo test --release --locked
+
+# Extended #[ignore]d soaks (tests/faults.rs, tests/jepsen.rs) in release
+# mode. Seed count via RUSTKV_SOAK_SEEDS (the tests' own default is 24;
+# 256 here for CI/nightly — ~90s per suite locally at 256).
+RUSTKV_SOAK_SEEDS ?= 256
+soak:
+	RUSTKV_SOAK_SEEDS=$(RUSTKV_SOAK_SEEDS) cargo test --release --locked \
+		--test faults --test jepsen -- --ignored extended_soak

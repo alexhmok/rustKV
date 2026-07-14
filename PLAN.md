@@ -1788,3 +1788,63 @@ checkpoint. Joint consensus stays out of scope.
 Joint-consensus (multi-server) membership changes. The snapshot
 chunking/streaming path graduated from this list into planned phase 20
 (as dynamic membership did in phase 15 and snapshotting in phase 14).
+
+## Phase T1 — CI pipeline ✅ (2026-07-14)
+
+First of the six testing-regime phases (T1 CI, T2 harness soundness, T3
+storage fault injection, T4 workload widening, T5 untested HTTP/binary
+paths, T6 nightly soaks+mutation+coverage). Purely additive: new files
+under .github/ plus new Makefile targets; src/ and tests/ untouched.
+
+Delivered:
+- `.github/workflows/ci.yml` — on push + pull_request, three jobs:
+  - `lint`: `cargo fmt --check` + `cargo clippy --all-targets --locked
+    -- -D warnings` (toolchain auto-installed from rust-toolchain.toml).
+  - `test`: `cargo build --locked` (debug compile check) then
+    `cargo test --release --locked` — release because the documented
+    cluster_http flake class is CPU-starvation-driven (2/16 debug,
+    0/16 release locally; runners are slower than the dev machine).
+  - `partition`: `make partition-test` on ubuntu-latest's Docker daemon.
+  - Flake policy stated in the workflow header: NO automatic retries
+    anywhere; a cluster_http failure gets exactly one manual re-run,
+    and if it reproduces it's a real bug.
+  - Swatinem/rust-cache in the rust jobs; per-ref concurrency group
+    cancels superseded runs.
+- `.github/workflows/nightly.yml` — cron 03:00 UTC + workflow_dispatch,
+  runs `make soak`; clearly-marked TODO(T6) stubs for cargo-mutants and
+  cargo-llvm-cov tiers (runner-installed tooling only — the CLAUDE.md
+  dependency whitelist is untouched).
+- Makefile: `make ci` (local parity with ci.yml: fmt/clippy/debug
+  build/locked release test) and `make soak` (the two #[ignore]d
+  extended soaks in tests/faults.rs + tests/jepsen.rs, release mode,
+  seed count via RUSTKV_SOAK_SEEDS, default 256). Appended with their
+  own .PHONY line so no existing Makefile line changed.
+
+Verified (not YAML inspection — a real Actions run, 29337857806, on
+branch t1-ci): all three jobs green on cold cache — lint 1m08s,
+partition 1m50s, test 4m11s. The partition script ran unmodified on the
+runner's Docker daemon/compose plugin; no environment differences from
+the local daemon needed fixing. Locally: `make ci` green, and
+`RUSTKV_SOAK_SEEDS=2 make soak` confirmed the filter selects exactly
+the two extended soaks (the 256-seed width was exercised locally in the
+post-completion testing review, ~90s per suite there).
+
+Merge gate (resolved at checkpoint): branch protection is a paid
+feature on private repos (classic API and rulesets both 403 under
+GitHub Free), so per user decision the repo was made PUBLIC on
+2026-07-14 and ruleset `main-ci-gate` (id 18933682) is active on main:
+required status checks lint/test/partition, no bypass actors. Direct
+pushes to main are now rejected — ALL mainline work (both active
+sessions) merges via PR through the same gate.
+
+Known gaps:
+- nightly.yml has not executed on a runner: workflow_dispatch/schedule
+  only register once the file is on the default branch, so its first
+  real run happens post-merge. `make soak` (the job's entire body) is
+  verified locally. Runner soak runtime at 256 seeds is therefore an
+  estimate (120-minute job timeout budgeted).
+- push + pull_request both trigger, so PR branches get duplicate runs
+  (accepted for simplicity; the concurrency group only collapses
+  superseded pushes on the same ref).
+- Cache is keyed by Swatinem defaults; first run per branch is cold
+  (~4m test job). No cache-warming job — not worth it at this runtime.
