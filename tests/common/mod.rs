@@ -101,6 +101,9 @@ pub struct TestCluster {
     /// reborn node silently reverting to `None` would diverge from the
     /// scenario under test.
     snapshot_threshold: Option<u64>,
+    /// Every node's `RaftConfig.snapshot_trailing` (phase-14 amendment),
+    /// preserved across restarts for the same reason.
+    snapshot_trailing: u64,
 }
 
 /// Spawns nodes 1..=n; `prepare` can pre-populate each node's storage
@@ -112,6 +115,7 @@ pub fn spawn_cluster_full(
     seed: u64,
     faults: FaultConfig,
     snapshot_threshold: Option<u64>,
+    snapshot_trailing: u64,
     prepare: impl Fn(NodeId, &mut Storage),
 ) -> TestCluster {
     let net = SimNetwork::new(seed, faults);
@@ -126,6 +130,7 @@ pub fn spawn_cluster_full(
         let store = Arc::new(KvStore::new());
         let mut config = node_config(id, n, seed);
         config.snapshot_threshold = snapshot_threshold;
+        config.snapshot_trailing = snapshot_trailing;
         nodes.push((
             id,
             Arc::new(RaftNode::spawn(
@@ -148,6 +153,7 @@ pub fn spawn_cluster_full(
         incarnation: AtomicU64::new(0),
         crashed: Mutex::new(HashSet::new()),
         snapshot_threshold,
+        snapshot_trailing,
     }
 }
 
@@ -157,7 +163,7 @@ pub fn spawn_cluster_with(
     faults: FaultConfig,
     prepare: impl Fn(NodeId, &mut Storage),
 ) -> TestCluster {
-    spawn_cluster_full(n, seed, faults, None, prepare)
+    spawn_cluster_full(n, seed, faults, None, 0, prepare)
 }
 
 pub fn spawn_cluster_with_threshold(
@@ -166,7 +172,27 @@ pub fn spawn_cluster_with_threshold(
     faults: FaultConfig,
     snapshot_threshold: Option<u64>,
 ) -> TestCluster {
-    spawn_cluster_full(n, seed, faults, snapshot_threshold, |_, _| {})
+    spawn_cluster_full(n, seed, faults, snapshot_threshold, 0, |_, _| {})
+}
+
+/// Like [`spawn_cluster_with_threshold`], with a trailing window: the
+/// boundary stays at least `snapshot_trailing` applies behind, so peers
+/// lagging by less catch up via entries instead of InstallSnapshot.
+pub fn spawn_cluster_with_trailing(
+    n: u64,
+    seed: u64,
+    faults: FaultConfig,
+    snapshot_threshold: Option<u64>,
+    snapshot_trailing: u64,
+) -> TestCluster {
+    spawn_cluster_full(
+        n,
+        seed,
+        faults,
+        snapshot_threshold,
+        snapshot_trailing,
+        |_, _| {},
+    )
 }
 
 pub fn spawn_cluster(n: u64, seed: u64, faults: FaultConfig) -> TestCluster {
@@ -298,6 +324,7 @@ impl TestCluster {
         let mut config = node_config(id, n, self.seed);
         config.timeout_seed ^= incarnation << 32;
         config.snapshot_threshold = self.snapshot_threshold;
+        config.snapshot_trailing = self.snapshot_trailing;
         let handle = Arc::new(RaftNode::spawn(
             config,
             storage,

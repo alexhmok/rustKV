@@ -914,9 +914,89 @@ Untested / known gaps (documented, not fixed):
   work (phase 13's gap, unchanged).
 - A leader compacts independently of peer progress: compacting past a
   live-but-slow peer's match_index forces a snapshot where entries
-  would have done (no match_index floor on compact_to).
+  would have done (no match_index floor on compact_to). [Addressed by
+  the amendment below via `snapshot_trailing`; default 0 keeps the gap
+  unless configured.]
 - The sessions table inside snapshots inherits phase 13's unbounded
   growth.
+
+### Phase 14 amendment — dropped-sender pin + trailing window (post-checkpoint)
+
+Follow-up from the compaction-edge-case review. Two findings recorded
+for the record first: (i) the dropped-sender behavior is not a
+fundamental tradeoff — definite answers below the boundary are
+recoverable by shipping a run-length-encoded term table
+(`term_runs: Vec<(first_index, term)>`, O(#terms ever)) in the
+snapshot, since `(term, index)` uniquely names an entry; deliberately
+NOT built (low ROI once dedup sessions exist) but documented as the
+upgrade path. (ii) The most serious latent issue is operational, not
+semantic: the single-shot snapshot payload rides one HTTP RPC against
+main.rs's 150ms RPC_TIMEOUT, so a large state degrades toward a
+catch-up resend loop — must be fixed (size-aware timeout → streaming →
+chunking) before running real data with snapshotting on.
+
+Done:
+1. **Dropped-sender pin** (`tests/snapshot.rs`): the previously
+   untested load-bearing line (`pending.retain(...)` in
+   handle_install_snapshot) is now pinned by a targeted test. The
+   severed-ack schedule (as in dedup.rs) parks an unresolved proposal
+   on a deposed leader, the successors commit it transitively and
+   compact past it, and the heal delivers InstallSnapshot: the
+   proposal must resolve as `Err` (channel dropped — ambiguous),
+   never `Ok(false)` (a lie: the test then proves the entry IS in the
+   committed history and lands in every final state, while the entry
+   itself is provably absent from the deposed leader's retained log —
+   the evidence really was destroyed). Mutation-checked: removing the
+   `retain` line makes resolve_pending send the false `Ok(false)` and
+   the test fails on exactly that arm. Reverted.
+2. **Trailing window** (etcd's SnapshotCatchUpEntries):
+   `RaftConfig.snapshot_trailing` / `RUSTKV_SNAPSHOT_TRAILING`
+   (default 0 = compact at last_applied immediately — bit-for-bit the
+   original behavior, so every seeded schedule stays pinned). Because
+   a snapshot's state can only ever be captured at `last_applied`,
+   the window is implemented as DEFERRED compaction, not a boundary
+   offset: when the threshold trigger fires, the state is captured
+   and staged (`staged_snapshot`, volatile — a crash just re-stages
+   later); the log is compacted to the staged point only once it has
+   fallen `trailing` applies behind. Storage is untouched — all
+   boundary invariants (retained log starts at boundary+1, compact_to
+   term capture) hold unchanged, and compact_to still finds the
+   staged entry in the log by construction. A staged capture overtaken
+   by an installed snapshot is discarded (guard in maybe_compact).
+   Boundary lag oscillates in [trailing, trailing+threshold); peers
+   lagging by less than the window catch up via ordinary
+   AppendEntries.
+
+Tested (141 total; 4 new):
+- The pin above (+ its hand-run mutation check).
+- Trailing mechanism: single-node, threshold 4 / trailing 8, 30
+  writes → boundary stays >= 8 behind the tail on disk, retained log
+  continues from the boundary, crash/restart replays the longer tail
+  on top of the lagging snapshot.
+- The payoff test: follower isolated (live, not crashed) at index 5,
+  survivors commit 18 more with threshold 2 / trailing 16 — survivors
+  provably compact DURING the isolation but only to a boundary at or
+  below the victim's log; on heal the victim's retained log contains
+  every missed index (they arrived as entries; a snapshot would have
+  folded them away). Hand-run mutation check: the same schedule with
+  trailing 0 compacts survivors to 22 > 5 and the construction guard
+  fails — i.e., without the window this exact scenario is the
+  InstallSnapshot money test.
+- Config: RUSTKV_SNAPSHOT_TRAILING parse/default/rejection.
+- TestCluster threads `snapshot_trailing` through spawn AND restart
+  (same reborn-node-divergence reasoning as the threshold);
+  `spawn_cluster_with_trailing` added. Full regression green with
+  zero re-pins (trailing defaults to 0 everywhere; staging adds no
+  RNG draws and no messages).
+
+Untested / known gaps (delta):
+- The staged capture holds a full serialized state copy in memory for
+  the lag duration — same memory class as the snapshot payload gap.
+- `snapshot_trailing` defaults to 0, so the slow-peer gap remains the
+  out-of-the-box behavior; flipping the default (e.g. to threshold)
+  would churn the aggressive-compaction test constructions and is
+  left as a deployment decision.
+- The payload-vs-RPC_TIMEOUT issue above is recorded, not fixed.
 
 ## Project complete (phases 0-14)
 Remaining ideas beyond the original scope, in planned order: dynamic

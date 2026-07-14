@@ -13,6 +13,10 @@
 //!   answer 503 instead of 307)
 //! - `RUSTKV_SNAPSHOT_THRESHOLD` — compact the log every N applied entries
 //!   (>= 1; unset = snapshotting off, the default)
+//! - `RUSTKV_SNAPSHOT_TRAILING`  — keep the snapshot boundary at least N
+//!   applied entries behind, so slightly-lagging peers catch up via
+//!   AppendEntries instead of InstallSnapshot (default 0 = compact
+//!   immediately; only meaningful with the threshold set)
 
 use std::collections::HashMap;
 
@@ -27,6 +31,7 @@ pub struct NodeConfig {
     pub peers: HashMap<NodeId, String>,
     pub peer_client_urls: HashMap<NodeId, String>,
     pub snapshot_threshold: Option<u64>,
+    pub snapshot_trailing: u64,
 }
 
 impl NodeConfig {
@@ -63,6 +68,12 @@ impl NodeConfig {
                     }
                 },
                 None => None,
+            },
+            snapshot_trailing: match get("RUSTKV_SNAPSHOT_TRAILING") {
+                Some(raw) => raw.parse::<u64>().map_err(|_| {
+                    format!("RUSTKV_SNAPSHOT_TRAILING must be a number, got {raw:?}")
+                })?,
+                None => 0,
             },
         };
         if config.peers.contains_key(&config.id) {
@@ -121,10 +132,25 @@ mod tests {
     fn parses_and_validates_the_snapshot_threshold() {
         let config = NodeConfig::from_vars(vars(&[("RUSTKV_SNAPSHOT_THRESHOLD", "1000")])).unwrap();
         assert_eq!(config.snapshot_threshold, Some(1000));
+        assert_eq!(config.snapshot_trailing, 0, "trailing defaults to 0");
         // 0 would mean "compact on every apply, even at the boundary" —
         // rejected rather than silently clamped.
         assert!(NodeConfig::from_vars(vars(&[("RUSTKV_SNAPSHOT_THRESHOLD", "0")])).is_err());
         assert!(NodeConfig::from_vars(vars(&[("RUSTKV_SNAPSHOT_THRESHOLD", "abc")])).is_err());
+    }
+
+    #[test]
+    fn parses_the_snapshot_trailing_window() {
+        let config = NodeConfig::from_vars(vars(&[
+            ("RUSTKV_SNAPSHOT_THRESHOLD", "1000"),
+            ("RUSTKV_SNAPSHOT_TRAILING", "5000"),
+        ]))
+        .unwrap();
+        assert_eq!(config.snapshot_trailing, 5000);
+        // 0 is legal (compact immediately, the default behavior).
+        let config = NodeConfig::from_vars(vars(&[("RUSTKV_SNAPSHOT_TRAILING", "0")])).unwrap();
+        assert_eq!(config.snapshot_trailing, 0);
+        assert!(NodeConfig::from_vars(vars(&[("RUSTKV_SNAPSHOT_TRAILING", "abc")])).is_err());
     }
 
     #[test]

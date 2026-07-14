@@ -350,3 +350,223 @@ async fn dedup_survives_catch_up_via_install_snapshot() {
             >= original_index
     );
 }
+
+// ---- the dropped-sender window ----
+
+/// Phase-14 amendment: a pending proposal whose entry is swallowed by an
+/// INSTALLED snapshot resolves as `Err` (channel dropped — outcome unknown),
+/// never `Ok(false)` and never `Ok(true)`. The terms that could have decided
+/// committed-vs-replaced were compacted away cluster-wide, so any definite
+/// answer would be a guess — and this schedule constructs the case where
+/// `Ok(false)` ("definitely didn't happen, safe to retry") would be a lie:
+/// the entry IS in the committed history and lands in the final state.
+///
+/// Schedule (the phase-12 severed-ack trick, as in tests/dedup.rs): the
+/// proposal replicates to both followers but every ack dies, so the leader
+/// never learns the outcome; CheckQuorum deposes it (pending deliberately
+/// survives step-down, phase 5); the successor commits the entry
+/// transitively, then commits and compacts far past it; on heal the old
+/// leader is caught up via InstallSnapshot, which is the moment the pending
+/// proposal's evidence disappears.
+#[tokio::test(start_paused = true)]
+async fn proposal_swallowed_by_installed_snapshot_resolves_ambiguous_not_false() {
+    let cluster = spawn_cluster_with_threshold(3, 79, low_loss_faults(), Some(8));
+    let all = cluster.all_ids();
+
+    let leader = cluster.wait_for_leader().await;
+    confirm_put(&cluster, &all, "v0", 0).await;
+    converge_among(&cluster, &all).await;
+
+    // Sever ONLY the follower→leader legs: AppendEntries still reach the
+    // followers, every reply (and every follower-originated request) dies.
+    let followers: Vec<NodeId> = all.iter().copied().filter(|&id| id != leader.id).collect();
+    for &f in &followers {
+        cluster.net.set_link_blocked(f, leader.id, true);
+    }
+
+    // The ambiguous proposal: durably appended on the leader, replicated to
+    // both followers, never acked — its commit outcome is unknowable here.
+    let mut pending = cluster
+        .handle(leader.id)
+        .propose(put("v1", 1))
+        .await
+        .expect("still leader inside the check-quorum window");
+    let pending_index = pending.index;
+
+    // CheckQuorum deposes the deaf leader; the followers elect a successor
+    // whose no-op commits the entry transitively (case A: it DID happen).
+    let successor = cluster.wait_for_leader_among(&followers).await;
+    assert!(successor.term > leader.term);
+
+    // While the old leader is dark, the proposal must stay unresolved...
+    let still_pending = tokio::time::timeout(ms(2000), &mut pending.committed).await;
+    assert!(
+        still_pending.is_err(),
+        "nothing may resolve the proposal while its node is cut off"
+    );
+
+    // ...and the survivors commit + compact PAST it (threshold 8, 12 more
+    // writes), destroying the term evidence everywhere that has it.
+    for i in 1..=12u64 {
+        confirm_put(&cluster, &followers, &format!("f{i}"), i).await;
+    }
+    converge_among(&cluster, &followers).await;
+
+    for &f in &followers {
+        cluster.net.set_link_blocked(f, leader.id, false);
+    }
+
+    // On heal the successor's next_index for the old leader sits at or below
+    // its snapshot boundary, so catch-up arrives as InstallSnapshot — and the
+    // pending proposal's sender is dropped THEN, not resolved with a guess.
+    let outcome = tokio::time::timeout(ms(3000), &mut pending.committed).await;
+    match outcome {
+        Ok(Err(_dropped)) => {} // ambiguous — the only honest answer
+        Ok(Ok(false)) => panic!(
+            "got the definite 'never committed' — a lie: the entry is in the \
+             committed history (asserted below)"
+        ),
+        Ok(Ok(true)) => panic!("got a definite ack the node cannot justify"),
+        Err(_) => panic!("proposal still unresolved 3s after heal — the drop never fired"),
+    }
+
+    // Case A made concrete: the write IS in the final state on every node,
+    // including the deposed leader (delivered inside the snapshot payload).
+    converge_among(&cluster, &all).await;
+    wait_until("swallowed write visible on the deposed leader", || {
+        cluster.store(leader.id).get("v1") == Some(json!(1))
+    })
+    .await;
+    assert_states_identical(&cluster);
+
+    cluster.shutdown();
+    tokio::time::sleep(ms(100)).await;
+    // The window was real: the entry itself is gone from the deposed
+    // leader's disk — it arrived folded into a snapshot, not as an entry.
+    let snapshot = cluster
+        .disk_snapshot(leader.id)
+        .expect("the deposed leader was caught up via InstallSnapshot");
+    assert!(snapshot.last_included_index >= pending_index);
+    assert!(
+        cluster
+            .disk_log(leader.id)
+            .iter()
+            .all(|e| e.index != pending_index),
+        "the entry survived as an entry — the ambiguity window was never entered"
+    );
+}
+
+// ---- the trailing window (phase-14 amendment) ----
+
+/// With `snapshot_trailing` set, the boundary lags `last_applied` by at
+/// least the window: the log always retains that many applied entries, and
+/// a crash/restart on top of the lagging boundary replays the longer tail
+/// correctly.
+#[tokio::test(start_paused = true)]
+async fn trailing_window_keeps_the_boundary_behind_the_applied_index() {
+    let cluster = spawn_cluster_with_trailing(1, 81, low_loss_faults(), Some(4), 8);
+    for i in 1..=30u64 {
+        confirm_put(&cluster, &[1], &format!("k{i}"), i).await;
+    }
+    cluster.crash(1);
+    cluster.restart(1).await;
+    cluster.wait_for_leader().await;
+    wait_until("state rebuilt from lagging snapshot + long tail", || {
+        (1..=30u64).all(|i| cluster.store(1).get(&format!("k{i}")) == Some(json!(i)))
+    })
+    .await;
+
+    cluster.shutdown();
+    tokio::time::sleep(ms(100)).await;
+    let boundary = cluster
+        .disk_snapshot(1)
+        .expect("compacted repeatedly")
+        .last_included_index;
+    let log = cluster.disk_log(1);
+    let last = log.last().expect("retained tail is nonempty").index;
+    assert!(boundary >= 1);
+    assert!(
+        last - boundary >= 8,
+        "boundary {boundary} closer than the trailing window to the tail {last}"
+    );
+    assert_eq!(log.first().unwrap().index, boundary + 1);
+}
+
+/// The payoff: a peer that falls behind by LESS than the trailing window
+/// catches up through ordinary AppendEntries even though the leader has
+/// compacted — the entries it needs were deliberately retained. (Contrast
+/// with `lagging_node_catches_up_via_install_snapshot`, where trailing = 0
+/// makes the same catch-up impossible without a snapshot.)
+#[tokio::test(start_paused = true)]
+async fn slow_live_peer_catches_up_via_entries_inside_the_trailing_window() {
+    let cluster = spawn_cluster_with_trailing(3, 82, low_loss_faults(), Some(2), 16);
+    let all = cluster.all_ids();
+
+    let leader = cluster.wait_for_leader().await;
+    for i in 1..=4u64 {
+        confirm_put(&cluster, &all, &format!("k{i}"), i).await;
+    }
+    converge_among(&cluster, &all).await;
+
+    // Isolate a follower (live, not crashed) and commit past it — but by
+    // less than the trailing window, so its entries stay retained.
+    let victim = *all.iter().find(|&&id| id != leader.id).unwrap();
+    let victim_last = cluster.handle(victim).status().last_log_index;
+    for &other in all.iter().filter(|&&id| id != victim) {
+        cluster.net.set_pair_blocked(victim, other, true);
+    }
+    let survivors: Vec<NodeId> = all.iter().copied().filter(|&id| id != victim).collect();
+    for i in 5..=22u64 {
+        confirm_put(&cluster, &survivors, &format!("k{i}"), i).await;
+    }
+    converge_among(&cluster, &survivors).await;
+
+    for &other in all.iter().filter(|&&id| id != victim) {
+        cluster.net.set_pair_blocked(victim, other, false);
+    }
+    converge_among(&cluster, &all).await;
+    assert_states_identical(&cluster);
+
+    cluster.shutdown();
+    tokio::time::sleep(ms(100)).await;
+    let final_last = cluster.disk_log(leader.id).last().unwrap().index;
+    // Construction guard: the survivors DID compact while the victim was
+    // cut off — but only to a boundary at or below the victim's log, which
+    // is exactly what the trailing window is for.
+    for &id in &survivors {
+        let boundary = cluster
+            .disk_snapshot(id)
+            .expect("survivors compacted during the isolation")
+            .last_included_index;
+        assert!(
+            boundary >= 1,
+            "node {id} never compacted — vacuous scenario"
+        );
+        assert!(
+            boundary <= victim_last,
+            "node {id} compacted past the victim's log ({boundary} > \
+             {victim_last}) — the window failed and this test proves nothing"
+        );
+        assert!(
+            final_last - boundary >= 16,
+            "node {id}: trailing guarantee violated"
+        );
+    }
+    // The proof: every entry the victim missed reached it AS AN ENTRY — its
+    // retained log holds the full isolation-window range, which a snapshot
+    // catch-up would have folded away instead.
+    let victim_log = cluster.disk_log(victim);
+    for index in victim_last + 1..=final_last {
+        assert!(
+            victim_log.iter().any(|e| e.index == index),
+            "index {index} missing from the victim's log — it must have \
+             arrived via InstallSnapshot, not AppendEntries"
+        );
+    }
+    if let Some(snapshot) = cluster.disk_snapshot(victim) {
+        assert!(
+            snapshot.last_included_index <= victim_last,
+            "the victim's boundary covers entries it never held as entries"
+        );
+    }
+}

@@ -108,6 +108,13 @@ pub struct RaftConfig {
     /// disables snapshotting entirely — nothing is written, nothing changes
     /// on the wire.
     pub snapshot_threshold: Option<u64>,
+    /// Keep the snapshot boundary at least this many entries behind
+    /// `last_applied` (etcd's SnapshotCatchUpEntries): a peer lagging by
+    /// less than this catches up through ordinary AppendEntries instead of
+    /// being forced onto the InstallSnapshot path. 0 (the default) compacts
+    /// at `last_applied` immediately — the original phase-14 behavior,
+    /// bit-for-bit. Only meaningful with `snapshot_threshold` set.
+    pub snapshot_trailing: u64,
 }
 
 impl RaftConfig {
@@ -120,6 +127,7 @@ impl RaftConfig {
             heartbeat_interval: Duration::from_millis(50),
             timeout_seed: id,
             snapshot_threshold: None,
+            snapshot_trailing: 0,
         }
     }
 }
@@ -393,6 +401,13 @@ pub struct RaftNode<T: Transport + Clone> {
     /// Local proposals awaiting their commit outcome. Survives step-down
     /// (a deposed leader's entry may still commit under its successor).
     pending: Vec<PendingProposal>,
+    /// A state-machine capture awaiting its compaction turn (phase-14
+    /// trailing window): the snapshot boundary must carry the state at
+    /// EXACTLY that index, so with `snapshot_trailing > 0` the state is
+    /// captured when the trigger fires and compacted to only once it is
+    /// `trailing` applies old. Volatile — losing it to a crash just means
+    /// the next trigger re-stages (the boundary lags a little longer).
+    staged_snapshot: Option<(LogIndex, serde_json::Value)>,
     /// When the last valid AppendEntries (current-or-higher term) arrived.
     /// Leader stickiness: pre-votes are denied while this is fresher than
     /// `election_timeout_min`. Volatile — a restarted node grants again.
@@ -462,6 +477,7 @@ impl<T: Transport + Clone> RaftNode<T> {
             commit_index: snapshot_index,
             last_applied: snapshot_index,
             pending: Vec::new(),
+            staged_snapshot: None,
             last_leader_contact: None,
             election_deadline: Instant::now(),
             next_heartbeat: Instant::now(),
@@ -1540,28 +1556,57 @@ impl<T: Transport + Clone> RaftNode<T> {
     }
 
     /// Compacts the applied prefix once it outgrows `snapshot_threshold`
-    /// (phase 14). Called after every apply batch, so with a fixed threshold
+    /// (phase 14). Called after every apply batch, so with fixed settings
     /// the compaction points are a pure function of the applied log —
-    /// deterministic by construction, no size or timer triggers. Always at
-    /// `last_applied`: commit_index may run ahead of what the state machine
-    /// actually contains.
+    /// deterministic by construction, no size or timer triggers.
+    ///
+    /// Two-step to honor `snapshot_trailing`: a snapshot's boundary must
+    /// carry the state at exactly that index, and the only state ever
+    /// available is the one at `last_applied` — so the state is CAPTURED
+    /// when the trigger fires (staged), and the log is compacted to the
+    /// staged point only once it has fallen `trailing` applies behind.
+    /// With trailing = 0 both steps happen in the same call and this is
+    /// exactly the original compact-at-`last_applied`. Never at
+    /// `commit_index`: it may run ahead of what the state machine contains.
     fn maybe_compact(&mut self) {
         let Some(threshold) = self.config.snapshot_threshold else {
             return;
         };
-        if self.last_applied - self.storage.snapshot_index() < threshold.max(1) {
-            return;
+        // An installed snapshot may have overtaken a staged capture
+        // (boundary moved past it); the capture is then stale — discard.
+        if let Some((staged_index, _)) = &self.staged_snapshot
+            && *staged_index <= self.storage.snapshot_index()
+        {
+            self.staged_snapshot = None;
         }
-        let state = self.state_machine.snapshot();
-        self.storage
-            .compact_to(self.last_applied, state)
-            .expect("cannot write snapshot; fail-stop");
-        tracing::info!(
-            node = self.config.id,
-            term = self.current_term(),
-            last_included_index = self.last_applied,
-            "log compacted"
-        );
+        if self.staged_snapshot.is_none()
+            && self.last_applied - self.storage.snapshot_index() >= threshold.max(1)
+        {
+            self.staged_snapshot = Some((self.last_applied, self.state_machine.snapshot()));
+            tracing::debug!(
+                node = self.config.id,
+                staged_index = self.last_applied,
+                "state captured for compaction"
+            );
+        }
+        if let Some((staged_index, _)) = &self.staged_snapshot
+            && self.last_applied - *staged_index >= self.config.snapshot_trailing
+        {
+            let (staged_index, state) = self.staged_snapshot.take().expect("just matched Some");
+            // The staged entry is still in the log (the boundary never
+            // passed it — see the guard above), so compact_to can capture
+            // its term as usual.
+            self.storage
+                .compact_to(staged_index, state)
+                .expect("cannot write snapshot; fail-stop");
+            tracing::info!(
+                node = self.config.id,
+                term = self.current_term(),
+                last_included_index = staged_index,
+                trailing = self.last_applied - staged_index,
+                "log compacted"
+            );
+        }
     }
 
     /// Advances commit_index to the highest index replicated on a majority,
