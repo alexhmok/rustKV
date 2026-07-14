@@ -236,7 +236,8 @@ Done:
 - `src/raft/transport/http.rs`: JSON over HTTP/1.1. Outbound is a hand-rolled client
   over TcpStream (no HTTP-client crate on the whitelist): one connection per RPC,
   `Connection: close`, Content-Length/EOF framing, chunked rejected
-  (`TODO(perf)` for pooling). Inbound: `POST /raft` axum router feeding the same
+  (`TODO(perf)` for pooling — resolved in phase 16). Inbound: `POST /raft` axum
+  router feeding the same
   `Inbound` channel as the simulator — the Raft core can't tell transports apart.
   IO/parse/slow failures all map to Timeout; only an unknown id is Unreachable.
 - `src/config.rs`: env-based NodeConfig (RUSTKV_NODE_ID / LISTEN / RAFT_LISTEN /
@@ -270,7 +271,8 @@ Untested / known gaps:
   `make test`; a scripted compose partition test would need the daemon in CI.
 - Compose healing requires re-adding the `--alias nodeN-raft` (documented in README);
   omitting it leaves the node unresolvable by peers.
-- No TLS/auth on the raft port and no connection pooling (out of scope; TODOs).
+- No TLS/auth on the raft port and no connection pooling (out of scope; TODOs —
+  pooling later shipped in phase 16; TLS stayed dropped, blocked on the whitelist).
 - Follower reads remain eventually consistent (documented since phase 5).
 
 ## Phase 8 — Jepsen-style consistency harness ✅ (approved by user)
@@ -1256,10 +1258,90 @@ Untested / known gaps (recorded from the concern review; deliberate):
   until the main.rs watch task installs its address (≤ one heartbeat,
   self-healing).
 
-## Project complete (phases 0-15)
-Remaining ideas beyond the original scope, in planned order: connection
-pooling, scripted Docker partition test. (TLS on the raft port: dropped —
-blocked on the dependency whitelist.)
+## Phase 16 — HTTP transport connection pooling ✅
+
+Resolves the `TODO(perf)` in `src/raft/transport/http.rs` module docs
+(standing since phase 7). Outbound only; the inbound axum side is
+untouched, and the wire format did not move.
+
+Done:
+- Persistent HTTP/1.1: the hand-rolled client no longer sends
+  `Connection: close`. The read path went from read_to_end (EOF framing)
+  to an incremental header scan (read until `\r\n\r\n`, tolerating body
+  bytes already buffered, 16 KiB head backstop) +
+  `read_exact(content_length)`. A 200 without Content-Length is read to
+  close and not repooled; non-200, chunked, a server `Connection: close`,
+  or excess bytes past the declared length are never repooled. Parse
+  logic stays in non-async helpers (`parse_response_head`,
+  `find_header_end`) so it remains unit-testable.
+- Pool: `Arc<Mutex<HashMap<String /*addr*/, Vec<TcpStream>>>>`, shared
+  across transport clones, keyed by ADDRESS (the advertised address, per
+  phase 15 — that is what the membership log carries and `set_peers`
+  installs), so an address change is a new key and stale sockets
+  invalidate naturally. Checkout pops (exclusive use — parallel RPCs to
+  one peer each get their own stream); checkin pushes back, capped at 4
+  idle per key, and ONLY at the successful tail: a fully-consumed,
+  Content-Length-framed 200. Cancellation safety falls out of that
+  single checkin site: when rpc_timeout drops the in-flight future, the
+  stream it owned is dropped with it — a half-read response can never
+  leak into a later RPC. The pool mutex (std, not tokio) is never held
+  across an await.
+- One retry on a FRESH connection, only when the failed attempt used a
+  POOLED connection — the stale-idle race (peer closed the socket while
+  it sat idle). A fresh-connection failure is a real network answer and
+  is never retried. The retry runs inside the same outer rpc_timeout.
+  Retry-safety argument: the pooled attempt can fail after the request
+  was written, so the retry may duplicate an RPC the peer already
+  processed — safe because Raft RPCs are duplicate-tolerant (phase 10's
+  duplication fault is the standing proof) and InstallSnapshot carries
+  its own idempotence guard (phase 14).
+- `set_peers` (the phase-15 invalidation hook the original roadmap
+  predates) prunes pool entries whose address left the book in the same
+  critical section — otherwise idle sockets to removed/re-addressed
+  members would linger until process exit.
+
+Tested (170 total; 4 new integration + reworked unit tests):
+- Socket-count reuse: 50 sequential RPCs land on ≤2 accepted connections
+  (observed: 1), against a hand-rolled counting server (accept loop
+  incrementing a counter; per-connection tasks serve framed requests in
+  a loop — axum doesn't expose accept counts).
+- Stale-conn recovery: RPC pools a connection, server killed and
+  restarted on the SAME port, next RPC succeeds via the fresh-retry path
+  (restarted server sees exactly 1 accept).
+- 8 parallel RPCs to one peer get distinct, correct responses (each
+  reply's term matches its request — exclusive checkout, no
+  interleaving).
+- No repool after timeout: the server stalls one response past the
+  client timeout; the timed-out stream never re-enters the pool — the
+  next RPC opens a fresh connection and cannot read the stale response.
+- Header-parsing unit tests (the phase-7 parse_response tests, carried
+  forward): content-length extraction, close-delimited, non-200,
+  chunked, `Connection: close` detection, malformed length, garbage;
+  incremental header-end scanning.
+- tests/three_process.rs passes UNCHANGED (interop proof: the wire
+  format didn't move), as do the prior three http_transport tests. Full
+  regression green with zero edits and zero seed re-pins — the sim
+  suites never touch HttpTransport.
+
+Untested / known gaps:
+- The joiner-catch-up blocker is NOT fixed by pooling: a single-shot
+  InstallSnapshot payload still races main.rs's 150ms RPC_TIMEOUT (see
+  phases 14/15 gap notes). Budget interaction noted: rpc_timeout now
+  covers checkout + a possible stale-conn retry — still comfortable at
+  LAN latencies, but it tightens the same budget that large snapshot
+  payloads already strain.
+- Idle pooled sockets are dropped lazily (on failed use → retry), not
+  proactively health-checked; that is the design (the retry IS the
+  recovery path), but a mass peer restart costs one wasted attempt per
+  stale socket.
+- Pool metrics (hit rate, churn) are not exposed anywhere; the reuse
+  claim is proven by the counting-server test, not observable in
+  production.
+
+## Project complete (phases 0-16)
+Remaining ideas beyond the original scope: scripted Docker partition
+test. (TLS on the raft port: dropped — blocked on the dependency
+whitelist. Connection pooling graduated in phase 16.)
 
 ## Out of scope (deliberate)
 Joint-consensus (multi-server) membership changes and a snapshot

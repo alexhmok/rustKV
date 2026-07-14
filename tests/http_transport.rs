@@ -3,9 +3,11 @@
 //! API and raft RPCs run over real sockets.
 //!
 //! Covered: RPC roundtrip over HTTP, unreachable-vs-timeout semantics
-//! (unknown id, dead peer, black-holed listener), and a real-transport
-//! cluster electing a leader, committing writes everywhere, and surviving
-//! a leader crash.
+//! (unknown id, dead peer, black-holed listener), connection pooling
+//! (phase 16: reuse across sequential RPCs, stale-conn retry after a
+//! server restart, exclusive checkout under parallel RPCs, no repool
+//! after a timeout), and a real-transport cluster electing a leader,
+//! committing writes everywhere, and surviving a leader crash.
 //! NOT covered: transport behavior under OS-level packet loss (the sim
 //! transport owns fault injection; real-network partitions are exercised
 //! via Docker, see README).
@@ -123,6 +125,266 @@ async fn unknown_peer_is_unreachable_dead_peer_times_out() {
     drop(rx3);
     let (t1b, _addr, _rx) = bind_transport(1, HashMap::from([(3, addr3)])).await;
     assert_eq!(t1b.send(3, request).await, Err(TransportError::Timeout));
+}
+
+// ---- connection pooling (phase 16) ----
+//
+// These need accept counts, which axum::serve doesn't expose, so they run
+// against a hand-rolled counting server: an accept loop bumping a counter,
+// each connection served in a task that reads framed requests in a loop
+// and answers RequestVote with the request's own term (so every response
+// is attributable to exactly one request).
+
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use rustkv::raft::transport::TransportError;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+fn vote_request(term: u64) -> RpcRequest {
+    RpcRequest::RequestVote(RequestVoteArgs {
+        term,
+        candidate_id: 1,
+        last_log_index: 0,
+        last_log_term: 0,
+    })
+}
+
+fn vote_reply(term: u64) -> RpcResponse {
+    RpcResponse::RequestVote(RequestVoteReply {
+        term,
+        vote_granted: true,
+    })
+}
+
+/// Transport for node 1 with a single peer (id 2) at `peer_addr`. The
+/// router/inbound side is unused — these tests exercise outbound only.
+fn client_transport(peer_addr: String, rpc_timeout: Duration) -> HttpTransport {
+    let (transport, _router, _inbound) =
+        HttpTransport::new(1, HashMap::from([(2, peer_addr)]), rpc_timeout);
+    transport
+}
+
+struct CountingServer {
+    addr: String,
+    accepted: Arc<AtomicUsize>,
+    accept_task: tokio::task::JoinHandle<()>,
+    conn_tasks: Arc<StdMutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+impl CountingServer {
+    /// Aborts the accept loop and every connection task — client-visible
+    /// as closed sockets, like a process crash. Frees the port.
+    fn kill(&self) {
+        self.accept_task.abort();
+        for task in self.conn_tasks.lock().unwrap().drain(..) {
+            task.abort();
+        }
+    }
+}
+
+/// `delay`: (request ordinal counted across all connections, pause) —
+/// postpones that one response so a client can time out while it is
+/// pending.
+async fn spawn_counting_server(bind: &str, delay: Option<(usize, Duration)>) -> CountingServer {
+    // Retry the bind briefly: the restart-on-same-port test rebinds right
+    // after kill() and the old socket may still be tearing down.
+    let listener = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match TcpListener::bind(bind).await {
+                Ok(listener) => break listener,
+                Err(error) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "could not bind {bind}: {error}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+    };
+    let addr = listener.local_addr().unwrap().to_string();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let conn_tasks = Arc::new(StdMutex::new(Vec::new()));
+    let served = Arc::new(AtomicUsize::new(0));
+
+    let accept_task = tokio::spawn({
+        let accepted = accepted.clone();
+        let conn_tasks = conn_tasks.clone();
+        async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                accepted.fetch_add(1, Ordering::SeqCst);
+                let served = served.clone();
+                let conn_task = tokio::spawn(async move {
+                    while let Some(body) = read_framed_request(&mut stream).await {
+                        let ordinal = served.fetch_add(1, Ordering::SeqCst);
+                        if let Some((delayed_ordinal, pause)) = delay
+                            && ordinal == delayed_ordinal
+                        {
+                            tokio::time::sleep(pause).await;
+                        }
+                        // The envelope is {"from":..,"request":{"RequestVote":{..}}}.
+                        let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let term = envelope["request"]["RequestVote"]["term"].as_u64().unwrap();
+                        let json = serde_json::to_vec(&vote_reply(term)).unwrap();
+                        let head =
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", json.len());
+                        if stream.write_all(head.as_bytes()).await.is_err()
+                            || stream.write_all(&json).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+                conn_tasks.lock().unwrap().push(conn_task);
+            }
+        }
+    });
+    CountingServer {
+        addr,
+        accepted,
+        accept_task,
+        conn_tasks,
+    }
+}
+
+/// Reads one Content-Length-framed HTTP request body; None on EOF/error.
+async fn read_framed_request(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    let header_end = loop {
+        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break end;
+        }
+        let mut chunk = [0u8; 4096];
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..header_end]).to_ascii_lowercase();
+    let length: usize = head
+        .lines()
+        .find_map(|line| line.strip_prefix("content-length:"))
+        .map(str::trim)?
+        .parse()
+        .ok()?;
+    let mut body = buf.split_off(header_end + 4);
+    while body.len() < length {
+        let mut chunk = [0u8; 4096];
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => body.extend_from_slice(&chunk[..n]),
+        }
+    }
+    body.truncate(length);
+    Some(body)
+}
+
+#[tokio::test]
+async fn sequential_rpcs_reuse_a_pooled_connection() {
+    let _serial = SERIAL.lock().await;
+    let server = spawn_counting_server("127.0.0.1:0", None).await;
+    let transport = client_transport(server.addr.clone(), RPC_TIMEOUT);
+
+    for term in 1..=50u64 {
+        let response = transport.send(2, vote_request(term)).await.unwrap();
+        assert_eq!(response, vote_reply(term));
+    }
+
+    let accepted = server.accepted.load(Ordering::SeqCst);
+    assert!(
+        accepted <= 2,
+        "50 sequential RPCs should reuse one pooled connection, saw {accepted} accepts"
+    );
+    server.kill();
+}
+
+#[tokio::test]
+async fn stale_pooled_connection_recovers_on_a_fresh_retry() {
+    let _serial = SERIAL.lock().await;
+    let server = spawn_counting_server("127.0.0.1:0", None).await;
+    let addr = server.addr.clone();
+    let transport = client_transport(addr.clone(), RPC_TIMEOUT);
+
+    // First RPC pools its connection; killing the server closes it while
+    // it sits idle — the stale-idle race the retry exists for.
+    assert_eq!(
+        transport.send(2, vote_request(1)).await.unwrap(),
+        vote_reply(1)
+    );
+    server.kill();
+    let restarted = spawn_counting_server(&addr, None).await;
+
+    let response = transport.send(2, vote_request(2)).await.unwrap();
+    assert_eq!(response, vote_reply(2));
+    assert_eq!(
+        restarted.accepted.load(Ordering::SeqCst),
+        1,
+        "retry must arrive on a fresh connection to the restarted server"
+    );
+    restarted.kill();
+}
+
+#[tokio::test]
+async fn parallel_rpcs_get_exclusive_connections_and_distinct_responses() {
+    let _serial = SERIAL.lock().await;
+    let server = spawn_counting_server("127.0.0.1:0", None).await;
+    let transport = client_transport(server.addr.clone(), RPC_TIMEOUT);
+
+    let mut joins = Vec::new();
+    for term in 1..=8u64 {
+        let transport = transport.clone();
+        joins.push(tokio::spawn(async move {
+            (term, transport.send(2, vote_request(term)).await)
+        }));
+    }
+    for join in joins {
+        let (term, response) = join.await.unwrap();
+        assert_eq!(
+            response.unwrap(),
+            vote_reply(term),
+            "parallel RPCs must not interleave responses"
+        );
+    }
+    server.kill();
+}
+
+#[tokio::test]
+async fn timed_out_connection_is_never_repooled() {
+    let _serial = SERIAL.lock().await;
+    // The SECOND request (ordinal 1) stalls past the client timeout, so it
+    // times out on a POOLED connection with the response still pending.
+    let stall = Duration::from_millis(600);
+    let server = spawn_counting_server("127.0.0.1:0", Some((1, stall))).await;
+    let transport = client_transport(server.addr.clone(), Duration::from_millis(200));
+
+    // Pool a connection, then time out on it.
+    assert_eq!(
+        transport.send(2, vote_request(7)).await.unwrap(),
+        vote_reply(7)
+    );
+    assert_eq!(
+        transport.send(2, vote_request(8)).await,
+        Err(TransportError::Timeout)
+    );
+
+    // Let the stalled term-8 response get written (to a dropped socket).
+    // If the timed-out stream had been repooled, the next RPC would read
+    // that stale response instead of its own.
+    tokio::time::sleep(stall).await;
+    let response = transport.send(2, vote_request(9)).await.unwrap();
+    assert_eq!(response, vote_reply(9));
+    assert_eq!(
+        server.accepted.load(Ordering::SeqCst),
+        2,
+        "the RPC after the timeout must open a fresh connection"
+    );
+    server.kill();
 }
 
 // ---- a real 3-node cluster over the HTTP transport, in-process ----
