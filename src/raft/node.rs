@@ -150,6 +150,15 @@ pub struct RaftConfig {
     /// term movement — until a ConfigChange that includes it arrives from
     /// the leader; catch-up rides InstallSnapshot/AppendEntries as usual.
     pub join: bool,
+    /// HARNESS-ONLY (phase 18): disables the two phase-15 reconfig safety
+    /// gates — "no ConfigChange before this term's no-op commits" and "at
+    /// most one change in flight" — so the sim can construct the
+    /// disjoint-majority schedule those gates exist to prevent. The
+    /// structural checks (non-empty, single-server delta) and the
+    /// availability guard stay on. Must NEVER be reachable from env config
+    /// (main.rs leaves it at the default `false`, under which behavior is
+    /// bit-for-bit unchanged: no RNG draws, no messages, no wire changes).
+    pub test_disable_reconfig_gates: bool,
 }
 
 impl RaftConfig {
@@ -165,6 +174,7 @@ impl RaftConfig {
             snapshot_trailing: 0,
             bootstrap_addrs: BTreeMap::new(),
             join: false,
+            test_disable_reconfig_gates: false,
         }
     }
 }
@@ -700,11 +710,16 @@ impl<T: Transport + Clone> RaftNode<T> {
         else {
             unreachable!("validated only on the leader");
         };
-        if self.commit_index < *term_start_index {
-            return Err("this term's no-op is not yet committed; retry shortly");
-        }
-        if self.members_index > self.commit_index {
-            return Err("a configuration change is already in flight");
+        // The two SAFETY gates (thesis §4.1), harness-bypassable so the
+        // phase-18 test can construct the disjoint-majority disease they
+        // prevent; everything below them stays on even in the harness.
+        if !self.config.test_disable_reconfig_gates {
+            if self.commit_index < *term_start_index {
+                return Err("this term's no-op is not yet committed; retry shortly");
+            }
+            if self.members_index > self.commit_index {
+                return Err("a configuration change is already in flight");
+            }
         }
         if new.is_empty() {
             return Err("the new configuration must keep at least one member");

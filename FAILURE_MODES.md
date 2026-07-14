@@ -12,7 +12,7 @@ the trigger, what a client or operator observes, and its status:
   documented operational rule.
 - **open** — a known gap with the fix path named but not built.
 
-Safety claims are backed by the deterministic sim/jepsen suites (181 tests,
+Safety claims are backed by the deterministic sim/jepsen suites (183 tests,
 plus opt-in wide soaks: 512 randomized fault schedules across 256 seeds
 with 10% message duplication and aggressive compaction — zero safety or
 linearizability violations) and the scripted real-network Docker partition
@@ -196,11 +196,27 @@ A pre-phase-15 binary cannot deserialize a `ConfigChange` log entry
 forward-safe. Rule: never propose a membership change while a rolling
 upgrade is in progress.
 
-### Ongaro concurrent-change schedule untested — open (test debt)
-The no-op gate and one-in-flight rule are implemented and their firing is
-tested, but the disjoint-majority disease they prevent was never
-constructed in the sim (needs the gate disabled plus a 4-server
-interleaving). Honest test-the-fix debt, recorded in PLAN.md phase 15.
+### Ongaro concurrent-change schedule — closed in phase 18 (was: test debt)
+The disjoint-majority disease the phase-15 gates prevent is now constructed
+in the sim, via the harness-only `RaftConfig.test_disable_reconfig_gates`
+flag (never reachable from env config): with the gates off, a
+minority-partitioned 5-node leader STACKS two removals (members 5 → 4 → 3,
+each effective on append) until its partition of two is a quorum, and two
+disjoint majorities — {leader, follower} and the far three, still on the
+5-member config — commit different entries at the same log index:
+split-brain, demonstrated down to both sides serving granted linearizable
+reads of state the other never heard of. With the gates on, the identical
+driver is refused at exactly the stacking step (`InvalidConfigChange`,
+one-in-flight). Two findings from the construction, recorded in the PLAN.md
+phase-18 record: (a) the classic TWO-LEADER form of the disease is not
+constructible in this implementation — for a single in-flight single-server
+change, every new-config commit majority intersects every old-config vote
+majority, and the intersecting node either denies the rival's vote (§5.4.1,
+its log is longer) or rejects the old leader's AppendEntries (term check);
+the gates' unique work is preventing STACKING. (b) The event-level safety
+observer is silent through the unsafe run — its checks are per-term and the
+split-brain leaders hold different terms (see the harness-limitations note
+below).
 
 ## Transport and networking
 
@@ -277,6 +293,10 @@ go to the leader directly. Root path is not a key. Pinned by
 - **The event-level safety observer** checks AppendEntries content
   invariants only — liveness bugs surface as test timeouts, not observer
   hits; PreVote/InstallSnapshot traffic is deliberately invisible to it.
+  Its election-safety and log-matching checks are both PER-TERM, so
+  cross-term disjoint-majority commits (the phase-18 Ongaro schedule) are
+  invisible to it too — divergence/WGL assertions are the detector for
+  that class.
 - **WGL checker caps at 63 ops per key** (u64 bitmask), sized to the
   workloads.
 - **Docker/partition coverage is one scenario** (leader partitioned, heal,

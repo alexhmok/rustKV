@@ -27,6 +27,14 @@
 //!   stickiness-lapsed window of a real election (leader crash) it cannot
 //!   win, because the committed removal entry makes every member's log
 //!   strictly longer than its own. See PLAN.md for the decision record.
+//! - the Ongaro concurrent-change schedule (phase 18): with the reconfig
+//!   gates harness-disabled, a minority-partitioned leader STACKS two
+//!   uncommitted removals until its own partition is a quorum — two
+//!   disjoint majorities then commit different entries at the same index
+//!   (split-brain, demonstrated down to conflicting linearizable reads);
+//!   with the gates on, the identical driver is refused at the exact
+//!   stacking step. See the section comment for why the two-competing-
+//!   leaders form of the disease is NOT constructible here.
 
 mod common;
 
@@ -34,7 +42,7 @@ use std::sync::Arc;
 
 use common::lin::{OpKind, Recorded, WriteKind, WriteOutcome, check_linearizable};
 use common::*;
-use rustkv::raft::node::{ProposeError, RoleKind};
+use rustkv::raft::node::{Proposal, ProposeError, RoleKind, Status};
 use rustkv::raft::transport::sim::FaultConfig;
 use rustkv::raft::types::{Command, LogIndex, Membership, NodeId, Session};
 use rustkv::rng::SplitMix64;
@@ -1103,6 +1111,219 @@ async fn joiner_never_campaigns_before_a_config_includes_it() {
         .collect();
     cluster.wait_for_leader_among(&remaining).await;
     confirm_put(&cluster, &remaining, "post-crash", 2).await;
+    cluster.shutdown();
+}
+
+// ---- the Ongaro concurrent-change schedule (phase 18) ----
+//
+// The disjoint-majority disease the phase-15 gates exist to prevent,
+// constructed for real. Two findings shape these tests:
+//
+// 1. The classic TWO-LEADER form (leader 1 commits `remove 4` with {1,3}
+//    while node 2 wins term+1 with votes {2,3,4}) is NOT constructible in
+//    this implementation, gates or no gates: with a single change in
+//    flight, any commit-majority of the new config and any vote-majority
+//    of the old config intersect (single-server overlap: e.g. 2-of-3 plus
+//    3-of-4 > 4 nodes), and the intersecting node faces a contradiction —
+//    if it acks the ConfigChange first, its longer log makes it deny the
+//    rival's vote (§5.4.1); if it votes first, its bumped term makes it
+//    reject the old leader's AppendEntries. The defense that binds there
+//    is Raft's base machinery, not the gates.
+//
+// 2. What the gates DO uniquely prevent is STACKING: a second change
+//    appended while the first is uncommitted computes its quorum from an
+//    unsettled basis, and configs two deltas apart need not overlap. A
+//    minority-partitioned 5-node leader that stacks `remove far_c` then
+//    `remove far_b` (members 5 → 4 → 3, quorum 3 → 2) becomes
+//    self-sufficient with one follower — while the far three are still a
+//    3-of-5 majority of the config THEY hold. Both sides then commit
+//    different entries at the same indexes. That schedule needs no timing
+//    races at all — just the partition — which is exactly why the
+//    one-in-flight rule is load-bearing.
+//
+// The event-level observer stays silent through the unsafe run — its
+// election-safety and log-matching checks are both per-term, and the two
+// leaders here hold different terms — so the assertions below (both sides
+// confirm commits and serve conflicting linearizable reads at overlapping
+// indexes) are the violation record, per the phase-10 observer's
+// documented scope.
+
+/// Runs the shared schedule up to the decisive step on an ESTABLISHED
+/// leader (no-op long committed, so the no-op gate is satisfied in both
+/// legs and the one-in-flight rule is the only gate in play): converge a
+/// 5-node cluster, partition {leader, one follower} from the other three,
+/// and immediately — while every last_contact is still fresh, so the
+/// availability guard passes honestly in both legs — propose the two
+/// stacked removals of far-side members. Returns the sides and both
+/// proposal outcomes; the callers assert opposite fates for the second.
+async fn ongaro_stacked_removals(
+    cluster: &TestCluster,
+) -> (
+    Status,
+    NodeId,
+    Vec<NodeId>,
+    Proposal,
+    Result<Proposal, ProposeError>,
+) {
+    let all = cluster.all_ids();
+    assert_eq!(all.len(), 5, "the schedule is sized for five nodes");
+    let leader = cluster.wait_for_leader().await;
+    confirm_put(cluster, &all, "before", 1).await;
+    converge_among(cluster, &all).await;
+
+    let near = *all.iter().find(|&&id| id != leader.id).unwrap();
+    let far: Vec<NodeId> = all
+        .iter()
+        .copied()
+        .filter(|&id| id != leader.id && id != near)
+        .collect();
+    for &m in &[leader.id, near] {
+        for &f in &far {
+            cluster.net.set_pair_blocked(m, f, true);
+        }
+    }
+
+    // Both removals target far-side members, proposed back to back inside
+    // the contact-freshness window (the far side acked heartbeats moments
+    // ago, so the availability guard sees a reachable new majority — a
+    // TRUE statement about 50ms ago, which is all the guard ever has).
+    let handle = cluster.handle(leader.id);
+    let mut minus_c = handle.membership();
+    minus_c.remove(&far[2]);
+    let c1 = handle
+        .propose(Command::ConfigChange { members: minus_c })
+        .await
+        .expect("the first removal is admitted in both legs");
+    let mut minus_b = handle.membership();
+    minus_b.remove(&far[1]);
+    let c2 = handle
+        .propose(Command::ConfigChange { members: minus_b })
+        .await;
+    (leader, near, far, c1, c2)
+}
+
+/// EXPECTED-UNSAFE (gates harness-disabled): the stacked removals leave
+/// {leader, near} believing in a 3-member config with quorum 2, so the
+/// minority partition commits a write — while the far three, still on the
+/// 5-member config, elect their own leader (3 of 5) and commit a different
+/// write AT AN OVERLAPPING INDEX. Two disjoint majorities, {L, near} and
+/// the far three, each confirm commits and each serve linearizable reads
+/// of state the other side has never heard of. This is the disease; the
+/// companion test below shows the gates refuse the identical driver.
+#[tokio::test(start_paused = true)]
+async fn stacked_config_changes_commit_on_disjoint_majorities_without_the_gates() {
+    let cluster = spawn_cluster_without_reconfig_gates(5, 181, fixed_delay_faults());
+    let (leader, near, far, c1, c2) = ongaro_stacked_removals(&cluster).await;
+    let c2 = c2.expect("gates off: the stacked second removal is admitted");
+
+    // The minority side commits: with the stacked config {leader, near,
+    // far[0]} in effect, leader + near is a 2-of-3 quorum. All three
+    // entries — both ConfigChanges and the payload — confirm commit.
+    let l_handle = cluster.handle(leader.id);
+    let poison = l_handle
+        .propose(put("poison", 13))
+        .await
+        .expect("the split-brain leader takes writes");
+    assert_eq!(poison.committed.await, Ok(true), "committed by {{L, near}}");
+    assert_eq!(c1.committed.await, Ok(true));
+    assert_eq!(c2.committed.await, Ok(true));
+
+    // The far side never saw the removals: its three nodes are a 3-of-5
+    // majority of the config they hold, and elect a leader of a HIGHER
+    // term once stickiness lapses.
+    let rival = cluster.wait_for_leader_among(&far).await;
+    assert!(
+        rival.term > leader.term,
+        "the far side elects at a fresh term"
+    );
+    let r_handle = cluster.handle(rival.id);
+    let rival_write = r_handle
+        .propose(put("rival", 99))
+        .await
+        .expect("the far-side leader takes writes");
+    assert_eq!(rival_write.committed.await, Ok(true), "committed by 3 of 5");
+
+    // The smoking gun, part 1 — overlapping log positions: the far side's
+    // no-op landed at c1's index, so its committed write occupies the SAME
+    // index as the minority side's committed second ConfigChange. One log
+    // slot, two committed entries.
+    assert_eq!(
+        rival_write.index, c2.index,
+        "both sides committed different entries at index {}",
+        c2.index
+    );
+    assert!(poison.index > rival_write.index);
+
+    // Part 2 — both leaders coexist and each side serves LINEARIZABLE
+    // reads of divergent committed state (ReadIndex confirms against each
+    // side's own quorum, so both grants succeed).
+    assert_eq!(l_handle.status().role, RoleKind::Leader);
+    assert_eq!(r_handle.status().role, RoleKind::Leader);
+    let ticket = l_handle.read().await.expect("split-brain leader read");
+    tokio::time::timeout(ms(1500), ticket.granted)
+        .await
+        .expect("granted in time")
+        .expect("leadership held");
+    assert_eq!(cluster.store(leader.id).get("poison"), Some(json!(13)));
+    assert_eq!(cluster.store(leader.id).get("rival"), None);
+    let ticket = r_handle.read().await.expect("far-side leader read");
+    tokio::time::timeout(ms(1500), ticket.granted)
+        .await
+        .expect("granted in time")
+        .expect("leadership held");
+    assert_eq!(cluster.store(rival.id).get("rival"), Some(json!(99)));
+    assert_eq!(cluster.store(rival.id).get("poison"), None);
+
+    // Deliberately NO heal: healing makes the successor's entries truncate
+    // committed entries on the ex-leader, which correctly trips the
+    // fail-stop "asked to truncate committed entry" assertion inside its
+    // task. The divergence above IS the demonstrated violation. The
+    // observer teardown check passes vacuously — see the section comment.
+    let _ = near;
+    cluster.shutdown();
+}
+
+/// The inversion: the IDENTICAL driver on a default cluster is refused at
+/// the exact stacking step — `InvalidConfigChange`, "already in flight" —
+/// and the run converges safely: the first removal commits after heal, the
+/// remaining four agree byte-for-byte, and writes proceed. Together with
+/// the test above this is the "demonstrate the disease, then show the gate
+/// refuses it" pair the phase-15 gates were shipped without.
+#[tokio::test(start_paused = true)]
+async fn the_reconfig_gates_refuse_the_stacked_removal_that_splits_majorities() {
+    let cluster = spawn_cluster(5, 182, fixed_delay_faults());
+    let (leader, near, far, c1, c2) = ongaro_stacked_removals(&cluster).await;
+
+    // The one-in-flight gate fires at the exact step the unsafe leg needed
+    // admitted (rejections are side-effect-free: nothing was appended).
+    let err = c2.expect_err("gates on: the stacked second removal is refused");
+    let ProposeError::InvalidConfigChange { reason } = err else {
+        panic!("expected InvalidConfigChange, got {err}");
+    };
+    assert!(
+        reason.contains("in flight"),
+        "the ONE-IN-FLIGHT gate must be what binds, got: {reason}"
+    );
+
+    // Heal immediately (the far side has not even reached an election
+    // timeout): the lone in-flight removal replicates, commits under its
+    // own 3-of-4 majority, and the cluster converges — no divergence, no
+    // second leader, and the observer check at shutdown stays the real
+    // assertion it always is.
+    for &m in &[leader.id, near] {
+        for &f in &far {
+            cluster.net.set_pair_blocked(m, f, false);
+        }
+    }
+    assert_eq!(c1.committed.await, Ok(true));
+    let members: Vec<NodeId> = cluster
+        .all_ids()
+        .into_iter()
+        .filter(|&id| id != far[2])
+        .collect();
+    converge_among(&cluster, &members).await;
+    assert_states_identical(&cluster, &members);
+    confirm_put(&cluster, &members, "after", 2).await;
     cluster.shutdown();
 }
 
