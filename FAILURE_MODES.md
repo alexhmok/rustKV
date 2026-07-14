@@ -12,7 +12,7 @@ the trigger, what a client or operator observes, and its status:
   documented operational rule.
 - **open** — a known gap with the fix path named but not built.
 
-Safety claims are backed by the deterministic sim/jepsen suites (183 tests,
+Safety claims are backed by the deterministic sim/jepsen suites (185 tests,
 plus opt-in wide soaks: 512 randomized fault schedules across 256 seeds
 with 10% message duplication and aggressive compaction — zero safety or
 linearizability violations) and the scripted real-network Docker partition
@@ -169,21 +169,42 @@ and catch-up speed is governed by the payload/timeout entry above. Keep
 adds to windows of full health (the availability guard enforces
 reachability of the new majority at propose time, but not catch-up speed).
 
-### Reconfig guard blind spot in a fresh term — open (self-healing)
-The guard's reachability signal (`last_contact`) resets at election, so a
-change proposed within the first `election_timeout_max` of a new term may
-pass while a member is actually down. Such a change can stall until the
-topology heals — but it remains supersedable/committable later, and the
-unrecoverable 1→2 case never depends on the signal. Retry after rejection;
-rejections are side-effect-free.
+### Reconfig guard blind spot in a fresh term — closed in phase 19 (was: open)
+The guard's reachability signal (`last_contact`) initializes to leadership
+start, so a change proposed within the first `election_timeout_max` of a
+new term used to pass while a member was actually down. Closed: a member
+now counts as reachable only if it has also ACKED an AppendEntries at the
+leader's term (the `acked_seq` key set — populated at exactly one site,
+empty at each leadership start — is the acked-this-term flag; self always
+counts). Latency cost is ~one heartbeat RTT and in practice zero: the
+no-op gate already forces waiting for a majority of acks. Demonstrated
+both ways in `membership::add_in_a_fresh_term_is_refused_until_members_ack`
+(pre-fix, the identical schedule accepts an add inside the blind window
+while a member is down — recorded in the PLAN.md phase-19 entry). Guard
+rejections remain side-effect-free; retry after the members ack.
 
-### Removed servers are never told — by design
-Leaders don't replicate outside the config, so a removed-but-running server
-parks probing forever (its pre-votes are structurally deniable — its log
-lacks the committed removal entry, so it can never assemble a majority).
-Liveness noise on its own box only. Operators must stop the process and
-clean the data dir. Address changes for an existing member are likewise
-refused (409); remove-then-re-add is the workaround.
+### Removed servers are now told (parting sends) — mitigated in phase 19 (was: by design)
+Leaders used to stop replicating to a removed peer the moment the removal
+took effect, so the peer never learned and probed with pre-votes forever.
+Now the leader keeps sending AppendEntries (or InstallSnapshot, if the
+removal entry was compacted) to the removed peer until
+`match_index[peer]` covers the removal entry, then goes quiet; the peer
+adopts the configuration that excludes it on APPEND (§4.1) and the
+campaign gate parks it silently — Follower, frozen term, frozen log. The
+membership watch carries departing peers' addresses until the parting ack
+so the real binary's transport can still reach them
+(`three_process::removed_process_learns_of_its_removal_and_goes_quiet`;
+sim leg in `membership::removed_follower_cannot_disrupt_the_members`).
+Residual, best-effort by design: the departing bookkeeping dies with the
+leadership — a peer removed under a leader that crashed or stepped down
+before the parting ack still parks probing forever (the old behavior; its
+pre-votes remain structurally deniable, liveness noise on its own box
+only). A parked peer may also hold the removal entry uncommitted-locally
+(the parting protocol guarantees delivery of the ENTRY, not the commit
+index) — harmless, since adoption is append-time. Operators should still
+stop the process and clean the data dir eventually. Address changes for
+an existing member are still refused (409); remove-then-re-add is the
+workaround.
 
 ### Admin ops have no dedup tokens — by design (verify on 409)
 A retried add/remove after an ambiguous 504 may answer 409 ("already a

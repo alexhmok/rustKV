@@ -281,10 +281,22 @@ pub struct ReadTicket {
     pub granted: oneshot::Receiver<()>,
 }
 
+/// The payload of the membership watch (phase 19b): the in-effect members
+/// plus, on a leader, the removed peers still owed their own removal entry
+/// (the parting sends). The transport layer must keep departing peers'
+/// addresses installed until the removal is acked, or the parting
+/// AppendEntries would be unreachable in the real binary; a second watch
+/// update drops them. Always empty off the leader.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MembershipView {
+    pub members: Membership,
+    pub departing: Membership,
+}
+
 /// Handle to a running node.
 pub struct RaftHandle {
     status: watch::Receiver<Status>,
-    membership: watch::Receiver<Membership>,
+    membership: watch::Receiver<MembershipView>,
     control: mpsc::UnboundedSender<Control>,
     task: JoinHandle<()>,
 }
@@ -300,13 +312,15 @@ impl RaftHandle {
 
     /// The in-effect cluster membership (phase 15) as this node knows it.
     pub fn membership(&self) -> Membership {
-        self.membership.borrow().clone()
+        self.membership.borrow().members.clone()
     }
 
     /// Watch channel of membership changes — how the transport and API
     /// layers learn about added/removed peers and their addresses without
-    /// the Raft core ever touching the network.
-    pub fn membership_watch(&self) -> watch::Receiver<Membership> {
+    /// the Raft core ever touching the network. Carries the departing
+    /// peers too (phase 19b) so the transport keeps their addresses for
+    /// the parting sends.
+    pub fn membership_watch(&self) -> watch::Receiver<MembershipView> {
         self.membership.clone()
     }
 
@@ -416,6 +430,10 @@ enum Event {
     },
 }
 
+// Exactly one Role value exists per node, so the Leader variant's size is
+// not a memory concern — boxing its fields would buy nothing but
+// indirection on the hottest paths.
+#[allow(clippy::large_enum_variant)]
 enum Role {
     Follower,
     /// Pre-campaigning (§9.6): counting non-binding pre-votes for the
@@ -446,6 +464,16 @@ enum Role {
         /// Initialized to leadership start so a fresh leader isn't deposed
         /// before its first acks can possibly arrive.
         last_contact: HashMap<NodeId, Instant>,
+        /// Removed peers still owed their own removal entry (phase 19b):
+        /// peer → (the removal entry's index, the address the transport
+        /// must keep installed for the parting sends). The leader keeps
+        /// sending AppendEntries to these until `match_index[peer]`
+        /// reaches the index, then goes quiet; they never count toward any
+        /// quorum (already outside `members`) and the map dies with the
+        /// leadership — best-effort by design: a successor inherits
+        /// nothing, so a peer removed under a crashed leader may still
+        /// park probing. BTreeMap so fan-out order stays deterministic.
+        departing: BTreeMap<NodeId, (LogIndex, MemberAddr)>,
         /// Reads awaiting confirmation. Deliberately inside the role: losing
         /// leadership drops them, resolving every ticket with an error —
         /// unlike `pending` proposals, which survive step-down.
@@ -487,7 +515,7 @@ pub struct RaftNode<T: Transport + Clone> {
     /// Truncation at or below it forces a rescan; a ConfigChange is "in
     /// flight" while this exceeds `commit_index`.
     members_index: LogIndex,
-    membership_tx: watch::Sender<Membership>,
+    membership_tx: watch::Sender<MembershipView>,
     /// When the last valid AppendEntries (current-or-higher term) arrived.
     /// Leader stickiness: pre-votes are denied while this is fresher than
     /// `election_timeout_min`. Volatile — a restarted node grants again.
@@ -542,7 +570,10 @@ impl<T: Transport + Clone> RaftNode<T> {
         // maintains, so a restart re-derives exactly what it knew: latest
         // ConfigChange in the retained log > snapshot > bootstrap config.
         let (members, members_index) = derive_membership(&storage, &config);
-        let (membership_tx, membership_rx) = watch::channel(members.clone());
+        let (membership_tx, membership_rx) = watch::channel(MembershipView {
+            members: members.clone(),
+            departing: Membership::new(),
+        });
         tracing::info!(
             node = config.id,
             term = hard_state.current_term,
@@ -685,9 +716,11 @@ impl<T: Transport + Clone> RaftNode<T> {
             index,
             committed: committed_rx,
         }));
-        // A single-node cluster commits immediately; otherwise replicate now.
+        // A single-node cluster commits immediately; otherwise replicate now
+        // (departing peers included — a removal's own append is what starts
+        // their parting delivery).
         self.maybe_advance_commit();
-        for peer in self.peer_ids() {
+        for peer in self.replication_targets() {
             self.send_append(peer);
         }
     }
@@ -704,6 +737,7 @@ impl<T: Transport + Clone> RaftNode<T> {
     fn validate_config_change(&self, new: &Membership) -> Result<(), &'static str> {
         let Role::Leader {
             term_start_index,
+            acked_seq,
             last_contact,
             ..
         } = &self.role
@@ -744,19 +778,27 @@ impl<T: Transport + Clone> RaftNode<T> {
         // CheckQuorum soon deposes the only node that could have fixed it,
         // permanently (it can never re-win a 2-of-2 election). Reuse
         // CheckQuorum's own signal: a member is reachable if it is this
-        // node or answered within election_timeout_max. A NOT-YET-ADDED
-        // member has never been heard (leaders only talk to members), so
-        // it always counts unreachable — which deliberately forbids growing
-        // a single-node cluster dynamically (etcd's answer there is
-        // learners; we have none — bootstrap statically instead).
+        // node or answered within election_timeout_max — AND it has acked
+        // an AppendEntries at THIS term (phase 19a): `last_contact` is
+        // initialized to leadership start, so for the first window of a
+        // fresh term every member merely LOOKS heard, and a change could
+        // pass while a member was down. `acked_seq` holds exactly the peers
+        // that answered at our term (it starts empty each leadership and
+        // gains entries at one site), so its key set IS the acked-this-term
+        // flag. A NOT-YET-ADDED member has never been heard (leaders only
+        // talk to members), so it always counts unreachable — which
+        // deliberately forbids growing a single-node cluster dynamically
+        // (etcd's answer there is learners; we have none — bootstrap
+        // statically instead).
         let window = self.config.election_timeout_max;
         let reachable = new
             .keys()
             .filter(|&&id| {
                 id == self.config.id
-                    || last_contact
-                        .get(&id)
-                        .is_some_and(|at| at.elapsed() < window)
+                    || (acked_seq.contains_key(&id)
+                        && last_contact
+                            .get(&id)
+                            .is_some_and(|at| at.elapsed() < window))
             })
             .count();
         if reachable < new.len() / 2 + 1 {
@@ -1353,11 +1395,13 @@ impl<T: Transport + Clone> RaftNode<T> {
                     return; // reply to an RPC from an earlier term of ours
                 }
                 let last_index = self.storage.last_index();
+                let node_id = self.config.id;
                 let Role::Leader {
                     next_index,
                     match_index,
                     acked_seq,
                     last_contact,
+                    departing,
                     ..
                 } = &mut self.role
                 else {
@@ -1371,6 +1415,7 @@ impl<T: Transport + Clone> RaftNode<T> {
                 *acked = (*acked).max(sent_seq);
                 last_contact.insert(from, Instant::now());
                 let mut resend = false;
+                let mut departed = false;
                 if reply.success {
                     // The peer confirmed it matches us up to prev + sent.
                     // max() because replies can arrive reordered.
@@ -1381,6 +1426,24 @@ impl<T: Transport + Clone> RaftNode<T> {
                         next_index.insert(from, confirmed + 1);
                         // Keep pushing if the peer is still behind.
                         resend = confirmed < last_index;
+                    }
+                    // Parting complete (phase 19b): a departing peer now
+                    // holds its own removal entry — go quiet toward it and
+                    // let the transport drop its address.
+                    let held = *matched;
+                    if departing
+                        .get(&from)
+                        .is_some_and(|&(removal_index, _)| held >= removal_index)
+                    {
+                        departing.remove(&from);
+                        departed = true;
+                        resend = false;
+                        tracing::info!(
+                            node = node_id,
+                            term = sent_term,
+                            peer = from,
+                            "removed peer acked its own removal; ending replication to it"
+                        );
                     }
                 } else {
                     // §5.3 backtracking: the peer diverges at or before
@@ -1396,6 +1459,11 @@ impl<T: Transport + Clone> RaftNode<T> {
                         "append rejected by peer; backtracking"
                     );
                     resend = true;
+                }
+                if departed {
+                    // The second watch update: the transport may now drop
+                    // the departed peer's address.
+                    self.publish_membership();
                 }
                 if reply.success {
                     self.maybe_advance_commit();
@@ -1443,6 +1511,7 @@ impl<T: Transport + Clone> RaftNode<T> {
                     next_index,
                     match_index,
                     last_contact,
+                    departing,
                     ..
                 } = &mut self.role
                 else {
@@ -1459,6 +1528,14 @@ impl<T: Transport + Clone> RaftNode<T> {
                 *matched = (*matched).max(last_included_index);
                 let next = next_index.entry(from).or_insert(1);
                 *next = (*next).max(last_included_index + 1);
+                // A departing peer whose removal entry fell inside the
+                // boundary got it with the snapshot (phase 19b) — done.
+                let departed = departing
+                    .get(&from)
+                    .is_some_and(|&(removal_index, _)| last_included_index >= removal_index);
+                if departed {
+                    departing.remove(&from);
+                }
                 tracing::info!(
                     node = self.config.id,
                     term = sent_term,
@@ -1466,6 +1543,9 @@ impl<T: Transport + Clone> RaftNode<T> {
                     last_included_index,
                     "snapshot installed on peer; resuming log replication"
                 );
+                if departed {
+                    self.publish_membership();
+                }
                 self.maybe_advance_commit();
                 if last_included_index < last_index {
                     self.send_append(from);
@@ -1498,10 +1578,18 @@ impl<T: Transport + Clone> RaftNode<T> {
                 "stepping down; pending linearizable reads resolve as retryable errors"
             );
         }
+        // Parting sends die with the leadership (phase 19b, best-effort by
+        // design): remember whether the watch needs the departing peers'
+        // addresses withdrawn.
+        let had_departing =
+            matches!(&self.role, Role::Leader { departing, .. } if !departing.is_empty());
         // Replacing the role drops any pending reads' senders — their
         // waiters get an error, never a hang or a stale value.
         self.role = Role::Follower;
         self.leader_id = leader_id;
+        if had_departing {
+            self.publish_membership();
+        }
         // Also resets when stepping down, so a deposed leader/candidate
         // waits a full randomized timeout before running again.
         self.reset_election_timer();
@@ -1653,6 +1741,7 @@ impl<T: Transport + Clone> RaftNode<T> {
             heartbeat_seq: 0,
             acked_seq: HashMap::new(),
             last_contact: peers.iter().map(|&p| (p, now)).collect(),
+            departing: BTreeMap::new(),
             pending_reads: Vec::new(),
         };
         self.leader_id = Some(self.config.id);
@@ -1707,7 +1796,7 @@ impl<T: Transport + Clone> RaftNode<T> {
                 return;
             }
         }
-        for peer in self.peer_ids() {
+        for peer in self.replication_targets() {
             self.send_append(peer);
         }
         self.next_heartbeat = Instant::now() + self.config.heartbeat_interval;
@@ -1718,9 +1807,11 @@ impl<T: Transport + Clone> RaftNode<T> {
     /// fine while compaction is out of scope and logs stay small.
     fn send_append(&self, peer: NodeId) {
         // §4.1: never replicate to a server outside the current config —
-        // the fan-outs already iterate members, but a reply-triggered
-        // resend can straggle in after a removal; this gate stops it.
-        if !self.members.contains_key(&peer) {
+        // EXCEPT a departing peer still owed its own removal entry (phase
+        // 19b). The gate also stops reply-triggered resends that straggle
+        // in after a removal (or after the parting ack dropped the peer
+        // from `departing`).
+        if !self.members.contains_key(&peer) && !self.is_departing(peer) {
             return;
         }
         let Role::Leader {
@@ -1969,16 +2060,49 @@ impl<T: Transport + Clone> RaftNode<T> {
             .collect()
     }
 
+    /// AppendEntries fan-out targets (phase 19b): the member peers plus any
+    /// departing peers still owed their removal entry. Both sources are
+    /// BTreeMaps, so the order is deterministic.
+    fn replication_targets(&self) -> Vec<NodeId> {
+        let mut targets = self.peer_ids();
+        if let Role::Leader { departing, .. } = &self.role {
+            targets.extend(departing.keys().copied());
+        }
+        targets
+    }
+
+    fn is_departing(&self, peer: NodeId) -> bool {
+        matches!(&self.role, Role::Leader { departing, .. } if departing.contains_key(&peer))
+    }
+
     /// Puts a configuration in effect (phase 15, §4.1: on append). On a
     /// leader, newly added peers start with fresh CheckQuorum contact —
     /// the same grace a fresh leader gives everyone — so a joiner has a
     /// full window to answer before it can count against the quorum.
     fn adopt_membership(&mut self, members: Membership, index: LogIndex) {
-        if let Role::Leader { last_contact, .. } = &mut self.role {
+        if let Role::Leader {
+            last_contact,
+            departing,
+            ..
+        } = &mut self.role
+        {
             let now = Instant::now();
             for &id in members.keys().filter(|&&id| id != self.config.id) {
                 last_contact.entry(id).or_insert(now);
             }
+            // Peers this configuration drops are owed the removal entry
+            // itself (phase 19b): keep replicating to them until they ack
+            // it, so they learn to park instead of probing forever. Self
+            // is not "departing" — a self-removing leader has its own
+            // step-down-on-commit path (§4.2.2).
+            for (&id, addr) in &self.members {
+                if id != self.config.id && !members.contains_key(&id) {
+                    departing.insert(id, (index, addr.clone()));
+                }
+            }
+            // A re-added peer is an ordinary member again; any leftover
+            // parting bookkeeping for it is moot.
+            departing.retain(|id, _| !members.contains_key(id));
         }
         self.members = members;
         self.members_index = index;
@@ -2020,11 +2144,22 @@ impl<T: Transport + Clone> RaftNode<T> {
     }
 
     fn publish_membership(&self) {
+        let departing = match &self.role {
+            Role::Leader { departing, .. } => departing
+                .iter()
+                .map(|(&id, (_, addr))| (id, addr.clone()))
+                .collect(),
+            _ => Membership::new(),
+        };
+        let view = MembershipView {
+            members: self.members.clone(),
+            departing,
+        };
         self.membership_tx.send_if_modified(|current| {
-            if *current == self.members {
+            if *current == view {
                 false
             } else {
-                *current = self.members.clone();
+                *current = view;
                 true
             }
         });
