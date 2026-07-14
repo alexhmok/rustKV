@@ -1,0 +1,32 @@
+# Nightly extended testing (testing-regime phase T1 skeleton).
+#
+# Currently: the #[ignore]d wide soaks (tests/faults.rs, tests/jepsen.rs) at
+# RUSTKV_SOAK_SEEDS=256 via `make soak`. Same flake policy as ci.yml: no
+# automatic retries; one manual re-run, then it's a real bug.
+#
+# TODO(T6): mutation-testing tier — cargo-mutants (installed on the runner,
+#           never added to Cargo.toml; the CLAUDE.md dependency whitelist is
+#           runtime-deps only).
+# TODO(T6): coverage tier — cargo-llvm-cov, published as an artifact.
+
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # 03:00 UTC daily
+  workflow_dispatch: {} # allow manual runs for debugging the skeleton
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  soak:
+    name: soak
+    runs-on: ubuntu-latest
+    # 256 seeds ran ~90s per suite locally; budget generously for the much
+    # slower shared runners.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: make soak
