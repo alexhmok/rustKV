@@ -21,6 +21,14 @@
 //!   empty membership, no campaigning, waiting to be added to a running
 //!   cluster via `PUT /cluster/members/{id}` on its leader. RUSTKV_PEERS is
 //!   not needed — peer addresses arrive with the configuration.
+//! - `RUSTKV_ADVERTISE_RAFT_ADDR`  — the raft address OTHER nodes should
+//!   dial for this node (default: RUSTKV_RAFT_LISTEN). Set it whenever the
+//!   bind address is not reachable as-is (0.0.0.0, Docker, NAT): the
+//!   advertised pair is what a ConfigChange embeds in the log and what the
+//!   whole cluster then uses (phase 15).
+//! - `RUSTKV_ADVERTISE_CLIENT_URL` — the client base URL peers should
+//!   redirect to for this node (default: `http://{RUSTKV_LISTEN}`); same
+//!   caveat as above.
 
 use std::collections::HashMap;
 
@@ -37,6 +45,11 @@ pub struct NodeConfig {
     pub snapshot_threshold: Option<u64>,
     pub snapshot_trailing: u64,
     pub join: bool,
+    /// What OTHER nodes dial/redirect to for this node (phase 15). Resolved
+    /// here — defaults derived from the listen addresses — so the rest of
+    /// the binary never has to know about the distinction.
+    pub advertise_raft_addr: String,
+    pub advertise_client_url: String,
 }
 
 impl NodeConfig {
@@ -52,10 +65,16 @@ impl NodeConfig {
                 .map_err(|_| format!("RUSTKV_NODE_ID must be a number, got {raw:?}"))?,
             None => 1,
         };
+        let listen = get("RUSTKV_LISTEN").unwrap_or_else(|| "127.0.0.1:8080".to_string());
+        let raft_listen = get("RUSTKV_RAFT_LISTEN").unwrap_or_else(|| "127.0.0.1:9080".to_string());
         let config = Self {
             id,
-            listen: get("RUSTKV_LISTEN").unwrap_or_else(|| "127.0.0.1:8080".to_string()),
-            raft_listen: get("RUSTKV_RAFT_LISTEN").unwrap_or_else(|| "127.0.0.1:9080".to_string()),
+            advertise_raft_addr: get("RUSTKV_ADVERTISE_RAFT_ADDR")
+                .unwrap_or_else(|| raft_listen.clone()),
+            advertise_client_url: get("RUSTKV_ADVERTISE_CLIENT_URL")
+                .unwrap_or_else(|| format!("http://{listen}")),
+            listen,
+            raft_listen,
             data_dir: get("RUSTKV_DATA_DIR").unwrap_or_else(|| "./rustkv-data".to_string()),
             peers: parse_peer_map(get("RUSTKV_PEERS").as_deref().unwrap_or(""))
                 .map_err(|e| format!("RUSTKV_PEERS: {e}"))?,
@@ -139,6 +158,30 @@ mod tests {
         assert!(config.peer_client_urls.is_empty());
         assert_eq!(config.snapshot_threshold, None, "snapshotting is opt-in");
         assert!(!config.join, "join mode is opt-in");
+    }
+
+    /// Advertise addresses default to the listen addresses (the phase-15
+    /// membership log embeds whatever is advertised, so nodes binding
+    /// 0.0.0.0 must override them).
+    #[test]
+    fn advertise_addresses_default_to_listen_and_can_be_overridden() {
+        let config = NodeConfig::from_vars(vars(&[
+            ("RUSTKV_LISTEN", "0.0.0.0:8080"),
+            ("RUSTKV_RAFT_LISTEN", "0.0.0.0:9080"),
+        ]))
+        .unwrap();
+        assert_eq!(config.advertise_raft_addr, "0.0.0.0:9080");
+        assert_eq!(config.advertise_client_url, "http://0.0.0.0:8080");
+
+        let config = NodeConfig::from_vars(vars(&[
+            ("RUSTKV_LISTEN", "0.0.0.0:8080"),
+            ("RUSTKV_RAFT_LISTEN", "0.0.0.0:9080"),
+            ("RUSTKV_ADVERTISE_RAFT_ADDR", "node2-raft:9080"),
+            ("RUSTKV_ADVERTISE_CLIENT_URL", "http://localhost:8082"),
+        ]))
+        .unwrap();
+        assert_eq!(config.advertise_raft_addr, "node2-raft:9080");
+        assert_eq!(config.advertise_client_url, "http://localhost:8082");
     }
 
     #[test]

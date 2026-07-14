@@ -686,13 +686,16 @@ impl<T: Transport + Clone> RaftNode<T> {
     /// leader-only (checked by the caller), no change until this term's
     /// no-op committed (a leader that doesn't know the committed prefix
     /// could otherwise stack a second change on an invisible first — the
-    /// known single-server-change bug), at most one change in flight, and
-    /// the new configuration must differ from the active one by EXACTLY one
+    /// known single-server-change bug), at most one change in flight, the
+    /// new configuration must differ from the active one by EXACTLY one
     /// added or removed member (the single-server overlap argument is what
-    /// makes joint consensus unnecessary).
+    /// makes joint consensus unnecessary), and a majority of the NEW
+    /// configuration must be reachable (the availability guard below).
     fn validate_config_change(&self, new: &Membership) -> Result<(), &'static str> {
         let Role::Leader {
-            term_start_index, ..
+            term_start_index,
+            last_contact,
+            ..
         } = &self.role
         else {
             unreachable!("validated only on the leader");
@@ -717,6 +720,36 @@ impl<T: Transport + Clone> RaftNode<T> {
             .count();
         if added + removed != 1 {
             return Err("exactly one member must be added or removed");
+        }
+        // Availability guard (etcd's strict reconfig check): the config
+        // takes effect on APPEND, so a change whose NEW majority is not
+        // reachable stalls the cluster the moment it is accepted — and one
+        // stall is unrecoverable: adding an unreachable second member to a
+        // single-node cluster means nothing can ever commit again, and
+        // CheckQuorum soon deposes the only node that could have fixed it,
+        // permanently (it can never re-win a 2-of-2 election). Reuse
+        // CheckQuorum's own signal: a member is reachable if it is this
+        // node or answered within election_timeout_max. A NOT-YET-ADDED
+        // member has never been heard (leaders only talk to members), so
+        // it always counts unreachable — which deliberately forbids growing
+        // a single-node cluster dynamically (etcd's answer there is
+        // learners; we have none — bootstrap statically instead).
+        let window = self.config.election_timeout_max;
+        let reachable = new
+            .keys()
+            .filter(|&&id| {
+                id == self.config.id
+                    || last_contact
+                        .get(&id)
+                        .is_some_and(|at| at.elapsed() < window)
+            })
+            .count();
+        if reachable < new.len() / 2 + 1 {
+            return Err(
+                "a majority of the new configuration must be reachable (recently \
+                 heard); refusing a change that could stall the cluster — a \
+                 not-yet-added member always counts as unreachable",
+            );
         }
         Ok(())
     }

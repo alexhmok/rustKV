@@ -24,6 +24,10 @@ services:
     container_name: rustkv-node1
     environment:
       RUSTKV_NODE_ID: "1"
+      # Advertise reachable addresses, never the 0.0.0.0 binds: these are
+      # what dynamic membership (phase 15) embeds in the replicated log.
+      RUSTKV_ADVERTISE_RAFT_ADDR: "node1-raft:9080"
+      RUSTKV_ADVERTISE_CLIENT_URL: "http://localhost:8081"
       RUSTKV_PEERS: "2=node2-raft:9080,3=node3-raft:9080"
       RUSTKV_PEER_CLIENT_URLS: "2=http://localhost:8082,3=http://localhost:8083"
     ports: ["8081:8080"]
@@ -38,6 +42,8 @@ services:
     container_name: rustkv-node2
     environment:
       RUSTKV_NODE_ID: "2"
+      RUSTKV_ADVERTISE_RAFT_ADDR: "node2-raft:9080"
+      RUSTKV_ADVERTISE_CLIENT_URL: "http://localhost:8082"
       RUSTKV_PEERS: "1=node1-raft:9080,3=node3-raft:9080"
       RUSTKV_PEER_CLIENT_URLS: "1=http://localhost:8081,3=http://localhost:8083"
     ports: ["8082:8080"]
@@ -52,6 +58,8 @@ services:
     container_name: rustkv-node3
     environment:
       RUSTKV_NODE_ID: "3"
+      RUSTKV_ADVERTISE_RAFT_ADDR: "node3-raft:9080"
+      RUSTKV_ADVERTISE_CLIENT_URL: "http://localhost:8083"
       RUSTKV_PEERS: "1=node1-raft:9080,2=node2-raft:9080"
       RUSTKV_PEER_CLIENT_URLS: "1=http://localhost:8081,2=http://localhost:8082"
     ports: ["8083:8080"]

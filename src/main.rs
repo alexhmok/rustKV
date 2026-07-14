@@ -52,9 +52,11 @@ async fn main() {
     raft_config.snapshot_threshold = config.snapshot_threshold;
     raft_config.snapshot_trailing = config.snapshot_trailing;
     raft_config.join = config.join;
-    // Address book for the bootstrap membership. Self advertises its
-    // listen addresses as-is — fine for host-per-node/local setups; a
-    // separate advertise address is a known gap (PLAN.md).
+    // Address book for the bootstrap membership. Self uses its ADVERTISE
+    // addresses (default: the listen addresses): whatever goes in here is
+    // what a future ConfigChange embeds in the log and hands the whole
+    // cluster — a 0.0.0.0 bind must never leak into that (phase-15
+    // amendment; RUSTKV_ADVERTISE_* in config.rs).
     let mut bootstrap_addrs: BTreeMap<NodeId, MemberAddr> = config
         .peers
         .iter()
@@ -75,8 +77,8 @@ async fn main() {
     bootstrap_addrs.insert(
         config.id,
         MemberAddr {
-            raft: config.raft_listen.clone(),
-            client: format!("http://{}", config.listen),
+            raft: config.advertise_raft_addr.clone(),
+            client: config.advertise_client_url.clone(),
         },
     );
     raft_config.bootstrap_addrs = bootstrap_addrs;

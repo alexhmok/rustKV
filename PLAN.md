@@ -1150,7 +1150,9 @@ Untested / known gaps (documented, not fixed):
 - The binary advertises its own bind addresses (`RUSTKV_LISTEN`/
   `RUSTKV_RAFT_LISTEN`) in bootstrap membership; behind NAT or 0.0.0.0
   binds a future ConfigChange would carry unreachable self-addresses —
-  a separate advertise-address variable is the known fix.
+  a separate advertise-address variable is the known fix. [Fixed by the
+  amendment below: `RUSTKV_ADVERTISE_RAFT_ADDR`/`RUSTKV_ADVERTISE_
+  CLIENT_URL`.]
 - A removed server is never told (leaders don't replicate outside the
   config, by design): it parks probing forever until its process is
   stopped; its data dir is not cleaned up.
@@ -1160,6 +1162,99 @@ Untested / known gaps (documented, not fixed):
   harmless, but the client must treat 409 as "already done, verify".
 - No joint consensus: only single-server deltas, serialized one at a
   time — a deliberate scope choice, same as the thesis's recommendation.
+
+### Phase 15 amendment — reconfig guard, advertise addresses, churn soak (post-checkpoint)
+
+Follow-up from the phase-15 concern review. Three fixes shipped; the
+remaining concerns are recorded at the end as deliberate gaps.
+
+Done:
+1. **Availability guard on ConfigChange** (etcd's strict reconfig check):
+   `validate_config_change` now also requires a majority of the NEW
+   configuration to be reachable — this node, or heard within
+   `election_timeout_max`, reusing CheckQuorum's own `last_contact`
+   signal. Config-on-append means an unguarded change whose new majority
+   is unreachable stalls the cluster the instant it is accepted, and one
+   case is UNRECOVERABLE: adding an unreachable second member to a
+   single-node cluster leaves nothing able to commit ever again, and
+   CheckQuorum then permanently deposes the only node that could have
+   fixed it (it can never re-win a 2-of-2 election). A not-yet-added
+   member has never been heard (leaders only talk to members), so it
+   always counts unreachable — which deliberately makes dynamic 1→2
+   growth impossible (etcd's answer there is learner members; we have
+   none — bootstrap statically instead). Rejections remain
+   side-effect-free, so callers may retry once the topology heals.
+2. **Advertise addresses**: `RUSTKV_ADVERTISE_RAFT_ADDR` /
+   `RUSTKV_ADVERTISE_CLIENT_URL` (defaults: the listen addresses), used
+   for the self entry in bootstrap membership. Without them, the FIRST
+   ConfigChange in any 0.0.0.0-binding deployment — the Docker image
+   binds 0.0.0.0 — snapshots the proposer's bind address into the log as
+   the canonical cluster-wide address book, poisoning every follower's
+   redirect map (`Location: http://0.0.0.0:8080/...`). compose.yaml now
+   sets both per node (`nodeN-raft:9080` / `http://localhost:808N`);
+   scripts/run-cluster.sh needs nothing (127.0.0.1 binds are reachable
+   as-is).
+3. **Randomized membership soak** (`membership_churn_soak_stays_
+   linearizable`): the jepsen-style workload with membership churn AS the
+   nemesis — six rounds per seed rolling grow-to-4 / shrink-to-3 (the
+   shrink victim may be the current leader: §4.2.2 exercised in the
+   wild) / partition-and-heal, under 5% loss and tight client timeouts,
+   across 3 seeds. Config changes are driven by a retry helper that
+   tolerates rejections, leadership changes and ambiguity (a retried
+   change that shows up as zero delta means an earlier ambiguous copy
+   landed — effect-on-append makes the leader's view the authority).
+   Whole-history WGL check, final-state equality among the final members,
+   event-level safety observer at teardown. Observed churn: 7 committed
+   grows, 6 committed shrinks, 31 confirmed writes across the seed set
+   (vacuity-guarded), zero violations.
+
+Tested (165 total; 5 new): the three guard tests — the 1→2 brick refused
+(cluster stays fully functional after the rejection); add refused while a
+member is unreachable, then the identical add accepted and committed once
+the restarted member is heard again (the test retries around the few-ms
+gap between visible convergence and the leader processing the first ack —
+rejections are side-effect-free by construction); removal of a LIVE
+member refused while another is down (would strand the survivors) while
+removing the DEAD member — the recovery operation — still passes and
+commits. Plus the soak and the advertise config unit test; the binary
+smoke re-run covers advertise + guard end-to-end (grow through a follower
+redirect still 201 with three reachable originals). Full regression green
+with zero re-pins (the guard only runs on ConfigChange proposals; static
+suites never propose one).
+
+Untested / known gaps (recorded from the concern review; deliberate):
+- **Mixed-version constraint**: a phase-14 binary cannot deserialize a
+  ConfigChange log entry (unknown Command variant → AE rejected on the
+  wire, `Corrupt` on log replay). Snapshots are forward-safe (the old
+  `Option<Value>` field absorbs typed membership). Operational rule:
+  never propose a membership change while a rolling upgrade is in
+  progress.
+- **No learner role**: a new member counts toward quorum from the moment
+  its ConfigChange is appended, so every add passes through a window
+  where fault tolerance is REDUCED until the joiner catches up (3→4:
+  all three originals are briefly load-bearing). The guard ensures the
+  change can commit, not that catch-up is fast — and catch-up inherits
+  the phase-14 single-shot-payload-vs-150ms-RPC_TIMEOUT blocker, plus
+  O(log-length) probe round trips on the AE path (no conflict-hint
+  backtracking). Learners (non-voting until caught up) are the real fix.
+- **The Ongaro concurrent-change bug schedule was never reproduced**:
+  the no-op gate and one-in-flight rule are implemented and their firing
+  is tested, but the disjoint-majority disease they prevent was not
+  constructed in the sim (needs the gate disabled plus a 4-server
+  interleaving). Test-the-fix debt, noted honestly.
+- **Shrink to 2 members is legal** and halves availability (either
+  node's hiccup deposes the leader via CheckQuorum); the guard doesn't
+  block it since both members are reachable at propose time.
+- The guard's reachability signal starts fresh at election (last_contact
+  initialized to leadership start), so a change proposed within the
+  first `election_timeout_max` of a new term may pass while a member is
+  actually down; the change then stalls-but-recovers (it can still be
+  superseded or commit late) — the unrecoverable 1→2 case is still
+  blocked, since it never depends on last_contact.
+- Real-binary transport updates race the first post-adoption fan-out by
+  design: a just-added peer's first AppendEntries can return Unreachable
+  until the main.rs watch task installs its address (≤ one heartbeat,
+  self-healing).
 
 ## Project complete (phases 0-15)
 Remaining ideas beyond the original scope, in planned order: connection

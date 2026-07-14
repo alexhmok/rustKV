@@ -332,6 +332,192 @@ async fn shrink_4_to_3_under_live_writes_stays_linearizable() {
     cluster.shutdown();
 }
 
+// ---- the membership soak (amendment): churn + partitions + checker ----
+
+/// Drives one configuration change to completion through whoever currently
+/// leads, tolerating rejections (guard, in-flight, NotLeader), leadership
+/// changes, and ambiguity. `mutate` must be idempotent against the current
+/// view: if applying it changes nothing, an earlier ambiguous copy already
+/// took effect and the change counts as done (effect-on-append makes the
+/// leader's view the authority). Returns false if the change never landed
+/// within the attempt budget — the soak just moves on.
+async fn try_commit_config(cluster: &TestCluster, mutate: impl Fn(&mut Membership)) -> bool {
+    for _ in 0..8 {
+        let Some(leader) = unique_leader(cluster) else {
+            tokio::time::sleep(ms(40)).await;
+            continue;
+        };
+        let handle = cluster.handle(leader);
+        let current = handle.membership();
+        let mut target = current.clone();
+        mutate(&mut target);
+        if target == current {
+            return true;
+        }
+        // A rejection means re-sample and retry; so does a truncated or
+        // ambiguous outcome — the next attempt re-reads the view, and the
+        // zero-delta check above absorbs a late-committing copy.
+        if let Ok(proposal) = handle
+            .propose(Command::ConfigChange { members: target })
+            .await
+            && let Ok(Ok(true)) = tokio::time::timeout(ms(800), proposal.committed).await
+        {
+            return true;
+        }
+        tokio::time::sleep(ms(40)).await;
+    }
+    false
+}
+
+/// The jepsen-style workload with membership churn AS the nemesis, plus
+/// partition rounds on top: random grow-to-4 / shrink-to-3 rounds (the
+/// shrink victim may be the leader — §4.2.2 in the wild) interleaved with
+/// node isolation, under loss and tight client timeouts. Every committed
+/// read/write lands in one history checked by the WGL linearizability
+/// checker; the event-level election-safety observer is asserted at
+/// teardown as always. Returns (grows, shrinks, confirmed writes).
+async fn membership_soak(seed: u64) -> (u64, u64, usize) {
+    let faults = FaultConfig {
+        min_delay: ms(1),
+        max_delay: ms(15),
+        drop_probability: 0.05,
+        duplicate_probability: 0.0,
+        rpc_timeout: ms(40),
+    };
+    let cluster = Arc::new(spawn_cluster(3, seed, faults));
+    let start = Instant::now();
+    cluster.wait_for_leader().await;
+
+    let clients: Vec<_> = (0..2u64)
+        .map(|p| tokio::spawn(client_workload(Arc::clone(&cluster), p, seed, 12, start)))
+        .collect();
+
+    let mut rng = SplitMix64::new(seed ^ 0x00C0_FFEE);
+    let mut next_id = 4u64;
+    let (mut grows, mut shrinks) = (0u64, 0u64);
+    for _round in 0..6 {
+        tokio::time::sleep(ms(rng.next_range(60..=220))).await;
+        if rng.next_range(0..=9) < 3 {
+            // Partition a random node for a while, then heal it.
+            let ids = cluster.alive_ids();
+            let victim = ids[rng.next_range(0..=(ids.len() as u64 - 1)) as usize];
+            for other in cluster.all_ids() {
+                if other != victim {
+                    cluster.net.set_pair_blocked(victim, other, true);
+                }
+            }
+            tokio::time::sleep(ms(rng.next_range(100..=300))).await;
+            for other in cluster.all_ids() {
+                if other != victim {
+                    cluster.net.set_pair_blocked(victim, other, false);
+                }
+            }
+        } else {
+            let Some(leader) = unique_leader(&cluster) else {
+                continue;
+            };
+            let members = cluster.handle(leader).membership();
+            if members.len() <= 3 {
+                let id = next_id;
+                next_id += 1;
+                cluster.add_node(id);
+                if try_commit_config(&cluster, |m| {
+                    m.insert(id, member_addr(id));
+                })
+                .await
+                {
+                    grows += 1;
+                }
+            } else {
+                // Any member may be the victim — the leader included.
+                let candidates: Vec<NodeId> = members.keys().copied().collect();
+                let victim = candidates[rng.next_range(0..=(candidates.len() as u64 - 1)) as usize];
+                if try_commit_config(&cluster, |m| {
+                    m.remove(&victim);
+                })
+                .await
+                {
+                    shrinks += 1;
+                }
+            }
+        }
+    }
+
+    let mut history = Vec::new();
+    for client in clients {
+        history.extend(client.await.expect("client task"));
+    }
+
+    // Heal everything and settle on the authoritative final membership.
+    for a in cluster.all_ids() {
+        for b in cluster.all_ids() {
+            if a != b {
+                cluster.net.set_pair_blocked(a, b, false);
+            }
+        }
+    }
+    let final_members: Vec<NodeId> =
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if let Some(leader) = unique_leader(&cluster) {
+                    break cluster
+                        .handle(leader)
+                        .membership()
+                        .keys()
+                        .copied()
+                        .collect();
+                }
+                tokio::time::sleep(ms(10)).await;
+            }
+        })
+        .await
+        .expect("a leader emerges after the final heal");
+    converge_among(&cluster, &final_members).await;
+    final_reads(&cluster, &mut history, start).await;
+    assert_states_identical(&cluster, &final_members);
+
+    let confirmed = history
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.op,
+                OpKind::Write {
+                    outcome: WriteOutcome::Ok,
+                    ..
+                }
+            )
+        })
+        .count();
+    if let Err(reason) = check_linearizable(&history) {
+        panic!("seed {seed}: membership soak produced a violation:\n{reason}");
+    }
+    cluster.shutdown();
+    (grows, shrinks, confirmed)
+}
+
+#[tokio::test(start_paused = true)]
+async fn membership_churn_soak_stays_linearizable() {
+    let (mut grows, mut shrinks, mut confirmed) = (0, 0, 0);
+    for seed in [201, 202, 203] {
+        let (g, s, c) = membership_soak(seed).await;
+        eprintln!("seed {seed}: grows={g} shrinks={s} confirmed_writes={c}");
+        grows += g;
+        shrinks += s;
+        confirmed += c;
+    }
+    // Vacuity guards: the seed set must really churn membership both ways
+    // under a working workload, or the checker's silence means nothing.
+    assert!(
+        grows >= 2,
+        "only {grows} committed grows across the seed set"
+    );
+    assert!(shrinks >= 1, "no committed shrink across the seed set");
+    assert!(
+        confirmed >= 15,
+        "only {confirmed} confirmed writes across the seed set"
+    );
+}
+
 // ---- removing the leader (§4.2.2) ----
 
 #[tokio::test(start_paused = true)]
@@ -747,6 +933,136 @@ async fn config_change_is_rejected_until_the_no_op_commits() {
         .await
         .expect("the gate opens once the no-op is committed");
     assert_eq!(proposal.committed.await, Ok(true));
+    cluster.shutdown();
+}
+
+// ---- the availability guard (amendment: etcd-style strict reconfig) ----
+
+/// The unrecoverable-brick case, closed: adding a member to a single-node
+/// cluster makes the new majority 2-of-2 before the joiner has ever been
+/// heard — if it never syncs, nothing commits again and CheckQuorum
+/// permanently deposes the only node that could fix it. The guard refuses
+/// outright (a not-yet-added member counts as unreachable), matching etcd's
+/// strict reconfig check; growing from one node means static bootstrap.
+#[tokio::test(start_paused = true)]
+async fn growing_a_single_node_cluster_is_rejected() {
+    let cluster = spawn_cluster(1, 163, low_loss_faults());
+    cluster.wait_for_leader().await;
+    confirm_put(&cluster, &[1], "ready", 1).await;
+    let mut add2 = cluster.handle(1).membership();
+    add2.insert(2, member_addr(2));
+    let err = cluster
+        .handle(1)
+        .propose(Command::ConfigChange { members: add2 })
+        .await
+        .expect_err("growing a single-node cluster must be refused");
+    assert!(
+        matches!(err, ProposeError::InvalidConfigChange { .. }),
+        "{err}"
+    );
+    // The refusal left the cluster fully functional.
+    confirm_put(&cluster, &[1], "still-works", 2).await;
+    cluster.shutdown();
+}
+
+/// Adding while degraded would stall: 3→4 raises the majority to 3 on
+/// append, and with an original down only 2 originals + an uncaught-up
+/// joiner can answer. The guard refuses until the down member is heard
+/// again — and the same add (with no fourth process even running) is
+/// accepted once all three originals are reachable.
+#[tokio::test(start_paused = true)]
+async fn add_is_rejected_while_a_member_is_unreachable() {
+    let cluster = spawn_cluster(3, 164, low_loss_faults());
+    let all = cluster.all_ids();
+    let leader = cluster.wait_for_leader().await;
+    confirm_put(&cluster, &all, "ready", 1).await;
+    converge_among(&cluster, &all).await;
+
+    let down = *all.iter().find(|&&id| id != leader.id).unwrap();
+    cluster.crash(down);
+    // Let the crashed member's last contact age past the guard's window
+    // (election_timeout_max) — but not so long that unrelated churn starts.
+    tokio::time::sleep(ms(400)).await;
+    let handle = cluster.handle(leader.id);
+    assert_eq!(
+        handle.status().role,
+        RoleKind::Leader,
+        "one lost follower must not depose the leader (CheckQuorum: 2 of 3)"
+    );
+    let mut add4 = handle.membership();
+    add4.insert(4, member_addr(4));
+    let err = handle
+        .propose(Command::ConfigChange {
+            members: add4.clone(),
+        })
+        .await
+        .expect_err("adding while a member is unreachable must be refused");
+    assert!(
+        matches!(err, ProposeError::InvalidConfigChange { .. }),
+        "{err}"
+    );
+
+    // Heal: once the restarted member is HEARD again, the identical add is
+    // accepted and commits with the three originals (3 of the new 4).
+    // Convergence is visible through the restarted node's status a few
+    // milliseconds before its first ack reaches the leader, so retry —
+    // guard rejections are side-effect-free by construction.
+    cluster.restart(down).await;
+    converge_among(&cluster, &all).await;
+    let accepted = loop {
+        match handle
+            .propose(Command::ConfigChange {
+                members: add4.clone(),
+            })
+            .await
+        {
+            Ok(proposal) => break proposal,
+            Err(ProposeError::InvalidConfigChange { .. }) => tokio::time::sleep(ms(10)).await,
+            Err(other) => panic!("unexpected rejection after heal: {other}"),
+        }
+    };
+    assert_eq!(accepted.committed.await, Ok(true));
+    cluster.shutdown();
+}
+
+/// Removals are guarded by the same rule, and it cuts both ways: removing a
+/// LIVE member while another is down would strand the survivors (new
+/// majority 2 of {leader, dead node} — unreachable), so it is refused; but
+/// removing the DEAD member — the recovery operation — passes, because the
+/// new configuration {leader, live follower} is fully reachable.
+#[tokio::test(start_paused = true)]
+async fn removal_is_rejected_when_it_would_strand_the_survivors() {
+    let cluster = spawn_cluster(3, 165, low_loss_faults());
+    let all = cluster.all_ids();
+    let leader = cluster.wait_for_leader().await;
+    confirm_put(&cluster, &all, "ready", 1).await;
+    converge_among(&cluster, &all).await;
+
+    let followers: Vec<NodeId> = all.iter().copied().filter(|&id| id != leader.id).collect();
+    let (live, dead) = (followers[0], followers[1]);
+    cluster.crash(dead);
+    tokio::time::sleep(ms(400)).await;
+
+    let handle = cluster.handle(leader.id);
+    let mut remove_live = handle.membership();
+    remove_live.remove(&live);
+    let err = handle
+        .propose(Command::ConfigChange {
+            members: remove_live,
+        })
+        .await
+        .expect_err("removing a live member while another is down must be refused");
+    assert!(
+        matches!(err, ProposeError::InvalidConfigChange { .. }),
+        "{err}"
+    );
+
+    // The recovery path stays open: drop the dead member instead.
+    commit_config(&cluster, &[leader.id, live], |m| {
+        m.remove(&dead);
+    })
+    .await;
+    confirm_put(&cluster, &[leader.id, live], "after", 2).await;
     cluster.shutdown();
 }
 
